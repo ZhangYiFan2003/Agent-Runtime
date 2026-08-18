@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+from collections.abc import Awaitable, Callable
+from typing import Protocol
+from uuid import uuid4
+
+from axiom.agent import QueryEngine
+from axiom.evaluation.models import (
+    EvaluationCase,
+    EvaluationDataset,
+    EvaluationRunResult,
+    EvaluationSuiteResult,
+    ScorerSpec,
+    now,
+)
+from axiom.evaluation.scorers import (
+    Scorer,
+    required_scores_passed,
+    score_case,
+    scorer_from_spec,
+)
+from axiom.runtime.checkpoints import RuntimeStore
+from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
+from axiom.runtime.models import Checkpoint, RunStatus
+from axiom.runtime.observability import SpanType
+from axiom.runtime.observability_store import ObservabilityService, ObservabilityStore, RunTracer
+
+EngineFactory = Callable[[EvaluationCase], QueryEngine | Awaitable[QueryEngine]]
+ScorerFactory = Callable[[ScorerSpec], Scorer]
+
+
+class EvaluationExecutor(Protocol):
+    async def execute(self, case: EvaluationCase) -> EvaluationRunResult: ...
+
+
+class DurableEvaluationExecutor:
+    """Runs one evaluation case through the real durable Agent Runtime."""
+
+    def __init__(
+        self,
+        *,
+        engine_factory: EngineFactory,
+        checkpoint_store: RuntimeStore,
+        observability_store: ObservabilityStore,
+        retry_policy: RetryPolicy | None = None,
+    ) -> None:
+        self.engine_factory = engine_factory
+        self.checkpoint_store = checkpoint_store
+        self.observability_store = observability_store
+        self.retry_policy = retry_policy
+        self.observability = ObservabilityService(observability_store)
+
+    async def execute(self, case: EvaluationCase) -> EvaluationRunResult:
+        engine = self.engine_factory(case)
+        if inspect.isawaitable(engine):
+            engine = await engine
+        thread_id = f"eval_thread_{uuid4().hex}"
+        turn_id = f"eval_turn_{uuid4().hex}"
+        run_id = f"eval_run_{uuid4().hex}"
+        tracer = RunTracer(self.observability_store)
+        runtime = DurableAgentRuntime(
+            llm_client=engine.llm_client,
+            tool_registry=engine.tool_registry,
+            system_prompt=engine.system_prompt,
+            cwd=engine.cwd,
+            config=engine.config,
+            store=self.checkpoint_store,
+            retry_policy=self.retry_policy,
+            tracer=tracer,
+        )
+        state: Checkpoint | None = None
+        execution_error: str | None = None
+        try:
+            state = await asyncio.wait_for(
+                runtime.start(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    run_id=run_id,
+                    input=case.prompt,
+                ),
+                timeout=case.timeout_seconds,
+            )
+        except TimeoutError:
+            execution_error = f"evaluation timed out after {case.timeout_seconds:g}s"
+            state = await self.checkpoint_store.load(run_id)
+            if state is not None and not state.finished:
+                await tracer.start_run(state, recovered=True)
+                try:
+                    state = await runtime.cancel(run_id)
+                except Exception as exc:  # noqa: BLE001 - preserve the evaluation result
+                    execution_error = f"{execution_error}; cancel failed: {_safe_error(exc)}"
+                    state = await self.checkpoint_store.load(run_id)
+        except Exception as exc:  # noqa: BLE001 - one failed case must not abort a suite
+            execution_error = _safe_error(exc)
+            state = await self.checkpoint_store.load(run_id)
+
+        bundle = await self.observability.trace(run_id)
+        metrics = await self.observability.metrics(run_id)
+        tool_calls = (
+            [
+                str(span.attributes.get("tool_name") or span.name.removeprefix("tool."))
+                for span in bundle.spans
+                if span.span_type == SpanType.TOOL
+            ]
+            if bundle is not None
+            else []
+        )
+        state_error = state.error.message if state is not None and state.error else None
+        actual_status = state.status.value if state is not None else "ERROR"
+        if execution_error and actual_status == RunStatus.RUNNING.value:
+            actual_status = "ERROR"
+        return EvaluationRunResult(
+            case_id=case.id,
+            run_id=run_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            trace_id=bundle.trace.trace_id if bundle is not None else None,
+            status=actual_status,
+            assistant_output=state.output_text if state is not None else "",
+            duration_ms=metrics.duration_ms if metrics is not None else None,
+            prompt_tokens=metrics.prompt_tokens if metrics is not None else 0,
+            completion_tokens=metrics.completion_tokens if metrics is not None else 0,
+            total_tokens=metrics.total_tokens if metrics is not None else 0,
+            tool_calls=tool_calls,
+            step_count=metrics.step_count if metrics is not None else 0,
+            error=execution_error or state_error,
+        )
+
+
+class EvaluationRunner:
+    def __init__(
+        self,
+        executor: EvaluationExecutor,
+        *,
+        scorer_factory: ScorerFactory = scorer_from_spec,
+    ) -> None:
+        self.executor = executor
+        self.scorer_factory = scorer_factory
+
+    async def run(self, dataset: EvaluationDataset) -> EvaluationSuiteResult:
+        configured = {case.id: self._scorers_for(case) for case in dataset.cases}
+        started_at = now()
+        results: list[EvaluationRunResult] = []
+        for case in dataset.cases:
+            try:
+                result = await self.executor.execute(case)
+            except Exception as exc:  # noqa: BLE001 - custom executor isolation
+                result = EvaluationRunResult(
+                    case_id=case.id,
+                    run_id="",
+                    thread_id="",
+                    turn_id="",
+                    trace_id=None,
+                    status="ERROR",
+                    assistant_output="",
+                    duration_ms=None,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    tool_calls=[],
+                    step_count=0,
+                    error=_safe_error(exc),
+                )
+            result.scores = await score_case(case, result, configured[case.id])
+            result.passed = required_scores_passed(result.scores)
+            results.append(result)
+        return EvaluationSuiteResult.create(
+            dataset,
+            results,
+            started_at=started_at,
+        )
+
+    def _scorers_for(self, case: EvaluationCase) -> list[Scorer]:
+        specs = case.scorers or (ScorerSpec(type="run_status"),)
+        return [self.scorer_factory(spec) for spec in specs]
+
+
+def _safe_error(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"[:2000]

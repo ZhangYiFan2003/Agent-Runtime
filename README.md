@@ -38,6 +38,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | MCP Server | Exposes built-in tools through handler-level JSON-RPC requests. | Handler tested |
 | Runtime API | Provides threads, turns, resumable Runs, Memory/SQLite checkpoints, interrupt/resume/cancel, durable tool records, task CRUD, and stored SSE event replay. | Live localhost and crash recovery tested |
 | Observability | Persists Run traces and Agent/LLM/Tool/checkpoint/interrupt spans, including tokens, TTFT, latency, retries, and Run summaries. | SQLite reload, API, CLI, and crash continuity tested |
+| Agent Evaluation | Runs JSON task datasets through the durable Runtime, applies deterministic scorers, writes JSON reports, and compares functional/performance regressions. | Runner, scorer, report, comparison, and CLI tested |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
 | REPL | Interactive prompt-toolkit entrypoint and slash commands. | Not fully verified |
 
@@ -98,6 +99,13 @@ tree with `axiom runs trace <run_id>`. The same data is available through
 `GET /v1/runs/{run_id}/metrics` and `GET /v1/runs/{run_id}/trace`.
 
 See [`docs/observability.md`](docs/observability.md) for the schema and metric definitions.
+
+### Agent evaluation
+
+Run a fixed task dataset with `axiom eval run <dataset.json> --output result.json`, then compare a
+later candidate with `axiom eval compare baseline.json result.json`. Evaluation uses real durable
+Runs and persisted traces rather than calling the model directly. See
+[`docs/evaluation.md`](docs/evaluation.md) for the dataset and scorer formats.
 
 See [`docs/architecture-current.md`](docs/architecture-current.md) for the detailed architecture baseline.
 
@@ -192,7 +200,7 @@ uv run pytest
 Current baseline:
 
 ```text
-166 tests passing
+177 tests passing
 ```
 
 The default tests use fake LLM clients, temporary directories, temporary SQLite databases, deterministic code-search fixtures, and localhost-safe HTTP paths. They do not require API keys and do not call external model providers.

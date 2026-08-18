@@ -66,3 +66,18 @@ Run from the repository root:
 The benchmark reports direct callers, direct callees, depth-3 traversal, and SCC
 timings. Result files are machine-specific evidence artifacts and should be
 reviewed before commit.
+
+## Agent Evaluation Dataset
+
+`datasets/agent-core.json` is a maintained task-success benchmark that runs through the real Axiom
+durable Runtime. Unlike the synthetic performance benchmarks above, it calls the configured model
+provider and may incur cost.
+
+```powershell
+uv run axiom eval run benchmarks/datasets/agent-core.json `
+  --cwd . `
+  --data-dir .tmp/eval-runtime `
+  --output .tmp/agent-core-result.json
+```
+
+See `docs/evaluation.md` for scorer semantics and regression comparison.

@@ -49,6 +49,7 @@ stage. This document does not repeat the model request.
 | MCP server | `src/axiom/mcp/server.py` | Partially verified | Handler-level tests cover initialize, tools/list, safe tools/call, unknown tools, unknown methods, and malformed missing-method requests. Long-running stdio/http transports were not started in this baseline. |
 | Runtime API and durable execution | `src/axiom/runtime/*` | Verified | Runtime lifecycle/API tests plus crash recovery tests cover Memory/SQLite checkpoints, restart resume, approval/reject/manual interrupt, cancel terminality, bounded retry, successful-tool deduplication, ambiguous side-effect recovery, optimistic sequence conflicts, same-process double resume, stored SSE replay, and socket release. |
 | Runtime observability | `src/axiom/runtime/observability.py`, `src/axiom/runtime/observability_store.py` | Verified | Deterministic tests cover LLM token/TTFT/latency spans, Tool success/failure/retry/reuse and ambiguity attributes, interrupt/resume continuity, crash recovery on one trace, SQLite reload, lifecycle Events, HTTP metrics/trace endpoints, and CLI rendering. |
+| Agent evaluation | `src/axiom/evaluation/*`, `benchmarks/datasets/agent-core.json` | Verified | Tests cover JSON dataset validation, five deterministic scorers, composite scoring, real durable Runtime execution, failed Runs, metrics projection, JSON report round-trip, regression comparison, and CLI wiring. |
 
 Status definitions:
 
@@ -141,7 +142,7 @@ added for Windows.
 
 ## 6. Recommended next-stage tasks
 
-1. Build deterministic Agent evaluation datasets and scorers on the persisted Run traces.
+1. Add a capability-based permission policy before expanding evaluation tasks that mutate workspaces or external systems.
 2. Add MCP stdio/http transport lifecycle tests with deterministic process cleanup.
 3. Add optional LLM-backed memory extraction evaluation with strict schemas and no default network calls.
 4. Broaden no-network tests for high-risk built-in tools beyond the current read/write, code search, Runtime API, and ReAct `read_file` paths.

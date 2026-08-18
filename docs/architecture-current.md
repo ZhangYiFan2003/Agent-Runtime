@@ -238,6 +238,9 @@ flowchart TD
     RunTracer execution hook, and trace/metrics query service.
 - `src/axiom/runtime/tasks.py`
   - Stores durable background tasks in SQLite.
+- `src/axiom/evaluation/`
+  - Defines JSON datasets, deterministic scorers, the durable Runtime evaluation
+    adapter, JSON results, and functional/performance regression comparison.
 
 ## 4. CLI execution flow
 

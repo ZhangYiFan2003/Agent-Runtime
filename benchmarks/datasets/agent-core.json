@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "name": "agent-core",
+  "version": "1.0.0",
+  "metadata": {
+    "description": "Small repository-grounded benchmark for the Axiom durable Agent Runtime.",
+    "working_directory": "repository root",
+    "notes": "Tool constraints test task requirements, not an exact global call sequence."
+  },
+  "cases": [
+    {
+      "id": "exact_sentinel",
+      "name": "Exact deterministic response",
+      "prompt": "Respond with exactly AXIOM_EVAL_OK and nothing else. Do not use tools.",
+      "tags": ["basic", "deterministic"],
+      "timeout_seconds": 60,
+      "scorers": [
+        {"type": "run_status", "expected": "COMPLETED"},
+        {"type": "exact_match", "expected": "AXIOM_EVAL_OK"},
+        {"type": "tool_usage", "forbidden_tools": ["write_file", "bash", "execute_command"]},
+        {"type": "metric_threshold", "max_steps": 4, "max_tokens": 4000, "max_tool_calls": 0}
+      ]
+    },
+    {
+      "id": "explain_turn_run",
+      "name": "Explain Turn and Run semantics",
+      "prompt": "Briefly explain the difference between Turn and Run in this repository. Do not modify files.",
+      "tags": ["basic", "runtime"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["Turn", "Run"]},
+        {"type": "tool_usage", "forbidden_tools": ["write_file", "bash", "execute_command"]},
+        {"type": "metric_threshold", "max_steps": 8, "max_tokens": 10000}
+      ]
+    },
+    {
+      "id": "list_runtime_modules",
+      "name": "List Runtime modules",
+      "prompt": "Use list_dir to inspect src/axiom/runtime, then name durable.py and observability.py in the answer.",
+      "tags": ["tool-selection", "filesystem"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["durable.py", "observability.py"]},
+        {"type": "tool_usage", "required_tools": ["list_dir"], "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 8, "max_tokens": 10000, "max_tool_calls": 4}
+      ]
+    },
+    {
+      "id": "read_checkpoint_store",
+      "name": "Read checkpoint persistence implementation",
+      "prompt": "Use read_file on src/axiom/runtime/checkpoints.py and identify both checkpoint store implementations. Do not modify files.",
+      "tags": ["tool-selection", "durable"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["MemoryCheckpointStore", "SQLiteCheckpointStore"]},
+        {"type": "tool_usage", "required_tools": ["read_file"], "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 8, "max_tokens": 12000, "max_tool_calls": 4}
+      ]
+    },
+    {
+      "id": "find_durable_runtime",
+      "name": "Locate DurableAgentRuntime",
+      "prompt": "Use grep to locate the DurableAgentRuntime class definition, then report its file path. Do not change the repository.",
+      "tags": ["tool-selection", "search"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["src", "axiom", "runtime", "durable.py"]},
+        {"type": "tool_usage", "required_tools": ["grep"], "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 8, "max_tokens": 10000, "max_tool_calls": 4}
+      ]
+    },
+    {
+      "id": "trace_llm_path",
+      "name": "Trace the LLM call path",
+      "prompt": "Find and read the durable Runtime LLM call path. State which method invokes llm_client.chat and which method instruments the LLM span. Use repository tools and do not edit files.",
+      "tags": ["multi-step", "observability"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["_collect_llm_response", "llm_client.chat", "_execute_llm_step"]},
+        {"type": "tool_usage", "required_tools": ["read_file"], "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 12, "max_tokens": 16000, "max_tool_calls": 7}
+      ]
+    },
+    {
+      "id": "locate_trace_schema",
+      "name": "Locate Trace and Span schema",
+      "prompt": "Inspect the observability implementation and explain where Trace, Span, and the SQLite traces/spans tables are defined. Include the relevant file names.",
+      "tags": ["multi-step", "observability"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["observability.py", "observability_store.py", "traces", "spans"]},
+        {"type": "tool_usage", "forbidden_tools": ["write_file", "bash", "execute_command"]},
+        {"type": "metric_threshold", "max_steps": 12, "max_tokens": 16000, "max_tool_calls": 8}
+      ]
+    },
+    {
+      "id": "locate_run_metrics_api",
+      "name": "Locate Run metrics API",
+      "prompt": "Locate the HTTP route that returns Run metrics and report the route and source file. Do not modify files.",
+      "tags": ["search", "api"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["/v1/runs/", "/metrics", "api.py"]},
+        {"type": "tool_usage", "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 10, "max_tokens": 12000, "max_tool_calls": 6}
+      ]
+    },
+    {
+      "id": "inspect_tool_execution",
+      "name": "Inspect ToolExecution identity",
+      "prompt": "Inspect the Runtime models and state which fields connect ToolExecutionRecord to a Run and a model tool call. Do not edit files.",
+      "tags": ["multi-step", "tool-idempotency"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["invocation_id", "run_id", "tool_call_id"]},
+        {"type": "tool_usage", "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 10, "max_tokens": 12000, "max_tool_calls": 6}
+      ]
+    },
+    {
+      "id": "recover_missing_read",
+      "name": "Recover from a failed read",
+      "prompt": "First use read_file on src/axiom/runtime/does_not_exist.py. After that failure, recover by using list_dir on src/axiom/runtime and answer with an existing Python file name. Do not modify anything.",
+      "tags": ["failure-handling", "multi-step"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ".py"},
+        {"type": "tool_usage", "required_tools": ["read_file", "list_dir"], "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 12, "max_tokens": 16000, "max_tool_calls": 7}
+      ]
+    },
+    {
+      "id": "explain_interrupt_resume",
+      "name": "Explain durable interrupt and resume",
+      "prompt": "Read docs/durable-execution.md and briefly explain WAITING_APPROVAL, resume approve, reject, and cancel behavior.",
+      "tags": ["durable", "documentation"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["WAITING_APPROVAL", "approve", "reject", "cancel"]},
+        {"type": "tool_usage", "required_tools": ["read_file"], "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 8, "max_tokens": 12000, "max_tool_calls": 4}
+      ]
+    },
+    {
+      "id": "explain_exactly_once_limit",
+      "name": "Explain tool exactly-once limitation",
+      "prompt": "Read docs/durable-execution.md and explain why arbitrary external tool side effects cannot be guaranteed exactly once. Mention the Runtime mechanism used for deduplication.",
+      "tags": ["durable", "tool-idempotency"],
+      "scorers": [
+        {"type": "run_status"},
+        {"type": "contains", "expected": ["exactly-once", "invocation_id", "idempotency"]},
+        {"type": "tool_usage", "required_tools": ["read_file"], "forbidden_tools": ["write_file"]},
+        {"type": "metric_threshold", "max_steps": 8, "max_tokens": 12000, "max_tool_calls": 4}
+      ]
+    }
+  ]
+}
