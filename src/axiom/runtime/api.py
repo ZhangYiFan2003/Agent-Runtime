@@ -20,6 +20,13 @@ from axiom.bootstrap import build_tool_registry
 from axiom.config import AxiomConfig
 from axiom.llm import create_llm_client
 from axiom.memory import MemoryService, SummaryPolicy
+from axiom.runtime.checkpoints import (
+    CheckpointConflictError,
+    RuntimeStore,
+    SQLiteCheckpointStore,
+)
+from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
+from axiom.runtime.models import Checkpoint, Interrupt, RunError, RunStatus
 from axiom.runtime.tasks import DurableTaskManager
 from axiom.types import Message
 
@@ -40,6 +47,8 @@ class RuntimeTurnContext:
     history: list[Message]
     cwd: str
     config: AxiomConfig
+    turn_id: str | None = None
+    run_id: str | None = None
 
 
 EngineFactory = Callable[[RuntimeTurnContext], Any]
@@ -147,7 +156,9 @@ class ThreadEventRepository:
             conn.execute("create index if not exists idx_events_thread_id on events(thread_id, id)")
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("pragma journal_mode = wal")
+        conn.execute("pragma busy_timeout = 30000")
         conn.execute("pragma foreign_keys = on")
         return conn
 
@@ -166,6 +177,8 @@ class RuntimeApiServer:
         engine_factory: EngineFactory | None = None,
         tool_registry_factory: ToolRegistryFactory | None = None,
         memory_service: MemoryService | None = None,
+        checkpoint_store: RuntimeStore | None = None,
+        retry_policy: RetryPolicy | None = None,
     ):
         self.cwd = str(Path(cwd).resolve())
         self.config = config
@@ -177,6 +190,10 @@ class RuntimeApiServer:
         )
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.repository = ThreadEventRepository(self.data_dir / "runtime.db")
+        self.checkpoint_store = checkpoint_store or SQLiteCheckpointStore(
+            self.data_dir / "runtime.db"
+        )
+        self.retry_policy = retry_policy or RetryPolicy()
         self.task_manager = task_manager or DurableTaskManager(self.data_dir / "tasks.db")
         self.memory_service = memory_service or MemoryService(
             self.data_dir / "memory.db",
@@ -191,6 +208,8 @@ class RuntimeApiServer:
         self._worker_threads: list[threading.Thread] = []
         self._thread_locks: dict[str, threading.Lock] = {}
         self._thread_locks_guard = threading.Lock()
+        self._run_locks: dict[str, threading.Lock] = {}
+        self._run_locks_guard = threading.Lock()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -316,7 +335,13 @@ class RuntimeApiServer:
                     return
                 try:
                     result = asyncio.run(self._run_turn(thread_id, message))
-                    _send_json(request, 200, result)
+                    response_status = (
+                        202
+                        if result.get("status")
+                        in {RunStatus.INTERRUPTED.value, RunStatus.WAITING_APPROVAL.value}
+                        else 200
+                    )
+                    _send_json(request, response_status, result)
                 finally:
                     lock.release()
             elif method == "GET" and path.startswith("/v1/threads/") and path.endswith("/events"):
@@ -326,6 +351,46 @@ class RuntimeApiServer:
                     _send_json(request, 404, {"error": "thread not found"})
                     return
                 self._send_events(request, thread_id, after_id=after_id)
+            elif method == "GET" and path.startswith("/v1/runs/"):
+                run_id = path.split("/")[3]
+                state = asyncio.run(self.checkpoint_store.load(run_id))
+                if state is None:
+                    _send_json(request, 404, {"error": "run not found"})
+                    return
+                _send_json(request, 200, state.public_dict())
+            elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/resume"):
+                run_id = path.split("/")[3]
+                lock = self._run_lock(run_id)
+                if not lock.acquire(blocking=False):
+                    _send_json(request, 409, {"error": "run already advancing"})
+                    return
+                try:
+                    decision = body.get("decision")
+                    if decision is None and "approved" in body:
+                        decision = "approve" if body.get("approved") else "reject"
+                    result = asyncio.run(
+                        self._resume_run(
+                            run_id,
+                            decision=str(decision) if decision is not None else None,
+                        )
+                    )
+                    response_status = (
+                        202 if result.get("status") == RunStatus.WAITING_APPROVAL.value else 200
+                    )
+                    _send_json(request, response_status, result)
+                finally:
+                    lock.release()
+            elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/cancel"):
+                run_id = path.split("/")[3]
+                state = asyncio.run(self._set_run_status(run_id, RunStatus.CANCELLED))
+                _send_json(request, 200, state.public_dict())
+            elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/interrupt"):
+                run_id = path.split("/")[3]
+                reason = str(body.get("reason") or "manual interrupt")
+                state = asyncio.run(
+                    self._set_run_status(run_id, RunStatus.INTERRUPTED, reason=reason)
+                )
+                _send_json(request, 200, state.public_dict())
             elif method == "POST" and path == "/v1/tasks":
                 prompt = str(body.get("message") or body.get("prompt") or "")
                 if not prompt:
@@ -344,20 +409,30 @@ class RuntimeApiServer:
                 _send_json(request, 200, {"canceled": self.task_manager.cancel(task_id)})
             else:
                 _send_json(request, 404, {"error": "not found"})
+        except (CheckpointConflictError, ValueError) as exc:
+            _send_json(request, 409, {"error": _safe_error(exc)})
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": _safe_error(exc)})
 
     async def _run_turn(self, thread_id: str, message: str) -> dict[str, Any]:
         history_events = self.repository.list_events(thread_id)
         history = self.memory_service.history_from_runtime_events(history_events)
+        turn_id = f"turn_{uuid4().hex}"
+        run_id = f"run_{uuid4().hex}"
         context = RuntimeTurnContext(
             thread_id=thread_id,
             message=message,
             history=history,
             cwd=self.cwd,
             config=self.config,
+            turn_id=turn_id,
+            run_id=run_id,
         )
-        self.repository.append_event(thread_id, "turn.started", {"message_chars": len(message)})
+        self.repository.append_event(
+            thread_id,
+            "turn.started",
+            {"turn_id": turn_id, "run_id": run_id, "message_chars": len(message)},
+        )
         user_event_id = self.repository.append_event(thread_id, "user.message", {"text": message})
         self._derive_conversation_memory(
             thread_id,
@@ -366,6 +441,53 @@ class RuntimeApiServer:
             event_id=user_event_id,
         )
         engine = await self._engine(context)
+        run_lock = self._run_lock(run_id)
+        if not run_lock.acquire(blocking=False):
+            raise RuntimeError("new run unexpectedly already advancing")
+        try:
+            if isinstance(engine, QueryEngine):
+                runtime = self._durable_runtime(engine, thread_id)
+                state = await runtime.start(
+                    thread_id=thread_id,
+                    input=message,
+                    history=history,
+                    run_id=run_id,
+                    turn_id=turn_id,
+                )
+                return await self._finish_durable_turn(state)
+
+            return await self._run_legacy_turn(
+                engine=engine,
+                context=context,
+                thread_id=thread_id,
+                message=message,
+                history=history,
+            )
+        finally:
+            run_lock.release()
+
+    async def _run_legacy_turn(
+        self,
+        *,
+        engine: Any,
+        context: RuntimeTurnContext,
+        thread_id: str,
+        message: str,
+        history: list[Message],
+    ) -> dict[str, Any]:
+        state = Checkpoint.create(
+            thread_id=thread_id,
+            input=message,
+            history=history,
+            run_id=context.run_id,
+            turn_id=context.turn_id,
+        )
+        await self.checkpoint_store.save(state)
+        self.repository.append_event(
+            thread_id,
+            "run.started",
+            {"run_id": state.run_id, "turn_id": state.turn_id, "legacy_engine": True},
+        )
         text = ""
         done_payload: dict[str, Any] = {}
         try:
@@ -395,7 +517,26 @@ class RuntimeApiServer:
                     done_payload = _jsonable(event)
         except Exception as exc:
             self.repository.append_event(thread_id, "error", {"error": _safe_error(exc)})
+            state.status = RunStatus.FAILED
+            state.error = RunError(type=type(exc).__name__, message=_safe_error(exc), step="engine")
+            await self.checkpoint_store.save(state)
+            self.repository.append_event(
+                thread_id,
+                "run.failed",
+                {"run_id": state.run_id, "error": state.error.to_dict()},
+            )
             raise
+        state.messages.append(Message(role="assistant", content=text))
+        state.output_text = text
+        state.status = RunStatus.COMPLETED
+        state.agent_turn = int(done_payload.get("total_turns") or 1)
+        state.total_tokens = int(done_payload.get("total_tokens") or 0)
+        await self.checkpoint_store.save(state)
+        self.repository.append_event(
+            thread_id,
+            "run.completed",
+            {"run_id": state.run_id, "legacy_engine": True},
+        )
         assistant_event_id = self.repository.append_event(
             thread_id,
             "assistant.message",
@@ -407,10 +548,162 @@ class RuntimeApiServer:
             content=text,
             event_id=assistant_event_id,
         )
-        self.repository.append_event(thread_id, "turn.completed", done_payload)
+        self.repository.append_event(
+            thread_id,
+            "turn.completed",
+            {**done_payload, "turn_id": state.turn_id, "run_id": state.run_id},
+        )
         await self._summarize_thread_best_effort(thread_id)
         await self._extract_facts_best_effort(thread_id)
         return {"thread_id": thread_id, "text": text}
+
+    async def _resume_run(self, run_id: str, *, decision: str | None) -> dict[str, Any]:
+        state = await self.checkpoint_store.load(run_id)
+        if state is None:
+            raise ValueError("run not found")
+        context = RuntimeTurnContext(
+            thread_id=state.thread_id,
+            message=state.input,
+            history=list(state.messages),
+            cwd=self.cwd,
+            config=self.config,
+            turn_id=state.turn_id,
+            run_id=state.run_id,
+        )
+        engine = await self._engine(context)
+        if not isinstance(engine, QueryEngine):
+            raise ValueError("custom engine does not support durable resume")
+        runtime = self._durable_runtime(engine, state.thread_id)
+        state = await runtime.resume(run_id, decision=decision)
+        return await self._finish_durable_turn(state)
+
+    async def _finish_durable_turn(self, state: Checkpoint) -> dict[str, Any]:
+        if state.status in {RunStatus.WAITING_APPROVAL, RunStatus.INTERRUPTED}:
+            return {
+                "thread_id": state.thread_id,
+                "turn_id": state.turn_id,
+                "run_id": state.run_id,
+                "status": state.status.value,
+                "interrupt": state.interrupt.to_dict() if state.interrupt else None,
+                "text": state.output_text,
+            }
+        if state.status == RunStatus.CANCELLED:
+            return {
+                "thread_id": state.thread_id,
+                "turn_id": state.turn_id,
+                "run_id": state.run_id,
+                "status": state.status.value,
+                "text": state.output_text,
+            }
+        if state.status == RunStatus.FAILED:
+            message = state.error.message if state.error else "run failed"
+            self.repository.append_event(state.thread_id, "error", {"error": message})
+            raise RuntimeError(message)
+
+        assistant_event_id = self.repository.append_event(
+            state.thread_id,
+            "assistant.message",
+            {"text": state.output_text},
+        )
+        self._derive_conversation_memory(
+            state.thread_id,
+            role="assistant",
+            content=state.output_text,
+            event_id=assistant_event_id,
+        )
+        self.repository.append_event(
+            state.thread_id,
+            "turn.completed",
+            {
+                "turn_id": state.turn_id,
+                "run_id": state.run_id,
+                "total_turns": state.agent_turn,
+                "total_tokens": state.total_tokens,
+            },
+        )
+        await self._summarize_thread_best_effort(state.thread_id)
+        await self._extract_facts_best_effort(state.thread_id)
+        return {"thread_id": state.thread_id, "text": state.output_text}
+
+    def _durable_runtime(self, engine: QueryEngine, thread_id: str) -> DurableAgentRuntime:
+        return DurableAgentRuntime(
+            llm_client=engine.llm_client,
+            tool_registry=engine.tool_registry,
+            system_prompt=engine.system_prompt,
+            cwd=engine.cwd,
+            config=engine.config,
+            store=self.checkpoint_store,
+            retry_policy=self.retry_policy,
+            event_sink=self._runtime_event_sink(thread_id),
+        )
+
+    def _runtime_event_sink(self, thread_id: str):
+        def emit(event_type: str, payload: dict[str, Any]) -> None:
+            self.repository.append_event(thread_id, event_type, payload)
+            if event_type == "tool.started":
+                self.repository.append_event(
+                    thread_id,
+                    "tool_call",
+                    {
+                        "name": payload.get("tool_name"),
+                        "input": payload.get("arguments", {}),
+                        "tool_call_id": payload.get("tool_call_id"),
+                        "invocation_id": payload.get("invocation_id"),
+                    },
+                )
+            elif event_type == "tool.completed":
+                event_id = self.repository.append_event(
+                    thread_id,
+                    "tool_result",
+                    {
+                        "name": payload.get("tool_name"),
+                        "result": payload.get("result", ""),
+                        "is_error": bool(payload.get("is_error")),
+                        "tool_call_id": payload.get("tool_call_id"),
+                        "invocation_id": payload.get("invocation_id"),
+                        "reused": bool(payload.get("reused")),
+                    },
+                )
+                self._derive_tool_result_memory(
+                    thread_id,
+                    tool_name=str(payload.get("tool_name") or "unknown"),
+                    success=not bool(payload.get("is_error")),
+                    content=str(payload.get("result") or ""),
+                    source_event_id=event_id,
+                )
+
+        return emit
+
+    async def _set_run_status(
+        self,
+        run_id: str,
+        status: RunStatus,
+        *,
+        reason: str | None = None,
+    ) -> Checkpoint:
+        state = await self.checkpoint_store.load(run_id)
+        if state is None:
+            raise ValueError("run not found")
+        if state.finished:
+            if state.status == status:
+                return state
+            raise ValueError(f"run in {state.status.value} cannot change status")
+        if status == RunStatus.INTERRUPTED and state.status != RunStatus.RUNNING:
+            raise ValueError(f"run in {state.status.value} cannot be manually interrupted")
+        state.status = status
+        state.interrupt = (
+            Interrupt(kind="manual", reason=reason or "manual interrupt")
+            if status == RunStatus.INTERRUPTED
+            else None
+        )
+        await self.checkpoint_store.save(state)
+        event_type = "run.interrupted" if status == RunStatus.INTERRUPTED else "run.cancelled"
+        self.repository.append_event(
+            state.thread_id,
+            event_type,
+            {"run_id": state.run_id, "status": state.status.value, "reason": reason},
+        )
+        return state
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -477,6 +770,14 @@ class RuntimeApiServer:
             if lock is None:
                 lock = threading.Lock()
                 self._thread_locks[thread_id] = lock
+            return lock
+
+    def _run_lock(self, run_id: str) -> threading.Lock:
+        with self._run_locks_guard:
+            lock = self._run_locks.get(run_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._run_locks[run_id] = lock
             return lock
 
     def _derive_conversation_memory(
@@ -598,13 +899,17 @@ def _send_json(request: BaseHTTPRequestHandler, status: int, payload: dict[str, 
 
 
 def _jsonable(event: dict[str, Any]) -> dict[str, Any]:
-    result = {}
-    for key, value in event.items():
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            result[key] = value
-        else:
-            result[key] = str(value)
-    return result
+    return {str(key): _json_value(value) for key, value in event.items()}
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    return str(value)
 
 
 def _decode_payload(payload: str) -> dict[str, Any]:

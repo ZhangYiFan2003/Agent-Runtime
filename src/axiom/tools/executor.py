@@ -45,6 +45,14 @@ class ToolExecutor:
 
         return results
 
+    async def execute_one(
+        self,
+        call: dict[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        """Execute one call while preserving the normal validation and policy path."""
+        return await self._execute_single(call, self.registry.get(_tool_call_name(call)), context)
+
     async def _execute_single(
         self,
         call: dict[str, Any],

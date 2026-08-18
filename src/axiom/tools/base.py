@@ -27,6 +27,7 @@ class ToolContext:
         None
     )
     skill_context_buffer: Any | None = None
+    invocation_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -41,6 +42,7 @@ class Tool:
     requires_approval: bool = False
     timeout: float = 60.0
     required_keys: list[str] = field(default_factory=list)
+    idempotency_key_parameter: str | None = None
 
     def definition(self) -> dict[str, Any]:
         return {
