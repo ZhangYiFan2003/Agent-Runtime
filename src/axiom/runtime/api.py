@@ -472,7 +472,11 @@ class RuntimeApiServer:
             raise RuntimeError("new run unexpectedly already advancing")
         try:
             if isinstance(engine, QueryEngine):
-                runtime = self._durable_runtime(engine, thread_id)
+                runtime = self._durable_runtime(
+                    engine,
+                    thread_id,
+                    execution_strategy=_execution_strategy_name(engine.config.prompt.agent_mode),
+                )
                 state = await runtime.start(
                     thread_id=thread_id,
                     input=message,
@@ -614,7 +618,11 @@ class RuntimeApiServer:
         engine = await self._engine(context)
         if not isinstance(engine, QueryEngine):
             raise ValueError("custom engine does not support durable resume")
-        runtime = self._durable_runtime(engine, state.thread_id)
+        runtime = self._durable_runtime(
+            engine,
+            state.thread_id,
+            execution_strategy=state.execution_strategy,
+        )
         state = await runtime.resume(run_id, decision=decision)
         return await self._finish_durable_turn(state)
 
@@ -666,7 +674,13 @@ class RuntimeApiServer:
         await self._extract_facts_best_effort(state.thread_id)
         return {"thread_id": state.thread_id, "text": state.output_text}
 
-    def _durable_runtime(self, engine: QueryEngine, thread_id: str) -> DurableAgentRuntime:
+    def _durable_runtime(
+        self,
+        engine: QueryEngine,
+        thread_id: str,
+        *,
+        execution_strategy: str = "react",
+    ) -> DurableAgentRuntime:
         return DurableAgentRuntime(
             llm_client=engine.llm_client,
             tool_registry=engine.tool_registry,
@@ -677,6 +691,7 @@ class RuntimeApiServer:
             retry_policy=self.retry_policy,
             event_sink=self._runtime_event_sink(thread_id),
             tracer=RunTracer(self.observability_store),
+            execution_strategy=execution_strategy,
         )
 
     def _runtime_event_sink(self, thread_id: str):
@@ -1003,6 +1018,11 @@ def _safe_error(exc: Exception) -> str:
     for secret in ["AXIOM_RUNTIME_API_KEY", "Authorization", "Bearer"]:
         text = text.replace(secret, "[redacted]")
     return text
+
+
+def _execution_strategy_name(agent_mode: str) -> str:
+    normalized = (agent_mode or "react").strip().lower().replace("-", "_")
+    return "plan_execute" if normalized in {"plan", "plan_execute"} else "react"
 
 
 def _now() -> str:

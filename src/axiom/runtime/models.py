@@ -87,6 +87,8 @@ class Checkpoint:
     step_index: int = 0
     total_tokens: int = 0
     output_text: str = ""
+    execution_strategy: str = "react"
+    strategy_state: dict[str, Any] = field(default_factory=dict)
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     next_tool_index: int = 0
     decisions: dict[str, str] = field(default_factory=dict)
@@ -104,6 +106,7 @@ class Checkpoint:
         history: list[Message] | None = None,
         run_id: str | None = None,
         turn_id: str | None = None,
+        execution_strategy: str = "react",
     ) -> Checkpoint:
         return cls(
             run_id=run_id or _new_id("run"),
@@ -111,6 +114,7 @@ class Checkpoint:
             turn_id=turn_id or _new_id("turn"),
             input=input,
             messages=[*(history or []), Message(role="user", content=input)],
+            execution_strategy=execution_strategy,
         )
 
     @property
@@ -135,6 +139,8 @@ class Checkpoint:
             "step_index": self.step_index,
             "total_tokens": self.total_tokens,
             "output_text": self.output_text,
+            "execution_strategy": self.execution_strategy,
+            "strategy_state": _json_value(self.strategy_state),
             "pending_tool_calls": _json_value(self.pending_tool_calls),
             "next_tool_index": self.next_tool_index,
             "decisions": dict(self.decisions),
@@ -166,6 +172,8 @@ class Checkpoint:
             step_index=int(data.get("step_index") or 0),
             total_tokens=int(data.get("total_tokens") or 0),
             output_text=str(data.get("output_text") or ""),
+            execution_strategy=str(data.get("execution_strategy") or "react"),
+            strategy_state=_dict(data.get("strategy_state")),
             pending_tool_calls=[item for item in raw_calls if isinstance(item, dict)]
             if isinstance(raw_calls, list)
             else [],
@@ -191,6 +199,7 @@ class Checkpoint:
             "agent_turn": self.agent_turn,
             "step_index": self.step_index,
             "total_tokens": self.total_tokens,
+            "execution_strategy": self.execution_strategy,
             "interrupt": self.interrupt.to_dict() if self.interrupt else None,
             "error": self.error.to_dict() if self.error else None,
             "created_at": self.created_at,

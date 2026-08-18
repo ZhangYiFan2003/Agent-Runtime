@@ -31,6 +31,7 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.observability import Span, SpanStatus, SpanType, now, tool_span_id
 from axiom.runtime.observability_store import RunTracer
+from axiom.runtime.strategies import RuntimeExecutionStrategy, execution_strategy_from_name
 from axiom.tools.base import Tool, ToolContext, ToolResult
 from axiom.tools.executor import ToolExecutor
 from axiom.tools.registry import ToolRegistry
@@ -84,6 +85,7 @@ class DurableAgentRuntime:
         tracer: RunTracer | None = None,
         permission_policy: PermissionPolicy | None = None,
         execution_backend: ExecutionBackend | None = None,
+        execution_strategy: RuntimeExecutionStrategy | str = "react",
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -100,6 +102,11 @@ class DurableAgentRuntime:
             hitl_mode=config.policy.hitl_mode,
         )
         self.execution_backend = execution_backend or create_execution_backend(config, cwd)
+        self.execution_strategy = (
+            execution_strategy_from_name(execution_strategy, llm_client=llm_client)
+            if isinstance(execution_strategy, str)
+            else execution_strategy
+        )
         self.max_turns = max_turns
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -118,6 +125,7 @@ class DurableAgentRuntime:
             history=history,
             run_id=run_id,
             turn_id=turn_id,
+            execution_strategy=self.execution_strategy.name,
         )
         async with self._run_lock(state.run_id):
             if await self.store.load(state.run_id) is not None:
@@ -134,6 +142,11 @@ class DurableAgentRuntime:
     async def resume(self, run_id: str, *, decision: str | None = None) -> Checkpoint:
         async with self._run_lock(run_id):
             state = await self._require(run_id)
+            if state.execution_strategy != self.execution_strategy.name:
+                raise ValueError(
+                    "runtime execution strategy does not match persisted checkpoint: "
+                    f"{self.execution_strategy.name} != {state.execution_strategy}"
+                )
             if state.status == RunStatus.CANCELLED:
                 raise ValueError("cancelled run cannot be resumed")
             if state.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
@@ -244,12 +257,22 @@ class DurableAgentRuntime:
                 await self.tracer.start_run(state)
             state.status = RunStatus.CANCELLED
             state.interrupt = None
+            await self.execution_strategy.on_cancel(self, state)
             await self._save_checkpoint(state, operation="cancel")
+            await self.execution_strategy.after_cancel(self, state)
             await self._finish_run_trace(state.status)
             await self._emit("run.cancelled", {"run_id": run_id})
             return state
 
     async def _advance(self, state: Checkpoint) -> Checkpoint:
+        if state.execution_strategy != self.execution_strategy.name:
+            raise ValueError(
+                "runtime execution strategy does not match persisted checkpoint: "
+                f"{self.execution_strategy.name} != {state.execution_strategy}"
+            )
+        return await self.execution_strategy.advance(self, state)
+
+    async def _advance_react(self, state: Checkpoint) -> Checkpoint:
         while state.status == RunStatus.RUNNING:
             state = await self._refresh(state)
             if state.status != RunStatus.RUNNING:
@@ -271,7 +294,17 @@ class DurableAgentRuntime:
             state = await self._execute_llm_step(state)
         return state
 
-    async def _execute_llm_step(self, state: Checkpoint) -> Checkpoint:
+    async def _execute_llm_step(
+        self,
+        state: Checkpoint,
+        *,
+        system_prompt: str | None = None,
+        parent_span_id: str | None = None,
+        complete_run: bool = True,
+        fail_run: bool = True,
+        output_state_key: str | None = None,
+        tool_call_scope: str | None = None,
+    ) -> Checkpoint:
         attempt = 0
         while True:
             attempt += 1
@@ -280,6 +313,7 @@ class DurableAgentRuntime:
                 SpanType.AGENT,
                 "agent.step",
                 attributes={"step_index": step_index, "kind": "llm", "attempt": attempt},
+                parent_span_id=parent_span_id,
             )
             await self._emit(
                 "step.started",
@@ -317,7 +351,11 @@ class DurableAgentRuntime:
                 },
             )
             try:
-                llm_result = await self._collect_llm_response(state, call_started=call_started)
+                llm_result = await self._collect_llm_response(
+                    state,
+                    call_started=call_started,
+                    system_prompt=system_prompt,
+                )
             except Exception as exc:
                 message = _safe_error(exc)
                 latency_ms = round((time.perf_counter() - call_started) * 1000, 3)
@@ -366,10 +404,14 @@ class DurableAgentRuntime:
                     {"run_id": state.run_id, "step_index": step_index, "error": message},
                 )
                 if not self.retry_policy.can_retry(message, attempt):
-                    state.status = RunStatus.FAILED
-                    await self._save_checkpoint(state, operation="run.failed")
-                    await self._finish_run_trace(state.status)
-                    await self._emit("run.failed", {"run_id": state.run_id, "error": message})
+                    if fail_run:
+                        state.status = RunStatus.FAILED
+                        await self._save_checkpoint(state, operation="run.failed")
+                        await self._finish_run_trace(state.status)
+                        await self._emit("run.failed", {"run_id": state.run_id, "error": message})
+                    else:
+                        state.strategy_state["current_task_error"] = message
+                        await self._save_checkpoint(state, operation="plan.step.llm_failed")
                     return state
                 if self.retry_policy.backoff_seconds > 0:
                     await asyncio.sleep(self.retry_policy.backoff_seconds)
@@ -404,21 +446,29 @@ class DurableAgentRuntime:
             )
 
             state.error = None
+            scoped_tool_calls = _scope_tool_call_ids(llm_result.tool_calls, tool_call_scope)
             state.messages.append(
                 Message(
                     role="assistant",
                     content=llm_result.text,
-                    tool_calls=llm_result.tool_calls,
+                    tool_calls=scoped_tool_calls,
                 )
             )
-            state.output_text += llm_result.text
-            state.pending_tool_calls = llm_result.tool_calls
+            if output_state_key is None:
+                state.output_text += llm_result.text
+            else:
+                current = str(state.strategy_state.get(output_state_key) or "")
+                state.strategy_state[output_state_key] = current + llm_result.text
+            state.pending_tool_calls = scoped_tool_calls
             state.next_tool_index = 0
             state.agent_turn += 1
             state.step_index += 1
             state.total_tokens += llm_result.prompt_tokens + llm_result.completion_tokens
-            if not llm_result.tool_calls and llm_result.stop_reason != "tool_use":
-                state.status = RunStatus.COMPLETED
+            if not scoped_tool_calls and llm_result.stop_reason != "tool_use":
+                if complete_run:
+                    state.status = RunStatus.COMPLETED
+                else:
+                    state.strategy_state["current_task_complete"] = True
             await self._save_checkpoint(
                 state,
                 operation="llm.completed",
@@ -429,7 +479,7 @@ class DurableAgentRuntime:
                 SpanStatus.SUCCEEDED,
                 attributes={
                     "finish_reason": llm_result.stop_reason,
-                    "tool_calls": len(llm_result.tool_calls),
+                    "tool_calls": len(scoped_tool_calls),
                 },
             )
             await self._emit(
@@ -439,7 +489,7 @@ class DurableAgentRuntime:
                     "step_index": state.step_index - 1,
                     "kind": "llm",
                     "stop_reason": llm_result.stop_reason,
-                    "tool_calls": len(llm_result.tool_calls),
+                    "tool_calls": len(scoped_tool_calls),
                 },
             )
             await self._emit(
@@ -459,6 +509,7 @@ class DurableAgentRuntime:
         state: Checkpoint,
         *,
         call_started: float,
+        system_prompt: str | None = None,
     ) -> _LlmCallResult:
         text = ""
         stop_reason = "end_turn"
@@ -470,7 +521,7 @@ class DurableAgentRuntime:
         async for event in self.llm_client.chat(
             state.messages,
             self.tool_registry.definitions(),
-            system_prompt=self.system_prompt,
+            system_prompt=system_prompt or self.system_prompt,
         ):
             event_type = event.get("type")
             if (
@@ -503,12 +554,18 @@ class DurableAgentRuntime:
             ttft_ms=ttft_ms,
         )
 
-    async def _execute_pending_tool(self, state: Checkpoint) -> Checkpoint:
+    async def _execute_pending_tool(
+        self,
+        state: Checkpoint,
+        *,
+        parent_span_id: str | None = None,
+    ) -> Checkpoint:
         step_index = state.step_index
         step_span = await self._start_span(
             SpanType.AGENT,
             "agent.step",
             attributes={"step_index": step_index, "kind": "tool"},
+            parent_span_id=parent_span_id,
         )
         await self._emit(
             "agent.step.started",
@@ -1136,6 +1193,8 @@ class DurableAgentRuntime:
         *,
         attributes: dict[str, object] | None = None,
         parent_span_id: str | None = None,
+        span_id: str | None = None,
+        reopen: bool = False,
     ) -> Span | None:
         if self.tracer is None:
             return None
@@ -1144,6 +1203,8 @@ class DurableAgentRuntime:
             name,
             attributes=attributes,
             parent_span_id=parent_span_id,
+            span_id=span_id,
+            reopen=reopen,
         )
 
     async def _finish_span(
@@ -1245,6 +1306,21 @@ def _merge_tool_delta(
 
 def _finalize_tool_calls(states: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
     return [states[index] for index in sorted(states) if states[index]["function"]["name"]]
+
+
+def _scope_tool_call_ids(
+    calls: list[dict[str, Any]],
+    scope: str | None,
+) -> list[dict[str, Any]]:
+    if scope is None:
+        return calls
+    scoped: list[dict[str, Any]] = []
+    for index, call in enumerate(calls):
+        item = dict(call)
+        original = str(item.get("id") or f"call_{index}")
+        item["id"] = f"{scope}:{original}"
+        scoped.append(item)
+    return scoped
 
 
 def _tool_call_name(call: dict[str, Any]) -> str:

@@ -108,8 +108,9 @@ flowchart TD
     tools, appends tool results, and repeats until the model finishes or the
     max turn limit is reached.
 - `src/axiom/agent/plan_execute.py`
-  - Implements Plan-and-Execute. A planner creates a DAG, then executable tasks
-    run in dependency order with parallel batches when possible.
+  - Provides the Plan-and-Execute compatibility facade. The planner creates a
+    DAG and `PlanExecuteStrategy` advances it sequentially at durable boundaries
+    inside `DurableAgentRuntime`.
 - `src/axiom/agent/orchestrator.py`
   - Implements a multi-agent workflow with planner, worker, and reviewer roles.
   - Workers can use tools; planner and reviewer run without tools.
@@ -476,10 +477,9 @@ MCP server expansion points:
 - Runtime API persistence is local SQLite and bound to localhost; it is not a
   distributed service, public deployment validation, load-tested API, or
   distributed queue.
-- The durable loop currently covers the Runtime API's default ReAct QueryEngine.
-  Plan-Execute, multi-agent worker/DAG state, and custom engine internals remain
-  in-memory. There is no distributed lock, recovery scheduler, or checkpoint
-  compaction yet.
+- The durable Runtime covers ReAct and Plan-Execute strategies. Multi-agent
+  planner/worker/reviewer state and custom engine internals remain in-memory.
+  There is no distributed lock, recovery scheduler, or checkpoint compaction yet.
 - Runtime tool records provide best-effort deduplication after a persisted
   success, not exactly-once semantics for arbitrary external side effects.
 - Observability is local and unsampled. There is no distributed trace context,

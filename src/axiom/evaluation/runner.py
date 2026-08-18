@@ -45,11 +45,13 @@ class DurableEvaluationExecutor:
         checkpoint_store: RuntimeStore,
         observability_store: ObservabilityStore,
         retry_policy: RetryPolicy | None = None,
+        execution_strategy: str = "react",
     ) -> None:
         self.engine_factory = engine_factory
         self.checkpoint_store = checkpoint_store
         self.observability_store = observability_store
         self.retry_policy = retry_policy
+        self.execution_strategy = execution_strategy
         self.observability = ObservabilityService(observability_store)
 
     async def execute(self, case: EvaluationCase) -> EvaluationRunResult:
@@ -69,6 +71,7 @@ class DurableEvaluationExecutor:
             store=self.checkpoint_store,
             retry_policy=self.retry_policy,
             tracer=tracer,
+            execution_strategy=self.execution_strategy,
         )
         state: Checkpoint | None = None
         execution_error: str | None = None

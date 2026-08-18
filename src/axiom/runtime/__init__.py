@@ -25,6 +25,8 @@ from axiom.runtime.observability_store import (
     ObservabilityService,
     SQLiteObservabilityStore,
 )
+from axiom.runtime.plan_strategy import PlanExecuteStrategy
+from axiom.runtime.strategies import ReactExecutionStrategy, RuntimeExecutionStrategy
 from axiom.runtime.tasks import DurableTaskManager, TaskRecord
 
 __all__ = [
@@ -36,10 +38,13 @@ __all__ = [
     "MemoryCheckpointStore",
     "MemoryObservabilityStore",
     "ObservabilityService",
+    "PlanExecuteStrategy",
+    "ReactExecutionStrategy",
     "RetryPolicy",
     "RunStatus",
     "RunMetrics",
     "RuntimeApiServer",
+    "RuntimeExecutionStrategy",
     "SQLiteCheckpointStore",
     "SQLiteObservabilityStore",
     "Span",

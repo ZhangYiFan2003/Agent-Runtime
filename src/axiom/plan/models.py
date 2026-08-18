@@ -3,6 +3,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
+
+PLAN_SCHEMA_VERSION = 1
 
 
 class TaskType(StrEnum):
@@ -40,6 +43,7 @@ class Task:
     status: TaskStatus = TaskStatus.PENDING
     result: str = ""
     error: str = ""
+    attempt: int = 0
     start_time: float = 0.0
     end_time: float = 0.0
 
@@ -53,6 +57,7 @@ class Task:
 
     def mark_started(self) -> None:
         self.status = TaskStatus.RUNNING
+        self.attempt += 1
         self.start_time = time.time()
 
     def mark_completed(self, result: str) -> None:
@@ -77,6 +82,74 @@ class Task:
             for dep_id in self.dependencies
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "description": self.description,
+            "type": self.type.value,
+            "dependencies": list(self.dependencies),
+            "dependents": list(self.dependents),
+            "status": self.status.value,
+            "result": self.result,
+            "error": self.error,
+            "attempt": self.attempt,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Task:
+        return cls(
+            id=str(data["id"]),
+            description=str(data.get("description") or ""),
+            type=TaskType(str(data.get("type") or TaskType.ANALYSIS.value)),
+            dependencies=_strings(data.get("dependencies")),
+            dependents=_strings(data.get("dependents")),
+            status=TaskStatus(str(data.get("status") or TaskStatus.PENDING.value)),
+            result=str(data.get("result") or ""),
+            error=str(data.get("error") or ""),
+            attempt=int(data.get("attempt") or 0),
+            start_time=float(data.get("start_time") or 0.0),
+            end_time=float(data.get("end_time") or 0.0),
+        )
+
+
+@dataclass(slots=True)
+class PlanVersion:
+    version: int
+    plan_id: str
+    status: PlanStatus
+    summary: str
+    reason: str
+    tasks: list[Task]
+    created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "plan_id": self.plan_id,
+            "status": self.status.value,
+            "summary": self.summary,
+            "reason": self.reason,
+            "tasks": [task.to_dict() for task in self.tasks],
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PlanVersion:
+        raw_tasks = data.get("tasks")
+        return cls(
+            version=int(data.get("version") or 1),
+            plan_id=str(data.get("plan_id") or ""),
+            status=PlanStatus(str(data.get("status") or PlanStatus.CREATED.value)),
+            summary=str(data.get("summary") or ""),
+            reason=str(data.get("reason") or ""),
+            tasks=[Task.from_dict(item) for item in raw_tasks if isinstance(item, dict)]
+            if isinstance(raw_tasks, list)
+            else [],
+            created_at=float(data.get("created_at") or time.time()),
+        )
+
 
 @dataclass(slots=True)
 class ExecutionPlan:
@@ -84,7 +157,12 @@ class ExecutionPlan:
     goal: str
     tasks: dict[str, Task] = field(default_factory=dict)
     status: PlanStatus = PlanStatus.CREATED
+    schema_version: int = PLAN_SCHEMA_VERSION
+    version: int = 1
+    replan_count: int = 0
+    history: list[PlanVersion] = field(default_factory=list)
     summary: str = ""
+    created_at: float = field(default_factory=time.time)
     start_time: float = 0.0
     end_time: float = 0.0
     _execution_order: list[str] = field(default_factory=list)
@@ -197,3 +275,64 @@ class ExecutionPlan:
             f"First batch: {first_batch}\n"
             f"Final convergence: {final_batch}"
         )
+
+    def snapshot(self, reason: str) -> PlanVersion:
+        return PlanVersion(
+            version=self.version,
+            plan_id=self.id,
+            status=self.status,
+            summary=self.summary,
+            reason=reason,
+            tasks=[Task.from_dict(task.to_dict()) for task in self.all_tasks()],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "id": self.id,
+            "goal": self.goal,
+            "version": self.version,
+            "replan_count": self.replan_count,
+            "status": self.status.value,
+            "summary": self.summary,
+            "created_at": self.created_at,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "tasks": [task.to_dict() for task in self.all_tasks()],
+            "history": [revision.to_dict() for revision in self.history],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ExecutionPlan:
+        schema_version = int(data.get("schema_version") or 0)
+        if schema_version != PLAN_SCHEMA_VERSION:
+            raise ValueError(f"unsupported plan schema version: {schema_version}")
+        plan = cls(
+            id=str(data["id"]),
+            goal=str(data.get("goal") or ""),
+            status=PlanStatus(str(data.get("status") or PlanStatus.CREATED.value)),
+            schema_version=schema_version,
+            version=int(data.get("version") or 1),
+            replan_count=int(data.get("replan_count") or 0),
+            summary=str(data.get("summary") or ""),
+            created_at=float(data.get("created_at") or time.time()),
+            start_time=float(data.get("start_time") or 0.0),
+            end_time=float(data.get("end_time") or 0.0),
+        )
+        raw_tasks = data.get("tasks")
+        if isinstance(raw_tasks, list):
+            for item in raw_tasks:
+                if isinstance(item, dict):
+                    plan.add_task(Task.from_dict(item))
+        raw_history = data.get("history")
+        if isinstance(raw_history, list):
+            plan.history = [
+                PlanVersion.from_dict(item) for item in raw_history if isinstance(item, dict)
+            ]
+        if not plan.compute_execution_order():
+            raise ValueError("persisted plan contains a cyclic dependency")
+        return plan
+
+
+def _strings(value: Any) -> list[str]:
+    return [str(item) for item in value] if isinstance(value, list) else []

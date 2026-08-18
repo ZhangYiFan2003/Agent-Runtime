@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from axiom.llm.base import LlmClient
@@ -27,27 +28,57 @@ Use independent tasks when they can run in parallel.
 """
 
 
+@dataclass(frozen=True, slots=True)
+class PlannerResult:
+    plan: ExecutionPlan
+    used_llm: bool
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    finish_reason: str = "end_turn"
+    ttft_ms: float | None = None
+
+
 class Planner:
     def __init__(self, llm_client: LlmClient):
         self.llm_client = llm_client
 
+    def requires_llm(self, goal: str) -> bool:
+        return not _is_simple_goal(goal)
+
     async def create_plan(self, goal: str) -> ExecutionPlan:
+        return (await self.create_plan_result(goal)).plan
+
+    async def create_plan_result(self, goal: str) -> PlannerResult:
         if _is_simple_goal(goal):
-            return _minimal_plan(goal)
-        text = await _collect_text(
+            return PlannerResult(plan=_minimal_plan(goal), used_llm=False)
+        response = await _collect_text(
             self.llm_client,
             [Message(role="user", content=f"Please create an execution plan for:\n{goal}")],
             system_prompt=PLANNER_PROMPT,
         )
-        return self.parse_plan(goal, text)
+        return PlannerResult(
+            plan=self.parse_plan(goal, response.text),
+            used_llm=True,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            finish_reason=response.finish_reason,
+            ttft_ms=response.ttft_ms,
+        )
 
     async def replan(self, failed_plan: ExecutionPlan, failure_reason: str) -> ExecutionPlan:
+        return (await self.replan_result(failed_plan, failure_reason)).plan
+
+    async def replan_result(
+        self,
+        failed_plan: ExecutionPlan,
+        failure_reason: str,
+    ) -> PlannerResult:
         completed = "\n".join(
             f"- {task.id}: {task.description}"
             for task in failed_plan.all_tasks()
             if task.result and not task.error
         )
-        return await self.create_plan(
+        return await self.create_plan_result(
             f"{failed_plan.goal}\nFailure reason: {failure_reason}\nCompleted tasks:\n{completed}"
         )
 
@@ -100,15 +131,44 @@ async def _collect_text(
     messages: list[Message],
     *,
     system_prompt: str,
-) -> str:
+) -> _PlannerResponse:
     text = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+    finish_reason = "end_turn"
+    started = time.perf_counter()
+    ttft_ms: float | None = None
     async for event in llm_client.chat(messages, [], system_prompt=system_prompt):
         event_type = event.get("type")
         if event_type == "text_delta":
+            if ttft_ms is None:
+                ttft_ms = round((time.perf_counter() - started) * 1000, 3)
             text += str(event.get("text") or "")
+        elif event_type == "usage":
+            usage = event.get("usage") or {}
+            if isinstance(usage, dict):
+                prompt_tokens += int(usage.get("input_tokens") or 0)
+                completion_tokens += int(usage.get("output_tokens") or 0)
+        elif event_type == "message_end":
+            finish_reason = str(event.get("stop_reason") or "end_turn")
         elif event_type == "error":
             raise event["error"]
-    return text
+    return _PlannerResponse(
+        text=text,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        finish_reason=finish_reason,
+        ttft_ms=ttft_ms,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PlannerResponse:
+    text: str
+    prompt_tokens: int
+    completion_tokens: int
+    finish_reason: str
+    ttft_ms: float | None
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

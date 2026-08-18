@@ -32,7 +32,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Memory | Stores typed conversation, summary, fact/preference, and tool-result digest records with scoped SQLite persistence, Runtime thread history recovery, Map-Reduce summary checkpoints, conservative fact/preference extraction, conflict supersession, and budgeted context assembly. | Tested |
 | Snapshots | Creates, restores, lists, and cleans workspace snapshots under an isolated home in tests. | Tested |
 | Skills | Loads built-in, user, and project `SKILL.md` files and supports skill context injection. | Tested |
-| Plan-Execute | Parses task DAGs, runs independent tasks in parallel, respects dependencies, and aggregates results. | Tested |
+| Plan-Execute | Runs serialized versioned Plans as a durable Runtime strategy, with per-step checkpoints, recovery, replan history, stable Tool invocations, approval, isolation, and trace hierarchy. | SQLite recovery and strategy convergence tested |
 | Multi-Agent | Coordinates planner, worker, and reviewer roles, including retries and worker failure summaries. | Tested |
 | MCP Client | Discovers and calls tools from local stdio MCP servers in tests. | Tested |
 | MCP Server | Exposes built-in tools through handler-level JSON-RPC requests. | Handler tested |
@@ -73,7 +73,7 @@ Key modules:
 - `src/axiom/mcp/`: MCP client, MCP config, and MCP server handler support.
 - `src/axiom/memory/`: scoped typed memory persistence, Runtime history recovery, and budgeted memory context assembly.
 - `src/axiom/snapshot/`: workspace snapshot service.
-- `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, durable ReAct loop, tool execution records, and durable task store.
+- `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, shared ReAct/Plan execution strategies, tool execution records, and durable task store.
 
 ### Durable execution
 
@@ -123,6 +123,14 @@ Approved Shell calls use an `ExecutionBackend`; the default restricted local bac
 environment variables, validates workspace cwd, bounds stdout/stderr, and cleans process trees on
 timeout or task cancellation. It does not enforce a host filesystem jail or network isolation. See
 [`docs/execution-isolation.md`](docs/execution-isolation.md) for platform behavior and non-guarantees.
+
+### Durable Plan-Execute
+
+Plan-Execute now runs as a strategy inside `DurableAgentRuntime`. Plan creation, task transitions,
+Tool calls, approval interrupts, replans, and completion share the existing Checkpoint,
+ToolExecution, Permission, Restricted Execution, Trace, and Evaluation contracts. See
+[`docs/plan-durable-execution.md`](docs/plan-durable-execution.md) for recovery boundaries and the
+versioned Plan state model.
 
 See [`docs/architecture-current.md`](docs/architecture-current.md) for the detailed architecture baseline.
 
@@ -217,7 +225,7 @@ uv run pytest
 Current baseline:
 
 ```text
-204 tests passing
+221 tests passing
 ```
 
 The default tests use fake LLM clients, temporary directories, temporary SQLite databases, deterministic code-search fixtures, and localhost-safe HTTP paths. They do not require API keys and do not call external model providers.
@@ -250,7 +258,7 @@ Partially verified or intentionally bounded:
 
 - MCP server long-running stdio/http transport lifecycle remains partially verified.
 - Runtime API public deployment, load testing, distributed queues, real-provider CI, and unlimited live streaming are not verified.
-- Plan-Execute and multi-agent internal step state do not yet use the durable Run loop.
+- Multi-agent internal planner/worker/reviewer state does not yet use the durable Run loop.
 - Distributed execution/locking, checkpoint compaction, automatic recovery scanning, and
   exactly-once semantics for arbitrary external tool side effects are not implemented.
 - Semantic memory retrieval, production LLM extraction quality evaluation, remote summarization/extraction CI, and cross-project preference sharing are not implemented yet.
