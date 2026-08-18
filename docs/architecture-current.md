@@ -113,7 +113,8 @@ flowchart TD
     inside `DurableAgentRuntime`.
 - `src/axiom/agent/orchestrator.py`
   - Provides the Multi-Agent compatibility facade over `MultiAgentExecutionStrategy`.
-  - Planner and Reviewer remain Parent steps; tool-capable Workers run as durable React Child Runs.
+  - Planner and Reviewer remain serialized Parent steps; independent tool-capable Workers run as
+    bounded parallel durable React Child Runs.
 
 ### Prompting
 
@@ -480,9 +481,10 @@ MCP server expansion points:
 - Runtime API persistence is local SQLite and bound to localhost; it is not a
   distributed service, public deployment validation, load-tested API, or
   distributed queue.
-- The durable Runtime covers ReAct, Plan-Execute, and sequential Multi-Agent strategies. Multi-Agent
-  Parent state and tool-capable Worker Child Runs are checkpointed with stable Parent/Child lineage.
-  There is no distributed lock, recovery scheduler, or checkpoint compaction yet.
+- The durable Runtime covers ReAct, Plan-Execute, and bounded local Multi-Agent scheduling.
+  Multi-Agent Parent state and tool-capable Worker Child Runs are checkpointed with stable
+  Parent/Child lineage and CAS-safe completion reconciliation. There is no distributed lock,
+  distributed scheduler, or checkpoint compaction yet.
 - Runtime tool records provide best-effort deduplication after a persisted
   success, not exactly-once semantics for arbitrary external side effects.
 - Observability is local and unsampled. There is no distributed trace context,

@@ -30,7 +30,7 @@ def test_orchestrator_parses_steps_and_review_output(tmp_path, monkeypatch):
     )
 
 
-def test_orchestrator_runs_independent_workers_sequentially(tmp_path, monkeypatch):
+def test_orchestrator_runs_independent_workers_in_parallel(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     client = ParallelTeamClient()
     orchestrator = _orchestrator(tmp_path, client)
@@ -49,7 +49,7 @@ def test_orchestrator_runs_independent_workers_sequentially(tmp_path, monkeypatc
     assert "Multi-Agent task completed" in result
     assert "Task A result" in result
     assert "Task B result" in result
-    assert client.peak_concurrency == 1
+    assert client.peak_concurrency == 2
 
 
 class FakeTeamClient:

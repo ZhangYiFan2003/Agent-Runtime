@@ -231,7 +231,7 @@ class AgentOrchestrator:
         from axiom.prompt import PromptAssembler
         from axiom.runtime.durable import DurableAgentRuntime
         from axiom.runtime.models import RunStatus
-        from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
+        from axiom.runtime.multi_agent_strategy import AssignmentStatus, MultiAgentExecutionStrategy
         from axiom.runtime.observability_store import RunTracer
 
         snapshot = SnapshotService(self.cwd)
@@ -248,6 +248,7 @@ class AgentOrchestrator:
 
         strategy = MultiAgentExecutionStrategy(
             max_retries_per_assignment=self.max_retries_per_step,
+            max_parallel_workers=self.worker_count,
         )
         system_prompt = PromptAssembler(
             config=self.config,
@@ -287,15 +288,22 @@ class AgentOrchestrator:
                 yield {"type": "text_delta", "text": state.output_text}
             if state.status == RunStatus.WAITING_CHILD:
                 orchestration = strategy.load_state(state)
-                assignment = (
-                    orchestration.assignment(orchestration.current_assignment_id)
+                active = (
+                    [
+                        assignment
+                        for assignment in orchestration.assignments
+                        if assignment.child_run_id
+                        and assignment.status
+                        in {AssignmentStatus.ASSIGNED, AssignmentStatus.WAITING_CHILD}
+                    ]
                     if orchestration
-                    else None
+                    else []
                 )
                 yield {
                     "type": "interrupt",
                     "run_id": state.run_id,
-                    "child_run_id": assignment.child_run_id if assignment else None,
+                    "child_run_id": active[0].child_run_id if active else None,
+                    "child_run_ids": [assignment.child_run_id for assignment in active],
                     "status": state.status.value,
                 }
             self.history = [
@@ -322,13 +330,23 @@ class AgentOrchestrator:
         from axiom.runtime.models import RunStatus
 
         orchestration = strategy.load_state(parent)
-        assignment = (
-            orchestration.assignment(orchestration.current_assignment_id) if orchestration else None
-        )
-        if assignment is None or assignment.child_run_id is None:
+        if orchestration is None:
             return None
-        child = await self.checkpoint_store.load(assignment.child_run_id)
-        if child is None or child.status != RunStatus.WAITING_APPROVAL or child.interrupt is None:
+        assignment = None
+        child = None
+        for candidate in orchestration.assignments:
+            if candidate.child_run_id is None:
+                continue
+            candidate_child = await self.checkpoint_store.load(candidate.child_run_id)
+            if (
+                candidate_child is not None
+                and candidate_child.status == RunStatus.WAITING_APPROVAL
+                and candidate_child.interrupt is not None
+            ):
+                assignment = candidate
+                child = candidate_child
+                break
+        if assignment is None or child is None:
             return None
         tool = self.tool_registry.get(child.interrupt.tool_name or "")
         request = {
@@ -344,6 +362,7 @@ class AgentOrchestrator:
             runtime,
             parent,
             decision="approve" if str(decision).lower() == "approve" else "reject",
+            child_run_id=assignment.child_run_id,
         )
 
     def parse_plan(self, plan_json: str) -> list[ExecutionStep]:

@@ -83,7 +83,7 @@ further child scheduling; cancelling a child does not automatically cancel its p
 | `RUNNING` | resume, cancel | Resume is used for explicit crash recovery. |
 | `INTERRUPTED` | resume, cancel | A manual interrupt requires an explicit resume. |
 | `WAITING_APPROVAL` | approve, reject, cancel | Decision targets the pending invocation. |
-| `WAITING_CHILD` | resume, cancel | Resume is valid only when all direct children are terminal. |
+| `WAITING_CHILD` | resume, cancel | Multi-Agent resume reconciles all Children and may schedule independent ready work. |
 | `COMPLETED` | none | Mutations return HTTP 409. |
 | `FAILED` | none | Mutations return HTTP 409. |
 | `CANCELLED` | cancel | Repeated cancel is a no-op; resume/approval conflict. |
@@ -124,9 +124,9 @@ repository and checkpoint store:
 - `WAITING_APPROVAL` remains waiting; no approval decision is inferred.
 - `INTERRUPTED` remains waiting for client resume.
 - `RUNNING` is exposed with `recovery_action=client_resume`.
-- `WAITING_CHILD` remains waiting while any child is non-terminal. If all direct
-  children are terminal, the Runtime safely resumes the parent and records recovery
-  lifecycle Events.
+- `WAITING_CHILD` Multi-Agent Parents reconcile every persisted Child and may start independent
+  ready assignments within the configured concurrency bound. Other strategies resume after their
+  direct Children become terminal.
 
 This is local recovery discovery, not a distributed scheduler. An operation record that
 was persisted as `IN_PROGRESS` but never completed is reported as
@@ -150,15 +150,14 @@ thread stream but retain explicit lineage.
 
 ## Parallel-child readiness
 
-The control-plane model can represent a parent with multiple children in different
+The control-plane model represents a parent with multiple children in different
 states, aggregate multiple pending interrupts, approve one child, cancel another, and
-cascade a parent cancellation to all non-terminal children. Runtime v1 still schedules
-Multi-Agent workers sequentially; this API shape is readiness for durable parallel
-scheduling, not an implementation of it.
+cascade a parent cancellation to all non-terminal children. Multi-Agent Workers now use local
+bounded durable scheduling; no distributed scheduler is implied.
 
 ## Current limitations
 
-- No durable parallel worker scheduler or distributed execution.
+- No distributed scheduler or distributed execution.
 - Active cancellation across separate Runtime processes is best effort.
 - SSE is a persisted replay stream, not a distributed live event bus.
 - Operation retention and compaction are not implemented.

@@ -33,7 +33,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Snapshots | Creates, restores, lists, and cleans workspace snapshots under an isolated home in tests. | Tested |
 | Skills | Loads built-in, user, and project `SKILL.md` files and supports skill context injection. | Tested |
 | Plan-Execute | Runs serialized versioned Plans as a durable Runtime strategy, with per-step checkpoints, recovery, replan history, stable Tool invocations, approval, isolation, and trace hierarchy. | SQLite recovery and strategy convergence tested |
-| Multi-Agent | Runs durable sequential Parent orchestration with React Child Runs, stable Child identity, approval/recovery, linked traces, and reviewer retries. | Runtime convergence tested |
+| Multi-Agent | Runs bounded parallel durable React Child Runs with stable identity, dependency scheduling, approval/recovery, linked traces, and serialized reviewer transitions. | Runtime convergence and parallel recovery tested |
 | MCP Client | Discovers and calls tools from local stdio MCP servers in tests. | Tested |
 | MCP Server | Exposes built-in tools through handler-level JSON-RPC requests. | Handler tested |
 | Runtime API | Provides threads, turns, resumable Runs, Memory/SQLite checkpoints, interrupt/resume/cancel, durable tool records, task CRUD, and stored SSE event replay. | Live localhost and crash recovery tested |
@@ -140,7 +140,9 @@ versioned Plan state model.
 
 Multi-Agent now uses a durable Parent Run plus stable, independently checkpointed React Child Runs
 for tool-capable Workers. Child approval, ToolExecution deduplication, PermissionPolicy, restricted
-execution, linked traces, and Evaluation metrics reuse the existing Runtime lifecycle. See
+execution, linked traces, and Evaluation metrics reuse the existing Runtime lifecycle. Independent
+Workers run through a local bounded scheduler configured by `multi_agent.max_parallel_workers`;
+waiting approvals release their compute slots. See
 [`docs/multi-agent-durable-execution.md`](docs/multi-agent-durable-execution.md).
 
 See [`docs/architecture-current.md`](docs/architecture-current.md) for the detailed architecture baseline.
@@ -269,7 +271,6 @@ Partially verified or intentionally bounded:
 
 - MCP server long-running stdio/http transport lifecycle remains partially verified.
 - Runtime API public deployment, load testing, distributed queues, real-provider CI, and unlimited live streaming are not verified.
-- Multi-agent internal planner/worker/reviewer state does not yet use the durable Run loop.
 - Distributed execution/locking, checkpoint compaction, automatic recovery scanning, and
   exactly-once semantics for arbitrary external tool side effects are not implemented.
 - Semantic memory retrieval, production LLM extraction quality evaluation, remote summarization/extraction CI, and cross-project preference sharing are not implemented yet.

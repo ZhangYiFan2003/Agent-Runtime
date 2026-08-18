@@ -22,9 +22,11 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.multi_agent_strategy import (
     AssignmentStatus,
+    LocalChildRunScheduler,
     MultiAgentExecutionStrategy,
     MultiAgentState,
     MultiAgentStatus,
+    SchedulerSnapshot,
     WorkerAssignment,
     child_run_id,
 )
@@ -66,8 +68,10 @@ __all__ = [
     "RuntimeApiServer",
     "RuntimeExecutionStrategy",
     "MultiAgentExecutionStrategy",
+    "LocalChildRunScheduler",
     "MultiAgentState",
     "MultiAgentStatus",
+    "SchedulerSnapshot",
     "AssignmentStatus",
     "WorkerAssignment",
     "child_run_id",

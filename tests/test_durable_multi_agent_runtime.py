@@ -284,11 +284,34 @@ def test_multi_agent_strategy_state_json_round_trip():
 
     restored = MultiAgentState.from_dict(json.loads(json.dumps(original.to_dict())))
 
-    assert restored.schema_version == 1
+    assert restored.schema_version == 2
     assert restored.status == MultiAgentStatus.WAITING_CHILD
     assert restored.assignments[0].child_run_id == "run_child_1"
     assert restored.assignments[0].attempt == 2
     assert restored.assignments[0].review_approved is False
+
+
+def test_multi_agent_v1_state_migrates_active_assignment_identity():
+    payload = {
+        "schema_version": 1,
+        "orchestration_goal": "goal",
+        "status": "WAITING_CHILD",
+        "assignments": [
+            {
+                "assignment_id": "assignment_1",
+                "worker_role": "worker",
+                "task": "A",
+                "status": "WAITING_CHILD",
+                "child_run_id": "child-a",
+            }
+        ],
+        "current_assignment_id": "assignment_1",
+    }
+
+    restored = MultiAgentState.from_dict(payload)
+
+    assert restored.schema_version == 2
+    assert restored.active_assignment_ids == ["assignment_1"]
 
 
 def test_parent_creates_child_in_same_thread_and_turn(tmp_path):
@@ -561,7 +584,7 @@ def test_parent_cancel_cancels_waiting_child_and_stops_scheduling(tmp_path):
         calls: list[dict[str, Any]] = []
         store = MemoryCheckpointStore()
         client = ScriptedTeamClient(
-            [_task("a", "A"), _task("b", "B")],
+            [_task("a", "A"), _task("b", "B", ["a"])],
             tool_steps={"A": ("write_data", {"path": "inside.txt"})},
         )
         runtime = _runtime(
@@ -570,6 +593,7 @@ def test_parent_cancel_cancels_waiting_child_and_stops_scheduling(tmp_path):
             tmp_path,
             tools=_registry(_side_effect_tool(calls)),
             hitl="always",
+            strategy=MultiAgentExecutionStrategy(max_parallel_workers=1),
         )
         waiting = await runtime.start(
             thread_id="thread-cancel",

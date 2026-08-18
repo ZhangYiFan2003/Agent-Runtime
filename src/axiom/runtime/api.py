@@ -727,16 +727,22 @@ class RuntimeApiServer:
         if state.parent_run_id and state.finished:
             parent = await self.checkpoint_store.load(state.parent_run_id)
             if parent is not None and parent.status == RunStatus.WAITING_CHILD:
+                parent_lock = self._run_lock(parent.run_id)
+                if not parent_lock.acquire(blocking=False):
+                    return await self._finish_durable_turn(state)
                 parent_runtime = self._durable_runtime(
                     engine,
                     parent.thread_id,
                     execution_strategy=parent.execution_strategy,
                 )
-                parent = await parent_runtime.resume(parent.run_id)
-                result = await self._finish_durable_turn(parent)
-                result["child_run_id"] = state.run_id
-                result["child_status"] = state.status.value
-                return result
+                try:
+                    parent = await parent_runtime.resume(parent.run_id)
+                    result = await self._finish_durable_turn(parent)
+                    result["child_run_id"] = state.run_id
+                    result["child_status"] = state.status.value
+                    return result
+                finally:
+                    parent_lock.release()
         return await self._finish_durable_turn(state)
 
     def _execute_control_operation(
@@ -904,7 +910,7 @@ class RuntimeApiServer:
         if state.status == RunStatus.WAITING_CHILD and operation == ControlOperationName.RESUME:
             children = asyncio.run(self._children(state))
             active = [child.run_id for child in children if not child.finished]
-            if active:
+            if active and state.execution_strategy != "multi_agent":
                 raise ApiError(
                     "invalid_run_transition",
                     "parent cannot resume while child runs are non-terminal",
@@ -1018,25 +1024,20 @@ class RuntimeApiServer:
                 "text": state.output_text,
             }
             if state.status == RunStatus.WAITING_CHILD:
-                from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
-
-                orchestration = MultiAgentExecutionStrategy.load_state(state)
-                assignment = (
-                    orchestration.assignment(orchestration.current_assignment_id)
-                    if orchestration
-                    else None
-                )
-                child = (
-                    await self.checkpoint_store.load(assignment.child_run_id)
-                    if assignment and assignment.child_run_id
-                    else None
-                )
+                view = await self._run_view(state)
+                children = await self._children(state)
+                active_children = [child for child in children if not child.finished]
+                first_child = active_children[0] if active_children else None
                 result.update(
                     {
-                        "child_run_id": assignment.child_run_id if assignment else None,
-                        "child_status": child.status.value if child else None,
+                        "active_child_run_ids": view["active_child_run_ids"],
+                        "pending_interrupts": view["pending_interrupts"],
+                        "child_run_id": first_child.run_id if first_child else None,
+                        "child_status": first_child.status.value if first_child else None,
                         "child_interrupt": (
-                            child.interrupt.to_dict() if child and child.interrupt else None
+                            first_child.interrupt.to_dict()
+                            if first_child and first_child.interrupt
+                            else None
                         ),
                     }
                 )
@@ -1250,7 +1251,11 @@ class RuntimeApiServer:
             if state.status != RunStatus.WAITING_CHILD:
                 continue
             children = await self._children(state)
-            if not children or any(not child.finished for child in children):
+            if not children:
+                continue
+            if state.execution_strategy != "multi_agent" and any(
+                not child.finished for child in children
+            ):
                 continue
             lock = self._run_lock(state.run_id)
             if not lock.acquire(blocking=False):
