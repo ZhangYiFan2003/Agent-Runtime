@@ -24,6 +24,7 @@ from axiom.evaluation.scorers import (
 from axiom.runtime.checkpoints import RuntimeStore
 from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
 from axiom.runtime.models import Checkpoint, RunStatus
+from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
 from axiom.runtime.observability import SpanType
 from axiom.runtime.observability_store import ObservabilityService, ObservabilityStore, RunTracer
 
@@ -101,10 +102,31 @@ class DurableEvaluationExecutor:
 
         bundle = await self.observability.trace(run_id)
         metrics = await self.observability.metrics(run_id)
+        child_bundles = []
+        child_metrics = []
+        if state is not None and state.execution_strategy == "multi_agent":
+            orchestration = MultiAgentExecutionStrategy.load_state(state)
+            child_run_ids = (
+                {
+                    assignment.child_run_id
+                    for assignment in orchestration.assignments
+                    if assignment.child_run_id
+                }
+                if orchestration is not None
+                else set()
+            )
+            for child_run_id in sorted(child_run_ids):
+                child_bundle = await self.observability.trace(child_run_id)
+                child_metric = await self.observability.metrics(child_run_id)
+                if child_bundle is not None:
+                    child_bundles.append(child_bundle)
+                if child_metric is not None:
+                    child_metrics.append(child_metric)
         tool_calls = (
             [
                 str(span.attributes.get("tool_name") or span.name.removeprefix("tool."))
-                for span in bundle.spans
+                for trace_bundle in [bundle, *child_bundles]
+                for span in trace_bundle.spans
                 if span.span_type == SpanType.TOOL
             ]
             if bundle is not None
@@ -123,11 +145,15 @@ class DurableEvaluationExecutor:
             status=actual_status,
             assistant_output=state.output_text if state is not None else "",
             duration_ms=metrics.duration_ms if metrics is not None else None,
-            prompt_tokens=metrics.prompt_tokens if metrics is not None else 0,
-            completion_tokens=metrics.completion_tokens if metrics is not None else 0,
-            total_tokens=metrics.total_tokens if metrics is not None else 0,
+            prompt_tokens=(metrics.prompt_tokens if metrics is not None else 0)
+            + sum(item.prompt_tokens for item in child_metrics),
+            completion_tokens=(metrics.completion_tokens if metrics is not None else 0)
+            + sum(item.completion_tokens for item in child_metrics),
+            total_tokens=(metrics.total_tokens if metrics is not None else 0)
+            + sum(item.total_tokens for item in child_metrics),
             tool_calls=tool_calls,
-            step_count=metrics.step_count if metrics is not None else 0,
+            step_count=(metrics.step_count if metrics is not None else 0)
+            + sum(item.step_count for item in child_metrics),
             error=execution_error or state_error,
         )
 

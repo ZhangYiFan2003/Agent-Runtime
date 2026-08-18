@@ -33,7 +33,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Snapshots | Creates, restores, lists, and cleans workspace snapshots under an isolated home in tests. | Tested |
 | Skills | Loads built-in, user, and project `SKILL.md` files and supports skill context injection. | Tested |
 | Plan-Execute | Runs serialized versioned Plans as a durable Runtime strategy, with per-step checkpoints, recovery, replan history, stable Tool invocations, approval, isolation, and trace hierarchy. | SQLite recovery and strategy convergence tested |
-| Multi-Agent | Coordinates planner, worker, and reviewer roles, including retries and worker failure summaries. | Tested |
+| Multi-Agent | Runs durable sequential Parent orchestration with React Child Runs, stable Child identity, approval/recovery, linked traces, and reviewer retries. | Runtime convergence tested |
 | MCP Client | Discovers and calls tools from local stdio MCP servers in tests. | Tested |
 | MCP Server | Exposes built-in tools through handler-level JSON-RPC requests. | Handler tested |
 | Runtime API | Provides threads, turns, resumable Runs, Memory/SQLite checkpoints, interrupt/resume/cancel, durable tool records, task CRUD, and stored SSE event replay. | Live localhost and crash recovery tested |
@@ -73,7 +73,7 @@ Key modules:
 - `src/axiom/mcp/`: MCP client, MCP config, and MCP server handler support.
 - `src/axiom/memory/`: scoped typed memory persistence, Runtime history recovery, and budgeted memory context assembly.
 - `src/axiom/snapshot/`: workspace snapshot service.
-- `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, shared ReAct/Plan execution strategies, tool execution records, and durable task store.
+- `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, shared ReAct/Plan/Multi-Agent execution strategies, tool execution records, and durable task store.
 
 ### Durable execution
 
@@ -131,6 +131,13 @@ Tool calls, approval interrupts, replans, and completion share the existing Chec
 ToolExecution, Permission, Restricted Execution, Trace, and Evaluation contracts. See
 [`docs/plan-durable-execution.md`](docs/plan-durable-execution.md) for recovery boundaries and the
 versioned Plan state model.
+
+### Durable Multi-Agent
+
+Multi-Agent now uses a durable Parent Run plus stable, independently checkpointed React Child Runs
+for tool-capable Workers. Child approval, ToolExecution deduplication, PermissionPolicy, restricted
+execution, linked traces, and Evaluation metrics reuse the existing Runtime lifecycle. See
+[`docs/multi-agent-durable-execution.md`](docs/multi-agent-durable-execution.md).
 
 See [`docs/architecture-current.md`](docs/architecture-current.md) for the detailed architecture baseline.
 

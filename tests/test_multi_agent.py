@@ -30,7 +30,7 @@ def test_orchestrator_parses_steps_and_review_output(tmp_path, monkeypatch):
     )
 
 
-def test_orchestrator_runs_independent_workers_in_parallel(tmp_path, monkeypatch):
+def test_orchestrator_runs_independent_workers_sequentially(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     client = ParallelTeamClient()
     orchestrator = _orchestrator(tmp_path, client)
@@ -49,7 +49,7 @@ def test_orchestrator_runs_independent_workers_in_parallel(tmp_path, monkeypatch
     assert "Multi-Agent task completed" in result
     assert "Task A result" in result
     assert "Task B result" in result
-    assert client.peak_concurrency == 2
+    assert client.peak_concurrency == 1
 
 
 class FakeTeamClient:
@@ -66,7 +66,6 @@ class ParallelTeamClient(FakeTeamClient):
     def __init__(self):
         self.current_concurrency = 0
         self.peak_concurrency = 0
-        self.ready = asyncio.Event()
 
     async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
         body = _message_text(messages[-1].content)
@@ -89,9 +88,7 @@ class ParallelTeamClient(FakeTeamClient):
         if "Task A" in body or "Task B" in body:
             self.current_concurrency += 1
             self.peak_concurrency = max(self.peak_concurrency, self.current_concurrency)
-            if self.current_concurrency == 2:
-                self.ready.set()
-            await asyncio.wait_for(self.ready.wait(), timeout=2)
+            await asyncio.sleep(0)
             self.current_concurrency -= 1
             text = "Task A result" if "Task A" in body else "Task B result"
             yield {"type": "text_delta", "text": text}

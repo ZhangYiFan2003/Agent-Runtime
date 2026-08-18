@@ -15,6 +15,7 @@ class RunStatus(StrEnum):
     RUNNING = "RUNNING"
     INTERRUPTED = "INTERRUPTED"
     WAITING_APPROVAL = "WAITING_APPROVAL"
+    WAITING_CHILD = "WAITING_CHILD"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -89,6 +90,9 @@ class Checkpoint:
     output_text: str = ""
     execution_strategy: str = "react"
     strategy_state: dict[str, Any] = field(default_factory=dict)
+    parent_run_id: str | None = None
+    parent_step_id: str | None = None
+    run_kind: str = "agent"
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     next_tool_index: int = 0
     decisions: dict[str, str] = field(default_factory=dict)
@@ -107,6 +111,9 @@ class Checkpoint:
         run_id: str | None = None,
         turn_id: str | None = None,
         execution_strategy: str = "react",
+        parent_run_id: str | None = None,
+        parent_step_id: str | None = None,
+        run_kind: str = "agent",
     ) -> Checkpoint:
         return cls(
             run_id=run_id or _new_id("run"),
@@ -115,6 +122,9 @@ class Checkpoint:
             input=input,
             messages=[*(history or []), Message(role="user", content=input)],
             execution_strategy=execution_strategy,
+            parent_run_id=parent_run_id,
+            parent_step_id=parent_step_id,
+            run_kind=run_kind,
         )
 
     @property
@@ -141,6 +151,9 @@ class Checkpoint:
             "output_text": self.output_text,
             "execution_strategy": self.execution_strategy,
             "strategy_state": _json_value(self.strategy_state),
+            "parent_run_id": self.parent_run_id,
+            "parent_step_id": self.parent_step_id,
+            "run_kind": self.run_kind,
             "pending_tool_calls": _json_value(self.pending_tool_calls),
             "next_tool_index": self.next_tool_index,
             "decisions": dict(self.decisions),
@@ -174,6 +187,9 @@ class Checkpoint:
             output_text=str(data.get("output_text") or ""),
             execution_strategy=str(data.get("execution_strategy") or "react"),
             strategy_state=_dict(data.get("strategy_state")),
+            parent_run_id=_optional_str(data.get("parent_run_id")),
+            parent_step_id=_optional_str(data.get("parent_step_id")),
+            run_kind=str(data.get("run_kind") or "agent"),
             pending_tool_calls=[item for item in raw_calls if isinstance(item, dict)]
             if isinstance(raw_calls, list)
             else [],
@@ -200,6 +216,9 @@ class Checkpoint:
             "step_index": self.step_index,
             "total_tokens": self.total_tokens,
             "execution_strategy": self.execution_strategy,
+            "parent_run_id": self.parent_run_id,
+            "parent_step_id": self.parent_step_id,
+            "run_kind": self.run_kind,
             "interrupt": self.interrupt.to_dict() if self.interrupt else None,
             "error": self.error.to_dict() if self.error else None,
             "created_at": self.created_at,

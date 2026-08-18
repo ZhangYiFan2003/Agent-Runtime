@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import inspect
 import json
 import re
 from collections.abc import AsyncIterator
@@ -8,9 +8,11 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 from axiom.agent.query import query
 from axiom.config import AxiomConfig
+from axiom.execution import ExecutionBackend
 from axiom.llm.base import LlmClient
 from axiom.prompt import PromptAssembler
 from axiom.skill import SkillContextBuffer
@@ -204,48 +206,101 @@ class AgentOrchestrator:
         cwd: str,
         approval_callback=None,
         worker_count: int = 2,
+        checkpoint_store=None,
+        observability_store=None,
+        execution_backend: ExecutionBackend | None = None,
+        event_sink=None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
         self.config = config
         self.cwd = cwd
         self.approval_callback = approval_callback
-        self.skill_context_buffer = SkillContextBuffer()
-        self.planner = self._subagent("planner", AgentRole.PLANNER)
-        self.workers = [
-            self._subagent(f"worker-{index}", AgentRole.WORKER)
-            for index in range(1, max(1, worker_count) + 1)
-        ]
-        self.reviewer = self._subagent("reviewer", AgentRole.REVIEWER)
+        from axiom.runtime.checkpoints import MemoryCheckpointStore
+        from axiom.runtime.observability_store import MemoryObservabilityStore
+
+        self.checkpoint_store = checkpoint_store or MemoryCheckpointStore()
+        self.observability_store = observability_store or MemoryObservabilityStore()
+        self.execution_backend = execution_backend
+        self.event_sink = event_sink
+        self.last_checkpoint = None
+        self.worker_count = max(1, worker_count)
         self.history: list[Message] = []
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
+        from axiom.prompt import PromptAssembler
+        from axiom.runtime.durable import DurableAgentRuntime
+        from axiom.runtime.models import RunStatus
+        from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
+        from axiom.runtime.observability_store import RunTracer
+
         snapshot = SnapshotService(self.cwd)
         with suppress(Exception):
             snapshot.create("pre-turn")
-        final_text = ""
+        captured: list[tuple[str, dict[str, Any]]] = []
+
+        async def capture(event_type: str, payload: dict[str, Any]) -> None:
+            captured.append((event_type, payload))
+            if self.event_sink is not None:
+                result = self.event_sink(event_type, payload)
+                if inspect.isawaitable(result):
+                    await result
+
+        strategy = MultiAgentExecutionStrategy(
+            max_retries_per_assignment=self.max_retries_per_step,
+        )
+        system_prompt = PromptAssembler(
+            config=self.config,
+            cwd=self.cwd,
+            tool_names=self.tool_registry.list_names(),
+            model=self.llm_client.model_name,
+            provider=self.llm_client.provider_name,
+        ).build()
+        runtime = DurableAgentRuntime(
+            llm_client=self.llm_client,
+            tool_registry=self.tool_registry,
+            system_prompt=system_prompt,
+            cwd=self.cwd,
+            config=self.config,
+            store=self.checkpoint_store,
+            event_sink=capture,
+            tracer=RunTracer(self.observability_store),
+            execution_backend=self.execution_backend,
+            execution_strategy=strategy,
+        )
         try:
-            yield {"type": "text_delta", "text": "Phase 1: planner\n\n"}
-            plan_result = await self.planner.execute(
-                AgentMessage.task("orchestrator", f"Create an execution plan for:\n{message}")
+            state = await runtime.start(
+                thread_id=f"thread_{uuid4().hex}",
+                turn_id=f"turn_{uuid4().hex}",
+                run_id=f"run_{uuid4().hex}",
+                input=message,
             )
-            self.planner.clear_history()
-            if plan_result.type == AgentMessageType.ERROR:
-                raise RuntimeError(f"planner failed: {plan_result.content}")
-            steps = self.parse_plan(plan_result.content)
-            if not steps:
-                raise ValueError(f"planner output could not be parsed:\n{plan_result.content}")
-            yield {"type": "text_delta", "text": self.summarize_steps(steps) + "\n"}
-            yield {"type": "text_delta", "text": "Phase 2: workers and reviewer\n\n"}
-            for event in await self._execute_steps(
-                steps, lambda text: {"type": "text_delta", "text": text}
-            ):
-                yield event
-            final_text = self.build_final_result(steps)
-            yield {"type": "text_delta", "text": final_text}
+            while state.status == RunStatus.WAITING_CHILD and self.approval_callback:
+                child = await self._approve_waiting_child(strategy, runtime, state)
+                if child is None:
+                    break
+                state = await runtime.resume(state.run_id)
+            self.last_checkpoint = state
+            if state.status == RunStatus.FAILED:
+                raise RuntimeError(state.error.message if state.error else "multi-agent failed")
+            if state.output_text:
+                yield {"type": "text_delta", "text": state.output_text}
+            if state.status == RunStatus.WAITING_CHILD:
+                orchestration = strategy.load_state(state)
+                assignment = (
+                    orchestration.assignment(orchestration.current_assignment_id)
+                    if orchestration
+                    else None
+                )
+                yield {
+                    "type": "interrupt",
+                    "run_id": state.run_id,
+                    "child_run_id": assignment.child_run_id if assignment else None,
+                    "status": state.status.value,
+                }
             self.history = [
                 Message(role="user", content=message),
-                Message(role="assistant", content=final_text),
+                Message(role="assistant", content=state.output_text),
             ]
         except Exception as exc:  # noqa: BLE001
             yield {"type": "error", "error": exc}
@@ -253,94 +308,43 @@ class AgentOrchestrator:
         finally:
             with suppress(Exception):
                 snapshot.create("post-turn")
-        yield {"type": "done", "total_turns": 0, "total_tokens": 0, "messages": self.history}
+        yield {
+            "type": "done",
+            "run_id": state.run_id,
+            "status": state.status.value,
+            "total_turns": state.agent_turn,
+            "total_tokens": state.total_tokens,
+            "messages": self.history,
+            "events": len(captured),
+        }
 
-    async def _execute_steps(
-        self,
-        steps: list[ExecutionStep],
-        event_factory,
-    ) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
-        retry_count: dict[str, int] = {}
-        worker_queue: asyncio.Queue[SubAgent] = asyncio.Queue()
-        for worker in self.workers:
-            worker_queue.put_nowait(worker)
+    async def _approve_waiting_child(self, strategy, runtime, parent):
+        from axiom.runtime.models import RunStatus
 
-        while True:
-            executable = self.get_executable_steps(steps)
-            if not executable:
-                break
-            if len(executable) > 1:
-                events.append(
-                    event_factory(
-                        f"Parallel batch: {', '.join(step.id for step in executable)}\n\n"
-                    )
-                )
-            await asyncio.gather(
-                *(
-                    self._run_step_with_worker_queue(
-                        step,
-                        steps,
-                        retry_count,
-                        worker_queue,
-                    )
-                    for step in executable
-                )
-            )
-        return events
-
-    async def _run_step_with_worker_queue(
-        self,
-        step: ExecutionStep,
-        steps: list[ExecutionStep],
-        retry_count: dict[str, int],
-        worker_queue: asyncio.Queue[SubAgent],
-    ) -> None:
-        worker = await worker_queue.get()
-        try:
-            reviewer = self._subagent(f"reviewer-{step.id}", AgentRole.REVIEWER)
-            await self._run_step(step, steps, retry_count, worker, reviewer)
-        finally:
-            worker.clear_history()
-            worker_queue.put_nowait(worker)
-
-    async def _run_step(
-        self,
-        step: ExecutionStep,
-        steps: list[ExecutionStep],
-        retry_count: dict[str, int],
-        worker: SubAgent,
-        reviewer: SubAgent,
-    ) -> None:
-        self._update_step(steps, step.id, step.started())
-        context = self.build_step_context(steps, step)
-        task_msg = AgentMessage.task("orchestrator", step.description)
-        result = await worker.execute(task_msg, context)
-        if result.type == AgentMessageType.ERROR or not result.content.strip():
-            self._update_step(steps, step.id, step.with_failed(result.content or "empty result"))
-            return
-
-        accepted_result = result.content
-        review = await reviewer.review(step.description, accepted_result)
-        reviewer.clear_history()
-        approved = self.parse_review_approval(review.content)
-        issues = self.parse_review_issues(review.content)
-        retries = retry_count.get(step.id, 0)
-        while not approved and retries < self.max_retries_per_step:
-            retries += 1
-            retry_count[step.id] = retries
-            retry_context = context + f"\n\nReviewer rejected the previous result:\n{issues}"
-            retry_result = await worker.execute(task_msg, retry_context)
-            if retry_result.type == AgentMessageType.ERROR or not retry_result.content.strip():
-                issues = retry_result.content or "empty retry result"
-                continue
-            accepted_result = retry_result.content
-            retry_review = await reviewer.review(step.description, accepted_result)
-            reviewer.clear_history()
-            approved = self.parse_review_approval(retry_review.content)
-            issues = self.parse_review_issues(retry_review.content)
-
-        self._update_step(steps, step.id, step.with_result(accepted_result))
+        orchestration = strategy.load_state(parent)
+        assignment = (
+            orchestration.assignment(orchestration.current_assignment_id) if orchestration else None
+        )
+        if assignment is None or assignment.child_run_id is None:
+            return None
+        child = await self.checkpoint_store.load(assignment.child_run_id)
+        if child is None or child.status != RunStatus.WAITING_APPROVAL or child.interrupt is None:
+            return None
+        tool = self.tool_registry.get(child.interrupt.tool_name or "")
+        request = {
+            "tool_name": child.interrupt.tool_name or "unknown",
+            "input": child.interrupt.arguments,
+            "danger_level": tool.danger_level if tool else "high",
+            "description": tool.description if tool else "",
+        }
+        decision = self.approval_callback(request)
+        if inspect.isawaitable(decision):
+            decision = await decision
+        return await strategy.resume_waiting_child(
+            runtime,
+            parent,
+            decision="approve" if str(decision).lower() == "approve" else "reject",
+        )
 
     def parse_plan(self, plan_json: str) -> list[ExecutionStep]:
         try:
@@ -452,29 +456,6 @@ class AgentOrchestrator:
             if step.result:
                 lines.append(f"  Result: {_preview(step.result)}")
         return "\n".join(lines) + "\n"
-
-    def _subagent(self, name: str, role: AgentRole) -> SubAgent:
-        return SubAgent(
-            name=name,
-            role=role,
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry,
-            config=self.config,
-            cwd=self.cwd,
-            approval_callback=self.approval_callback,
-            skill_context_buffer=self.skill_context_buffer,
-        )
-
-    def _update_step(
-        self,
-        steps: list[ExecutionStep],
-        step_id: str,
-        updated: ExecutionStep,
-    ) -> None:
-        for index, step in enumerate(steps):
-            if step.id == step_id:
-                steps[index] = updated
-                return
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

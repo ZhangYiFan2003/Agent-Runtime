@@ -307,7 +307,22 @@ class RunTracer:
                     "run_id": state.run_id,
                     "thread_id": state.thread_id,
                     "turn_id": state.turn_id,
+                    "parent_run_id": state.parent_run_id,
+                    "parent_step_id": state.parent_step_id,
+                    "run_kind": state.run_kind,
                 },
+                parent_span_id=state.parent_step_id,
+            )
+            await self.store.save_span(root)
+        else:
+            root.attributes.update(
+                json_attributes(
+                    {
+                        "parent_run_id": state.parent_run_id,
+                        "parent_step_id": state.parent_step_id,
+                        "run_kind": state.run_kind,
+                    }
+                )
             )
             await self.store.save_span(root)
         self.root_span = root

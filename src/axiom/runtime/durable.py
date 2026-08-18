@@ -118,7 +118,12 @@ class DurableAgentRuntime:
         history: list[Message] | None = None,
         run_id: str | None = None,
         turn_id: str | None = None,
+        parent_run_id: str | None = None,
+        parent_step_id: str | None = None,
+        run_kind: str = "agent",
     ) -> Checkpoint:
+        if run_kind == "agent" and self.execution_strategy.name == "multi_agent":
+            run_kind = "orchestrator"
         state = Checkpoint.create(
             thread_id=thread_id,
             input=input,
@@ -126,6 +131,9 @@ class DurableAgentRuntime:
             run_id=run_id,
             turn_id=turn_id,
             execution_strategy=self.execution_strategy.name,
+            parent_run_id=parent_run_id,
+            parent_step_id=parent_step_id,
+            run_kind=run_kind,
         )
         async with self._run_lock(state.run_id):
             if await self.store.load(state.run_id) is not None:
@@ -185,6 +193,9 @@ class DurableAgentRuntime:
                         {"run_id": run_id, "status": state.status.value},
                     )
                     return state
+
+            # WAITING_CHILD is a durable scheduling state, not an approval state.
+            # Resuming it simply asks the parent strategy to observe the existing child.
 
             if was_recovery:
                 # A no-op checkpoint is an optimistic claim. Two recovering workers

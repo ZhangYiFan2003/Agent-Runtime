@@ -68,4 +68,8 @@ def execution_strategy_from_name(
         from axiom.runtime.plan_strategy import PlanExecuteStrategy
 
         return PlanExecuteStrategy.for_llm(llm_client)
+    if normalized in {"team", "multi_agent"}:
+        from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
+
+        return MultiAgentExecutionStrategy()
     raise ValueError(f"unknown execution strategy: {name}")

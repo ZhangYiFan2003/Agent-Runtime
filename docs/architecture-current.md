@@ -112,8 +112,8 @@ flowchart TD
     DAG and `PlanExecuteStrategy` advances it sequentially at durable boundaries
     inside `DurableAgentRuntime`.
 - `src/axiom/agent/orchestrator.py`
-  - Implements a multi-agent workflow with planner, worker, and reviewer roles.
-  - Workers can use tools; planner and reviewer run without tools.
+  - Provides the Multi-Agent compatibility facade over `MultiAgentExecutionStrategy`.
+  - Planner and Reviewer remain Parent steps; tool-capable Workers run as durable React Child Runs.
 
 ### Prompting
 
@@ -477,8 +477,8 @@ MCP server expansion points:
 - Runtime API persistence is local SQLite and bound to localhost; it is not a
   distributed service, public deployment validation, load-tested API, or
   distributed queue.
-- The durable Runtime covers ReAct and Plan-Execute strategies. Multi-agent
-  planner/worker/reviewer state and custom engine internals remain in-memory.
+- The durable Runtime covers ReAct, Plan-Execute, and sequential Multi-Agent strategies. Multi-Agent
+  Parent state and tool-capable Worker Child Runs are checkpointed with stable Parent/Child lineage.
   There is no distributed lock, recovery scheduler, or checkpoint compaction yet.
 - Runtime tool records provide best-effort deduplication after a persisted
   success, not exactly-once semantics for arbitrary external side effects.

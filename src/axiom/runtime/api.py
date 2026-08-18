@@ -350,7 +350,11 @@ class RuntimeApiServer:
                     response_status = (
                         202
                         if result.get("status")
-                        in {RunStatus.INTERRUPTED.value, RunStatus.WAITING_APPROVAL.value}
+                        in {
+                            RunStatus.INTERRUPTED.value,
+                            RunStatus.WAITING_APPROVAL.value,
+                            RunStatus.WAITING_CHILD.value,
+                        }
                         else 200
                     )
                     _send_json(request, response_status, result)
@@ -401,7 +405,10 @@ class RuntimeApiServer:
                         )
                     )
                     response_status = (
-                        202 if result.get("status") == RunStatus.WAITING_APPROVAL.value else 200
+                        202
+                        if result.get("status")
+                        in {RunStatus.WAITING_APPROVAL.value, RunStatus.WAITING_CHILD.value}
+                        else 200
                     )
                     _send_json(request, response_status, result)
                 finally:
@@ -624,11 +631,39 @@ class RuntimeApiServer:
             execution_strategy=state.execution_strategy,
         )
         state = await runtime.resume(run_id, decision=decision)
+        if state.parent_run_id and state.finished:
+            parent = await self.checkpoint_store.load(state.parent_run_id)
+            if parent is not None and parent.status == RunStatus.WAITING_CHILD:
+                parent_runtime = self._durable_runtime(
+                    engine,
+                    parent.thread_id,
+                    execution_strategy=parent.execution_strategy,
+                )
+                parent = await parent_runtime.resume(parent.run_id)
+                result = await self._finish_durable_turn(parent)
+                result["child_run_id"] = state.run_id
+                result["child_status"] = state.status.value
+                return result
         return await self._finish_durable_turn(state)
 
     async def _finish_durable_turn(self, state: Checkpoint) -> dict[str, Any]:
-        if state.status in {RunStatus.WAITING_APPROVAL, RunStatus.INTERRUPTED}:
+        if state.parent_run_id:
             return {
+                "thread_id": state.thread_id,
+                "turn_id": state.turn_id,
+                "run_id": state.run_id,
+                "parent_run_id": state.parent_run_id,
+                "status": state.status.value,
+                "interrupt": state.interrupt.to_dict() if state.interrupt else None,
+                "text": state.output_text,
+                "error": state.error.to_dict() if state.error else None,
+            }
+        if state.status in {
+            RunStatus.WAITING_APPROVAL,
+            RunStatus.WAITING_CHILD,
+            RunStatus.INTERRUPTED,
+        }:
+            result = {
                 "thread_id": state.thread_id,
                 "turn_id": state.turn_id,
                 "run_id": state.run_id,
@@ -636,6 +671,30 @@ class RuntimeApiServer:
                 "interrupt": state.interrupt.to_dict() if state.interrupt else None,
                 "text": state.output_text,
             }
+            if state.status == RunStatus.WAITING_CHILD:
+                from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
+
+                orchestration = MultiAgentExecutionStrategy.load_state(state)
+                assignment = (
+                    orchestration.assignment(orchestration.current_assignment_id)
+                    if orchestration
+                    else None
+                )
+                child = (
+                    await self.checkpoint_store.load(assignment.child_run_id)
+                    if assignment and assignment.child_run_id
+                    else None
+                )
+                result.update(
+                    {
+                        "child_run_id": assignment.child_run_id if assignment else None,
+                        "child_status": child.status.value if child else None,
+                        "child_interrupt": (
+                            child.interrupt.to_dict() if child and child.interrupt else None
+                        ),
+                    }
+                )
+            return result
         if state.status == RunStatus.CANCELLED:
             return {
                 "thread_id": state.thread_id,
@@ -1022,7 +1081,11 @@ def _safe_error(exc: Exception) -> str:
 
 def _execution_strategy_name(agent_mode: str) -> str:
     normalized = (agent_mode or "react").strip().lower().replace("-", "_")
-    return "plan_execute" if normalized in {"plan", "plan_execute"} else "react"
+    if normalized in {"plan", "plan_execute"}:
+        return "plan_execute"
+    if normalized in {"team", "multi_agent"}:
+        return "multi_agent"
+    return "react"
 
 
 def _now() -> str:
