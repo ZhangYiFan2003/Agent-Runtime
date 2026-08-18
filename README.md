@@ -36,7 +36,8 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Multi-Agent | Coordinates planner, worker, and reviewer roles, including retries and worker failure summaries. | Tested |
 | MCP Client | Discovers and calls tools from local stdio MCP servers in tests. | Tested |
 | MCP Server | Exposes built-in tools through handler-level JSON-RPC requests. | Handler tested |
-| Runtime API | Provides task and thread-oriented runtime endpoints with live localhost lifecycle, health, auth, task CRUD/cancel, thread turn, and stored event replay tests. | Live localhost tested |
+| Runtime API | Provides threads, turns, resumable Runs, Memory/SQLite checkpoints, interrupt/resume/cancel, durable tool records, task CRUD, and stored SSE event replay. | Live localhost and crash recovery tested |
+| Observability | Persists Run traces and Agent/LLM/Tool/checkpoint/interrupt spans, including tokens, TTFT, latency, retries, and Run summaries. | SQLite reload, API, CLI, and crash continuity tested |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
 | REPL | Interactive prompt-toolkit entrypoint and slash commands. | Not fully verified |
 
@@ -68,7 +69,35 @@ Key modules:
 - `src/axiom/mcp/`: MCP client, MCP config, and MCP server handler support.
 - `src/axiom/memory/`: scoped typed memory persistence, Runtime history recovery, and budgeted memory context assembly.
 - `src/axiom/snapshot/`: workspace snapshot service.
-- `src/axiom/runtime/`: local Runtime API and durable task store.
+- `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, durable ReAct loop, tool execution records, and durable task store.
+
+### Durable execution
+
+Axiom checkpoints execution state after durable boundaries and can resume interrupted runs after
+process restart. The Runtime persists explicit JSON state rather than Python objects, with
+`MemoryCheckpointStore` for tests/embedded use and `SQLiteCheckpointStore` for restart recovery.
+
+Tool approval moves a Run to `WAITING_APPROVAL`; it can then be approved, rejected, cancelled, or
+resumed after restart through `/v1/runs/{run_id}` endpoints. Runtime events and checkpoints have
+separate roles: events are append-only history, while checkpoints are resumable state snapshots.
+
+Successful tool calls are deduplicated with a stable `invocation_id`, argument hash, and persisted
+ToolExecution result. Runtime-level deduplication does not magically provide exactly-once semantics
+for arbitrary external side effects. Tools with external idempotency support can declare an
+idempotency-key parameter; Axiom passes the invocation ID through, but the tool/external service
+must enforce it.
+
+See [`docs/durable-execution.md`](docs/durable-execution.md) for state transitions, API endpoints,
+crash-window behavior, serialization boundaries, and current limitations.
+
+### Run observability
+
+The durable Runtime writes a single trace per Run with hierarchical Agent, LLM, Tool, checkpoint,
+interrupt, and resume spans. Query summaries with `axiom runs show <run_id>` and inspect the span
+tree with `axiom runs trace <run_id>`. The same data is available through
+`GET /v1/runs/{run_id}/metrics` and `GET /v1/runs/{run_id}/trace`.
+
+See [`docs/observability.md`](docs/observability.md) for the schema and metric definitions.
 
 See [`docs/architecture-current.md`](docs/architecture-current.md) for the detailed architecture baseline.
 
@@ -163,7 +192,7 @@ uv run pytest
 Current baseline:
 
 ```text
-133 tests passing
+166 tests passing
 ```
 
 The default tests use fake LLM clients, temporary directories, temporary SQLite databases, deterministic code-search fixtures, and localhost-safe HTTP paths. They do not require API keys and do not call external model providers.
@@ -184,6 +213,10 @@ Verified in the current baseline:
 - MCP client stdio discovery/call path
 - AST code indexing, lexical/vector/hybrid search, symbol resolution, conservative static call graph, and graph-aware code context assembly
 - Runtime task store, live localhost Runtime API lifecycle, and stored SSE event replay
+- Durable default ReAct Runs with versioned Memory/SQLite checkpoints, interrupt/resume/cancel,
+  optimistic sequence checks, persisted tool attempts, and crash recovery tests
+- SQLite Run traces with LLM token/TTFT/latency metrics, Tool retry/reuse spans, checkpoint and
+  interrupt/resume counts, CLI inspection, and HTTP query endpoints
 - Runtime thread history recovery from persisted event IDs, explicit fact/preference storage, summary storage interfaces, and bounded tool-result digests
 - Map-Reduce conversation summary checkpoints with source event provenance and deterministic local tests
 - Conservative high-confidence fact/preference extraction with scoped reuse, duplicate merge, conflict supersession, retraction, and deterministic privacy guards
@@ -192,6 +225,9 @@ Partially verified or intentionally bounded:
 
 - MCP server long-running stdio/http transport lifecycle remains partially verified.
 - Runtime API public deployment, load testing, distributed queues, real-provider CI, and unlimited live streaming are not verified.
+- Plan-Execute and multi-agent internal step state do not yet use the durable Run loop.
+- Distributed execution/locking, checkpoint compaction, automatic recovery scanning, and
+  exactly-once semantics for arbitrary external tool side effects are not implemented.
 - Semantic memory retrieval, production LLM extraction quality evaluation, remote summarization/extraction CI, and cross-project preference sharing are not implemented yet.
 - Interactive REPL behavior is less extensively covered than non-interactive paths.
 - Real provider streaming has manual smoke coverage plus unit-level streaming/rendering paths, but not exhaustive provider matrix coverage.
@@ -253,7 +289,7 @@ Near-term directions:
 - Richer MCP transport lifecycle verification
 - Optional LLM-backed memory extraction evaluation and user-controlled preference management
 - Retrieval evaluation and graph-aware context quality improvements
-- Observability for agent runs, tools, and runtime events
+- Evaluation datasets and regression scoring built on persisted Run traces
 
 No dates are promised; the roadmap is intentionally small so the current verified baseline remains stable.
 

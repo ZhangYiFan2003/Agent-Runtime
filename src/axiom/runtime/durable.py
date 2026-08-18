@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +21,8 @@ from axiom.runtime.models import (
     ToolExecutionRecord,
     ToolExecutionStatus,
 )
+from axiom.runtime.observability import Span, SpanStatus, SpanType, now, tool_span_id
+from axiom.runtime.observability_store import RunTracer
 from axiom.tools.base import Tool, ToolContext, ToolResult
 from axiom.tools.executor import ToolExecutor
 from axiom.tools.registry import ToolRegistry
@@ -48,6 +51,8 @@ class _LlmCallResult:
     stop_reason: str
     prompt_tokens: int
     completion_tokens: int
+    first_token_at: str | None
+    ttft_ms: float | None
 
 
 class DurableAgentRuntime:
@@ -68,6 +73,7 @@ class DurableAgentRuntime:
         store: RuntimeStore,
         retry_policy: RetryPolicy | None = None,
         event_sink: EventSink | None = None,
+        tracer: RunTracer | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -78,6 +84,7 @@ class DurableAgentRuntime:
         self.store = store
         self.retry_policy = retry_policy or RetryPolicy()
         self.event_sink = event_sink
+        self.tracer = tracer
         self.max_turns = max_turns
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -100,6 +107,8 @@ class DurableAgentRuntime:
         async with self._run_lock(state.run_id):
             if await self.store.load(state.run_id) is not None:
                 raise ValueError(f"run already exists: {state.run_id}")
+            if self.tracer is not None:
+                await self.tracer.start_run(state)
             await self._save_checkpoint(state, operation="run.start")
             await self._emit(
                 "run.started",
@@ -116,6 +125,18 @@ class DurableAgentRuntime:
                 raise ValueError(f"{state.status.value.lower()} run cannot be resumed")
 
             was_recovery = state.status == RunStatus.RUNNING
+            if self.tracer is not None:
+                await self.tracer.start_run(state, recovered=was_recovery)
+            resume_span = await self._start_span(
+                SpanType.AGENT,
+                "resume",
+                attributes={"recovered": was_recovery, "decision": decision},
+            )
+            await self._emit(
+                "resume.started",
+                {"run_id": run_id, "recovered": was_recovery, "decision": decision},
+            )
+
             if state.status == RunStatus.WAITING_APPROVAL:
                 normalized = _normalize_decision(decision)
                 if normalized is None:
@@ -129,6 +150,12 @@ class DurableAgentRuntime:
                     state.interrupt = None
                     await self._save_checkpoint(state, operation="resume.reject")
                     await self._emit("run.cancelled", {"run_id": run_id})
+                    await self._finish_span(resume_span, SpanStatus.CANCELLED)
+                    await self._finish_run_trace(state.status)
+                    await self._emit(
+                        "resume.completed",
+                        {"run_id": run_id, "status": state.status.value},
+                    )
                     return state
 
             if was_recovery:
@@ -140,20 +167,54 @@ class DurableAgentRuntime:
                 state.interrupt = None
                 state.error = None
                 await self._save_checkpoint(state, operation="resume")
+            await self._update_run_trace(state.status)
             await self._emit(
                 "run.resumed",
                 {"run_id": run_id, "recovered": was_recovery},
             )
-            return await self._advance(state)
+            try:
+                state = await self._advance(state)
+            except Exception as exc:
+                await self._finish_span(
+                    resume_span,
+                    SpanStatus.FAILED,
+                    attributes={"error": _safe_error(exc)},
+                )
+                await self._emit(
+                    "resume.completed",
+                    {"run_id": run_id, "status": "FAILED", "error": _safe_error(exc)},
+                )
+                raise
+            resume_status = {
+                RunStatus.COMPLETED: SpanStatus.SUCCEEDED,
+                RunStatus.FAILED: SpanStatus.FAILED,
+                RunStatus.CANCELLED: SpanStatus.CANCELLED,
+            }.get(state.status, SpanStatus.INTERRUPTED)
+            await self._finish_span(
+                resume_span,
+                resume_status,
+                attributes={"result_status": state.status.value},
+            )
+            if state.finished:
+                await self._finish_run_trace(state.status)
+            await self._emit(
+                "resume.completed",
+                {"run_id": run_id, "status": state.status.value},
+            )
+            return state
 
     async def interrupt(self, run_id: str, *, reason: str = "manual interrupt") -> Checkpoint:
         async with self._run_lock(run_id):
             state = await self._require(run_id)
             if state.status != RunStatus.RUNNING:
                 raise ValueError(f"run in {state.status.value} cannot be interrupted")
+            if self.tracer is not None:
+                await self.tracer.start_run(state)
             state.status = RunStatus.INTERRUPTED
             state.interrupt = Interrupt(kind="manual", reason=reason)
             await self._save_checkpoint(state, operation="interrupt.manual")
+            await self._record_interrupt(state, kind="manual", reason=reason)
+            await self._update_run_trace(state.status)
             await self._emit("run.interrupted", {"run_id": run_id, "reason": reason})
             return state
 
@@ -164,9 +225,12 @@ class DurableAgentRuntime:
                 return state
             if state.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
                 raise ValueError(f"run in {state.status.value} cannot be cancelled")
+            if self.tracer is not None:
+                await self.tracer.start_run(state)
             state.status = RunStatus.CANCELLED
             state.interrupt = None
             await self._save_checkpoint(state, operation="cancel")
+            await self._finish_run_trace(state.status)
             await self._emit("run.cancelled", {"run_id": run_id})
             return state
 
@@ -196,21 +260,82 @@ class DurableAgentRuntime:
         attempt = 0
         while True:
             attempt += 1
+            step_index = state.step_index
+            step_span = await self._start_span(
+                SpanType.AGENT,
+                "agent.step",
+                attributes={"step_index": step_index, "kind": "llm", "attempt": attempt},
+            )
             await self._emit(
                 "step.started",
                 {
                     "run_id": state.run_id,
-                    "step_index": state.step_index,
+                    "step_index": step_index,
                     "kind": "llm",
                     "attempt": attempt,
                 },
             )
+            await self._emit(
+                "agent.step.started",
+                {"run_id": state.run_id, "step_index": step_index, "kind": "llm"},
+            )
+            llm_span = await self._start_span(
+                SpanType.LLM,
+                "llm.chat",
+                parent_span_id=_span_id(step_span),
+                attributes={
+                    "provider": self.llm_client.provider_name,
+                    "model": self.llm_client.model_name,
+                    "temperature": self.config.llm.temperature,
+                    "retry_count": attempt - 1,
+                },
+            )
+            call_started = time.perf_counter()
+            await self._emit(
+                "llm.started",
+                {
+                    "run_id": state.run_id,
+                    "span_id": _span_id(llm_span),
+                    "provider": self.llm_client.provider_name,
+                    "model": self.llm_client.model_name,
+                    "attempt": attempt,
+                },
+            )
             try:
-                llm_result = await self._collect_llm_response(state)
+                llm_result = await self._collect_llm_response(state, call_started=call_started)
             except Exception as exc:
                 message = _safe_error(exc)
+                latency_ms = round((time.perf_counter() - call_started) * 1000, 3)
+                await self._finish_span(
+                    llm_span,
+                    SpanStatus.FAILED,
+                    attributes={
+                        "latency_ms": latency_ms,
+                        "error": message,
+                        "retry_count": attempt - 1,
+                    },
+                )
+                await self._emit(
+                    "llm.failed",
+                    {
+                        "run_id": state.run_id,
+                        "span_id": _span_id(llm_span),
+                        "latency_ms": latency_ms,
+                        "error": message,
+                        "attempt": attempt,
+                    },
+                )
                 state.error = RunError(type=type(exc).__name__, message=message, step="llm")
-                await self._save_checkpoint(state, operation="llm.failed")
+                await self._save_checkpoint(
+                    state,
+                    operation="llm.failed",
+                    parent_span_id=_span_id(step_span),
+                )
+                await self._finish_span(
+                    step_span,
+                    SpanStatus.FAILED,
+                    attributes={"error": message},
+                )
                 await self._emit(
                     "step.failed",
                     {
@@ -221,14 +346,47 @@ class DurableAgentRuntime:
                         "error": message,
                     },
                 )
+                await self._emit(
+                    "agent.step.failed",
+                    {"run_id": state.run_id, "step_index": step_index, "error": message},
+                )
                 if not self.retry_policy.can_retry(message, attempt):
                     state.status = RunStatus.FAILED
                     await self._save_checkpoint(state, operation="run.failed")
+                    await self._finish_run_trace(state.status)
                     await self._emit("run.failed", {"run_id": state.run_id, "error": message})
                     return state
                 if self.retry_policy.backoff_seconds > 0:
                     await asyncio.sleep(self.retry_policy.backoff_seconds)
                 continue
+
+            latency_ms = round((time.perf_counter() - call_started) * 1000, 3)
+            await self._finish_span(
+                llm_span,
+                SpanStatus.SUCCEEDED,
+                attributes={
+                    "prompt_tokens": llm_result.prompt_tokens,
+                    "completion_tokens": llm_result.completion_tokens,
+                    "total_tokens": llm_result.prompt_tokens + llm_result.completion_tokens,
+                    "first_token_at": llm_result.first_token_at,
+                    "ttft_ms": llm_result.ttft_ms,
+                    "latency_ms": latency_ms,
+                    "finish_reason": llm_result.stop_reason,
+                    "retry_count": attempt - 1,
+                },
+            )
+            await self._emit(
+                "llm.completed",
+                {
+                    "run_id": state.run_id,
+                    "span_id": _span_id(llm_span),
+                    "prompt_tokens": llm_result.prompt_tokens,
+                    "completion_tokens": llm_result.completion_tokens,
+                    "ttft_ms": llm_result.ttft_ms,
+                    "latency_ms": latency_ms,
+                    "finish_reason": llm_result.stop_reason,
+                },
+            )
 
             state.error = None
             state.messages.append(
@@ -246,7 +404,19 @@ class DurableAgentRuntime:
             state.total_tokens += llm_result.prompt_tokens + llm_result.completion_tokens
             if not llm_result.tool_calls and llm_result.stop_reason != "tool_use":
                 state.status = RunStatus.COMPLETED
-            await self._save_checkpoint(state, operation="llm.completed")
+            await self._save_checkpoint(
+                state,
+                operation="llm.completed",
+                parent_span_id=_span_id(step_span),
+            )
+            await self._finish_span(
+                step_span,
+                SpanStatus.SUCCEEDED,
+                attributes={
+                    "finish_reason": llm_result.stop_reason,
+                    "tool_calls": len(llm_result.tool_calls),
+                },
+            )
             await self._emit(
                 "step.completed",
                 {
@@ -257,18 +427,30 @@ class DurableAgentRuntime:
                     "tool_calls": len(llm_result.tool_calls),
                 },
             )
+            await self._emit(
+                "agent.step.completed",
+                {"run_id": state.run_id, "step_index": step_index, "kind": "llm"},
+            )
             if state.status == RunStatus.COMPLETED:
+                await self._finish_run_trace(state.status)
                 await self._emit(
                     "run.completed",
                     {"run_id": state.run_id, "total_tokens": state.total_tokens},
                 )
             return state
 
-    async def _collect_llm_response(self, state: Checkpoint) -> _LlmCallResult:
+    async def _collect_llm_response(
+        self,
+        state: Checkpoint,
+        *,
+        call_started: float,
+    ) -> _LlmCallResult:
         text = ""
         stop_reason = "end_turn"
         prompt_tokens = 0
         completion_tokens = 0
+        first_token_at: str | None = None
+        ttft_ms: float | None = None
         tool_states: dict[int, dict[str, Any]] = {}
         async for event in self.llm_client.chat(
             state.messages,
@@ -276,6 +458,12 @@ class DurableAgentRuntime:
             system_prompt=self.system_prompt,
         ):
             event_type = event.get("type")
+            if (
+                event_type in {"text_delta", "thinking_delta", "tool_call_delta"}
+                and first_token_at is None
+            ):
+                first_token_at = now()
+                ttft_ms = round((time.perf_counter() - call_started) * 1000, 3)
             if event_type == "text_delta":
                 text += str(event.get("text") or "")
             elif event_type == "tool_call_delta" and isinstance(event.get("tool_call"), dict):
@@ -296,9 +484,65 @@ class DurableAgentRuntime:
             stop_reason=stop_reason,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            first_token_at=first_token_at,
+            ttft_ms=ttft_ms,
         )
 
     async def _execute_pending_tool(self, state: Checkpoint) -> Checkpoint:
+        step_index = state.step_index
+        step_span = await self._start_span(
+            SpanType.AGENT,
+            "agent.step",
+            attributes={"step_index": step_index, "kind": "tool"},
+        )
+        await self._emit(
+            "agent.step.started",
+            {"run_id": state.run_id, "step_index": step_index, "kind": "tool"},
+        )
+        try:
+            result = await self._execute_pending_tool_inner(
+                state,
+                parent_span_id=_span_id(step_span),
+            )
+        except Exception as exc:
+            await self._finish_span(
+                step_span,
+                SpanStatus.FAILED,
+                attributes={"error": _safe_error(exc)},
+            )
+            await self._emit(
+                "agent.step.failed",
+                {"run_id": state.run_id, "step_index": step_index, "error": _safe_error(exc)},
+            )
+            raise
+        step_status = {
+            RunStatus.FAILED: SpanStatus.FAILED,
+            RunStatus.CANCELLED: SpanStatus.CANCELLED,
+            RunStatus.INTERRUPTED: SpanStatus.INTERRUPTED,
+            RunStatus.WAITING_APPROVAL: SpanStatus.INTERRUPTED,
+        }.get(result.status, SpanStatus.SUCCEEDED)
+        await self._finish_span(
+            step_span,
+            step_status,
+            attributes={"result_status": result.status.value},
+        )
+        await self._emit(
+            "agent.step.completed",
+            {
+                "run_id": state.run_id,
+                "step_index": step_index,
+                "kind": "tool",
+                "status": step_status.value,
+            },
+        )
+        return result
+
+    async def _execute_pending_tool_inner(
+        self,
+        state: Checkpoint,
+        *,
+        parent_span_id: str | None,
+    ) -> Checkpoint:
         call = state.pending_tool_calls[state.next_tool_index]
         tool_call_id = str(call.get("id") or f"call_{state.agent_turn}_{state.next_tool_index}")
         call["id"] = tool_call_id
@@ -318,6 +562,24 @@ class DurableAgentRuntime:
             )
 
         if existing and existing.status == ToolExecutionStatus.SUCCEEDED:
+            tool_span = await self._start_tool_span(
+                invocation_id,
+                name,
+                parent_span_id=parent_span_id,
+                attributes={
+                    "approval_required": self._requires_approval(tool),
+                    "reused_result": True,
+                    "retry_count": max(0, existing.attempt - 1),
+                },
+            )
+            if tool_span is not None and tool_span.status == SpanStatus.RUNNING:
+                await self._finish_span(
+                    tool_span,
+                    SpanStatus.SUCCEEDED,
+                    attributes={"reused_result": True},
+                )
+            elif tool_span is not None and self.tracer is not None:
+                await self.tracer.annotate_span(tool_span.span_id, reused_result=True)
             result = ToolResult(
                 content=existing.result or "",
                 is_error=False,
@@ -329,11 +591,27 @@ class DurableAgentRuntime:
                 name,
                 result,
                 reused=True,
+                parent_span_id=parent_span_id,
             )
 
         if existing and existing.status == ToolExecutionStatus.RUNNING:
             retry_is_safe = bool(tool and (tool.is_read_only or tool.idempotency_key_parameter))
             if not retry_is_safe and decision != "approve":
+                tool_span = await self._start_tool_span(
+                    invocation_id,
+                    name,
+                    parent_span_id=parent_span_id,
+                    attributes={
+                        "approval_required": self._requires_approval(tool),
+                        "ambiguous_execution": True,
+                        "retry_count": max(0, existing.attempt - 1),
+                    },
+                )
+                if tool_span is not None and self.tracer is not None:
+                    await self.tracer.annotate_span(
+                        tool_span.span_id,
+                        ambiguous_execution=True,
+                    )
                 return await self._wait_for_approval(
                     state,
                     invocation_id=invocation_id,
@@ -344,6 +622,7 @@ class DurableAgentRuntime:
                         "The process stopped after tool execution started but before success was "
                         "persisted. Retrying may duplicate an external side effect."
                     ),
+                    parent_span_id=parent_span_id,
                 )
 
         if self._requires_approval(tool) and decision is None:
@@ -354,6 +633,7 @@ class DurableAgentRuntime:
                 arguments=payload,
                 kind="tool_approval",
                 reason=f'Tool "{name}" requires approval.',
+                parent_span_id=parent_span_id,
             )
 
         if decision == "reject":
@@ -370,6 +650,22 @@ class DurableAgentRuntime:
             record.is_error = True
             record.completed_at = _now()
             await self.store.save_tool_execution(record)
+            tool_span = await self._start_tool_span(
+                invocation_id,
+                name,
+                parent_span_id=parent_span_id,
+                attributes={
+                    "approval_required": True,
+                    "reused_result": False,
+                    "retry_count": max(0, record.attempt - 1),
+                    "rejected": True,
+                },
+            )
+            await self._finish_span(
+                tool_span,
+                SpanStatus.FAILED,
+                attributes={"error": record.error, "rejected": True},
+            )
             result = ToolResult(
                 content=f'Tool "{name}" was rejected by approval policy.',
                 is_error=True,
@@ -380,6 +676,7 @@ class DurableAgentRuntime:
                 invocation_id,
                 name,
                 result,
+                parent_span_id=parent_span_id,
             )
 
         record = existing or ToolExecutionRecord(
@@ -393,12 +690,33 @@ class DurableAgentRuntime:
         if existing is None:
             await self.store.save_tool_execution(record)
 
+        tool_span = await self._start_tool_span(
+            invocation_id,
+            name,
+            parent_span_id=parent_span_id,
+            attributes={
+                "approval_required": self._requires_approval(tool),
+                "reused_result": False,
+                "ambiguous_execution": bool(
+                    existing and existing.status == ToolExecutionStatus.RUNNING
+                ),
+                "tool_call_id": tool_call_id,
+            },
+            reopen=bool(existing and existing.status == ToolExecutionStatus.RUNNING),
+        )
+
         while True:
             record.attempt += 1
             record.status = ToolExecutionStatus.RUNNING
             record.started_at = record.started_at or _now()
             record.error = None
             await self.store.save_tool_execution(record)
+            if tool_span is not None and self.tracer is not None:
+                await self.tracer.annotate_span(
+                    tool_span.span_id,
+                    attempt=record.attempt,
+                    retry_count=max(0, record.attempt - 1),
+                )
             await self._emit(
                 "tool.started",
                 {
@@ -426,11 +744,20 @@ class DurableAgentRuntime:
                 record.error = None
                 record.completed_at = _now()
                 await self.store.save_tool_execution(record)
+                await self._finish_span(
+                    tool_span,
+                    SpanStatus.SUCCEEDED,
+                    attributes={
+                        "attempt": record.attempt,
+                        "retry_count": max(0, record.attempt - 1),
+                    },
+                )
                 return await self._apply_tool_result(
                     state,
                     invocation_id,
                     name,
                     result,
+                    parent_span_id=parent_span_id,
                 )
 
             record.status = ToolExecutionStatus.FAILED
@@ -456,11 +783,21 @@ class DurableAgentRuntime:
                 result.content, record.attempt
             )
             if not retryable:
+                await self._finish_span(
+                    tool_span,
+                    SpanStatus.FAILED,
+                    attributes={
+                        "attempt": record.attempt,
+                        "retry_count": max(0, record.attempt - 1),
+                        "error": result.content,
+                    },
+                )
                 return await self._apply_tool_result(
                     state,
                     invocation_id,
                     name,
                     result,
+                    parent_span_id=parent_span_id,
                 )
             if self.retry_policy.backoff_seconds > 0:
                 await asyncio.sleep(self.retry_policy.backoff_seconds)
@@ -473,6 +810,7 @@ class DurableAgentRuntime:
         result: ToolResult,
         *,
         reused: bool = False,
+        parent_span_id: str | None = None,
     ) -> Checkpoint:
         state.messages.append(
             Message(
@@ -485,7 +823,11 @@ class DurableAgentRuntime:
         state.step_index += 1
         state.interrupt = None
         state.decisions.pop(invocation_id, None)
-        await self._save_checkpoint(state, operation="tool.completed")
+        await self._save_checkpoint(
+            state,
+            operation="tool.completed",
+            parent_span_id=parent_span_id,
+        )
         await self._emit(
             "tool.completed",
             {
@@ -509,6 +851,7 @@ class DurableAgentRuntime:
         arguments: dict[str, Any],
         kind: str,
         reason: str,
+        parent_span_id: str | None = None,
     ) -> Checkpoint:
         state.status = RunStatus.WAITING_APPROVAL
         state.interrupt = Interrupt(
@@ -518,7 +861,27 @@ class DurableAgentRuntime:
             tool_name=tool_name,
             arguments=arguments,
         )
-        await self._save_checkpoint(state, operation="interrupt")
+        await self._save_checkpoint(
+            state,
+            operation="interrupt",
+            parent_span_id=parent_span_id,
+        )
+        await self._record_interrupt(
+            state,
+            kind=kind,
+            reason=reason,
+            parent_span_id=parent_span_id,
+        )
+        await self._update_run_trace(state.status)
+        await self._emit(
+            "interrupt.created",
+            {
+                "run_id": state.run_id,
+                "kind": kind,
+                "reason": reason,
+                "invocation_id": invocation_id,
+            },
+        )
         await self._emit(
             "run.interrupted",
             {
@@ -533,6 +896,7 @@ class DurableAgentRuntime:
         state.status = RunStatus.FAILED
         state.error = RunError(type=type(exc).__name__, message=_safe_error(exc), step=step)
         await self._save_checkpoint(state, operation="run.failed")
+        await self._finish_run_trace(state.status)
         await self._emit(
             "run.failed",
             {"run_id": state.run_id, "error": state.error.to_dict()},
@@ -566,9 +930,116 @@ class DurableAgentRuntime:
         state: Checkpoint,
         *,
         operation: str,
+        parent_span_id: str | None = None,
     ) -> None:
-        _ = operation
-        await self.store.save(state)
+        if self.tracer is None:
+            await self.store.save(state)
+            return
+        span = await self.tracer.start_span(
+            SpanType.CHECKPOINT,
+            "checkpoint.save",
+            parent_span_id=parent_span_id,
+            attributes={
+                "operation": operation,
+                "sequence_before": state.sequence,
+                "run_status": state.status.value,
+            },
+        )
+        try:
+            await self.store.save(state)
+        except Exception as exc:
+            await self.tracer.finish_span(
+                span,
+                SpanStatus.FAILED,
+                attributes={"error": _safe_error(exc)},
+            )
+            raise
+        await self.tracer.finish_span(
+            span,
+            SpanStatus.SUCCEEDED,
+            attributes={"sequence": state.sequence},
+        )
+
+    async def _start_span(
+        self,
+        span_type: SpanType,
+        name: str,
+        *,
+        attributes: dict[str, object] | None = None,
+        parent_span_id: str | None = None,
+    ) -> Span | None:
+        if self.tracer is None:
+            return None
+        return await self.tracer.start_span(
+            span_type,
+            name,
+            attributes=attributes,
+            parent_span_id=parent_span_id,
+        )
+
+    async def _finish_span(
+        self,
+        span: Span | None,
+        status: SpanStatus,
+        *,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        if self.tracer is None or span is None:
+            return
+        await self.tracer.finish_span(span, status, attributes=attributes)
+
+    async def _start_tool_span(
+        self,
+        invocation_id: str,
+        tool_name: str,
+        *,
+        parent_span_id: str | None,
+        attributes: dict[str, object] | None = None,
+        reopen: bool = False,
+    ) -> Span | None:
+        if self.tracer is None:
+            return None
+        return await self.tracer.start_span(
+            SpanType.TOOL,
+            f"tool.{tool_name}",
+            span_id=tool_span_id(invocation_id),
+            parent_span_id=parent_span_id,
+            reopen=reopen,
+            attributes={
+                "tool_name": tool_name,
+                "invocation_id": invocation_id,
+                **dict(attributes or {}),
+            },
+        )
+
+    async def _record_interrupt(
+        self,
+        state: Checkpoint,
+        *,
+        kind: str,
+        reason: str,
+        parent_span_id: str | None = None,
+    ) -> None:
+        span = await self._start_span(
+            SpanType.INTERRUPT,
+            "interrupt",
+            parent_span_id=parent_span_id,
+            attributes={
+                "kind": kind,
+                "reason": reason,
+                "invocation_id": state.interrupt.invocation_id if state.interrupt else None,
+                "tool_name": state.interrupt.tool_name if state.interrupt else None,
+            },
+        )
+        await self._finish_span(span, SpanStatus.INTERRUPTED)
+
+    async def _update_run_trace(self, status: RunStatus) -> None:
+        if self.tracer is not None:
+            await self.tracer.update_run(status)
+
+    async def _finish_run_trace(self, status: RunStatus) -> None:
+        if self.tracer is not None:
+            await self.tracer.update_run(status, terminal=True)
 
     async def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.event_sink is None:
@@ -576,6 +1047,10 @@ class DurableAgentRuntime:
         result = self.event_sink(event_type, payload)
         if inspect.isawaitable(result):
             await result
+
+
+def _span_id(span: Span | None) -> str | None:
+    return span.span_id if span is not None else None
 
 
 def _merge_tool_delta(

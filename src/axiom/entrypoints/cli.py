@@ -18,8 +18,13 @@ from axiom.config import get_config_paths, load_config
 from axiom.entrypoints.repl import start_repl
 from axiom.llm import create_llm_client
 from axiom.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
-from axiom.runtime import RuntimeApiServer
+from axiom.runtime import (
+    ObservabilityService,
+    RuntimeApiServer,
+    SQLiteObservabilityStore,
+)
 from axiom.runtime.api import runtime_api_key
+from axiom.runtime.observability import RunMetrics, Span, SpanType, TraceBundle
 
 app = typer.Typer(
     name="axiom",
@@ -28,7 +33,9 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 mcp_app = typer.Typer(help="MCP server management")
+runs_app = typer.Typer(help="Inspect persisted Runtime runs")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(runs_app, name="runs")
 console = Console()
 
 
@@ -126,6 +133,38 @@ def runtime_serve(
         port=port,
         data_dir=data_dir,
     ).serve_forever()
+
+
+@runs_app.command("show")
+def runs_show(
+    run_id: Annotated[str, typer.Argument(help="Run ID")],
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Runtime data directory"),
+    ] = None,
+) -> None:
+    service = ObservabilityService(SQLiteObservabilityStore(_runtime_db(data_dir)))
+    metrics = asyncio.run(service.metrics(run_id))
+    if metrics is None:
+        typer.echo(f"Run not found: {run_id}", err=True)
+        raise typer.Exit(1)
+    typer.echo(_format_run_metrics(metrics))
+
+
+@runs_app.command("trace")
+def runs_trace(
+    run_id: Annotated[str, typer.Argument(help="Run ID")],
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Runtime data directory"),
+    ] = None,
+) -> None:
+    service = ObservabilityService(SQLiteObservabilityStore(_runtime_db(data_dir)))
+    bundle = asyncio.run(service.trace(run_id))
+    if bundle is None:
+        typer.echo(f"Run not found: {run_id}", err=True)
+        raise typer.Exit(1)
+    typer.echo(_format_run_trace(bundle))
 
 
 @mcp_app.command("serve")
@@ -227,3 +266,95 @@ def _version_of(command: str) -> str:
     except Exception:  # noqa: BLE001
         return "unknown"
     return (result.stdout or result.stderr).strip() or "unknown"
+
+
+def _runtime_db(data_dir: Path | None) -> Path:
+    root = data_dir.expanduser() if data_dir else Path.home() / ".axiom" / "runtime"
+    return root / "runtime.db"
+
+
+def _format_run_metrics(metrics: RunMetrics) -> str:
+    success_rate = (
+        f"{metrics.tool_success_rate * 100:.1f}%"
+        if metrics.tool_success_rate is not None
+        else "n/a"
+    )
+    return "\n".join(
+        [
+            f"Run: {metrics.run_id}",
+            f"Status: {metrics.status}",
+            f"Latency: {_format_duration(metrics.duration_ms)}",
+            f"Steps: {metrics.step_count}",
+            f"LLM calls: {metrics.llm_calls}",
+            f"Tool calls: {metrics.tool_calls}",
+            f"Tokens: {metrics.total_tokens} "
+            f"(input {metrics.prompt_tokens}, output {metrics.completion_tokens})",
+            f"Tool success: {success_rate}",
+            f"Checkpoints: {metrics.checkpoint_count}",
+            f"Interrupts: {metrics.interrupt_count}",
+            f"Resumes: {metrics.resume_count}",
+            f"Retries: {metrics.retry_count}",
+        ]
+    )
+
+
+def _format_run_trace(bundle: TraceBundle) -> str:
+    children: dict[str | None, list[Span]] = {}
+    for span in bundle.spans:
+        children.setdefault(span.parent_span_id, []).append(span)
+    for values in children.values():
+        values.sort(key=lambda span: (span.started_at, span.span_id))
+
+    root = next(
+        (span for span in bundle.spans if span.span_type == SpanType.AGENT and span.name == "run"),
+        None,
+    )
+    lines = [
+        f"Run {bundle.trace.run_id} {_format_duration(bundle.trace.total_latency_ms)} "
+        f"[{bundle.trace.status}]"
+    ]
+    parent_id = root.span_id if root is not None else None
+    _append_trace_children(lines, children, parent_id, prefix="")
+    return "\n".join(lines)
+
+
+def _append_trace_children(
+    lines: list[str],
+    children: dict[str | None, list[Span]],
+    parent_id: str | None,
+    *,
+    prefix: str,
+) -> None:
+    values = children.get(parent_id, [])
+    for index, span in enumerate(values):
+        last = index == len(values) - 1
+        connector = "└──" if last else "├──"
+        lines.append(
+            f"{prefix}{connector} {_span_label(span):<24} "
+            f"{_format_duration(span.latency_ms):>9} [{span.status.value}]"
+        )
+        child_prefix = prefix + ("    " if last else "│   ")
+        _append_trace_children(lines, children, span.span_id, prefix=child_prefix)
+
+
+def _span_label(span: Span) -> str:
+    if span.span_type == SpanType.LLM:
+        model = str(span.attributes.get("model") or "unknown")
+        return f"LLM {model}"
+    if span.span_type == SpanType.TOOL:
+        return f"Tool {span.attributes.get('tool_name') or span.name}"
+    if span.span_type == SpanType.CHECKPOINT:
+        return "Checkpoint"
+    if span.span_type == SpanType.INTERRUPT:
+        return f"Interrupt {span.attributes.get('kind') or ''}".rstrip()
+    if span.name == "resume":
+        return "Resume"
+    return "Agent step" if span.name == "agent.step" else span.name
+
+
+def _format_duration(value: float | None) -> str:
+    if value is None:
+        return "running"
+    if value >= 1000:
+        return f"{value / 1000:.2f}s"
+    return f"{value:.1f}ms"

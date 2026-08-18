@@ -12,6 +12,19 @@ from axiom.runtime.models import (
     ToolExecutionRecord,
     ToolExecutionStatus,
 )
+from axiom.runtime.observability import (
+    RunMetrics,
+    Span,
+    SpanStatus,
+    SpanType,
+    Trace,
+    TraceBundle,
+)
+from axiom.runtime.observability_store import (
+    MemoryObservabilityStore,
+    ObservabilityService,
+    SQLiteObservabilityStore,
+)
 from axiom.runtime.tasks import DurableTaskManager, TaskRecord
 
 __all__ = [
@@ -21,11 +34,20 @@ __all__ = [
     "DurableAgentRuntime",
     "DurableTaskManager",
     "MemoryCheckpointStore",
+    "MemoryObservabilityStore",
+    "ObservabilityService",
     "RetryPolicy",
     "RunStatus",
+    "RunMetrics",
     "RuntimeApiServer",
     "SQLiteCheckpointStore",
+    "SQLiteObservabilityStore",
+    "Span",
+    "SpanStatus",
+    "SpanType",
     "TaskRecord",
     "ToolExecutionRecord",
     "ToolExecutionStatus",
+    "Trace",
+    "TraceBundle",
 ]

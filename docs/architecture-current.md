@@ -219,6 +219,23 @@ flowchart TD
     completed Runtime turn.
   - Runs best-effort fact/preference extraction after completed turns. Extracted
     facts are derived state and never replace raw Runtime events.
+- `src/axiom/runtime/models.py`
+  - Defines explicit Thread/Turn/Run checkpoint identities, Run statuses,
+    interrupts, errors, and ToolExecution records with stable JSON conversion.
+- `src/axiom/runtime/checkpoints.py`
+  - Defines the async-compatible checkpoint/tool execution store protocols and
+    Memory/SQLite implementations. SQLite appends checkpoint sequences and uses
+    optimistic sequence checks to reject stale workers.
+- `src/axiom/runtime/durable.py`
+  - Advances the default ReAct loop across LLM and per-tool durable boundaries,
+    persists approval interrupts, resumes after restart, applies bounded retry,
+    and reuses successful tool invocation records.
+- `src/axiom/runtime/observability.py`
+  - Defines Trace, Span, RunMetrics, stable Run/tool span identities, JSON
+    attributes, and latency/token aggregation rules.
+- `src/axiom/runtime/observability_store.py`
+  - Provides Memory/SQLite observability stores, schema versioning, the
+    RunTracer execution hook, and trace/metrics query service.
 - `src/axiom/runtime/tasks.py`
   - Stores durable background tasks in SQLite.
 
@@ -456,6 +473,15 @@ MCP server expansion points:
 - Runtime API persistence is local SQLite and bound to localhost; it is not a
   distributed service, public deployment validation, load-tested API, or
   distributed queue.
+- The durable loop currently covers the Runtime API's default ReAct QueryEngine.
+  Plan-Execute, multi-agent worker/DAG state, and custom engine internals remain
+  in-memory. There is no distributed lock, recovery scheduler, or checkpoint
+  compaction yet.
+- Runtime tool records provide best-effort deduplication after a persisted
+  success, not exactly-once semantics for arbitrary external side effects.
+- Observability is local and unsampled. There is no distributed trace context,
+  OpenTelemetry export, external dashboard, retention, or cross-process clock
+  correction.
 - Runtime thread history recovery, typed memory, Map-Reduce summary checkpoints,
   and conservative scoped fact/preference extraction are implemented locally,
   but semantic memory retrieval, remote summarization/extraction CI, and

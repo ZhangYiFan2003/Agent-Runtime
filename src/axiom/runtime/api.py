@@ -27,6 +27,13 @@ from axiom.runtime.checkpoints import (
 )
 from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
 from axiom.runtime.models import Checkpoint, Interrupt, RunError, RunStatus
+from axiom.runtime.observability import SpanStatus, SpanType
+from axiom.runtime.observability_store import (
+    ObservabilityService,
+    ObservabilityStore,
+    RunTracer,
+    SQLiteObservabilityStore,
+)
 from axiom.runtime.tasks import DurableTaskManager
 from axiom.types import Message
 
@@ -178,6 +185,7 @@ class RuntimeApiServer:
         tool_registry_factory: ToolRegistryFactory | None = None,
         memory_service: MemoryService | None = None,
         checkpoint_store: RuntimeStore | None = None,
+        observability_store: ObservabilityStore | None = None,
         retry_policy: RetryPolicy | None = None,
     ):
         self.cwd = str(Path(cwd).resolve())
@@ -193,6 +201,10 @@ class RuntimeApiServer:
         self.checkpoint_store = checkpoint_store or SQLiteCheckpointStore(
             self.data_dir / "runtime.db"
         )
+        self.observability_store = observability_store or SQLiteObservabilityStore(
+            self.data_dir / "runtime.db"
+        )
+        self.observability = ObservabilityService(self.observability_store)
         self.retry_policy = retry_policy or RetryPolicy()
         self.task_manager = task_manager or DurableTaskManager(self.data_dir / "tasks.db")
         self.memory_service = memory_service or MemoryService(
@@ -351,6 +363,20 @@ class RuntimeApiServer:
                     _send_json(request, 404, {"error": "thread not found"})
                     return
                 self._send_events(request, thread_id, after_id=after_id)
+            elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/trace"):
+                run_id = path.split("/")[3]
+                bundle = asyncio.run(self.observability.trace(run_id))
+                if bundle is None:
+                    _send_json(request, 404, {"error": "trace not found"})
+                    return
+                _send_json(request, 200, bundle.to_dict())
+            elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/metrics"):
+                run_id = path.split("/")[3]
+                metrics = asyncio.run(self.observability.metrics(run_id))
+                if metrics is None:
+                    _send_json(request, 404, {"error": "metrics not found"})
+                    return
+                _send_json(request, 200, metrics.to_dict())
             elif method == "GET" and path.startswith("/v1/runs/"):
                 run_id = path.split("/")[3]
                 state = asyncio.run(self.checkpoint_store.load(run_id))
@@ -482,6 +508,13 @@ class RuntimeApiServer:
             run_id=context.run_id,
             turn_id=context.turn_id,
         )
+        tracer = RunTracer(self.observability_store)
+        await tracer.start_run(state)
+        engine_span = await tracer.start_span(
+            SpanType.AGENT,
+            "legacy.engine",
+            attributes={"durable_internal_steps": False},
+        )
         await self.checkpoint_store.save(state)
         self.repository.append_event(
             thread_id,
@@ -520,6 +553,12 @@ class RuntimeApiServer:
             state.status = RunStatus.FAILED
             state.error = RunError(type=type(exc).__name__, message=_safe_error(exc), step="engine")
             await self.checkpoint_store.save(state)
+            await tracer.finish_span(
+                engine_span,
+                SpanStatus.FAILED,
+                attributes={"error": _safe_error(exc)},
+            )
+            await tracer.update_run(state.status, terminal=True)
             self.repository.append_event(
                 thread_id,
                 "run.failed",
@@ -532,6 +571,8 @@ class RuntimeApiServer:
         state.agent_turn = int(done_payload.get("total_turns") or 1)
         state.total_tokens = int(done_payload.get("total_tokens") or 0)
         await self.checkpoint_store.save(state)
+        await tracer.finish_span(engine_span, SpanStatus.SUCCEEDED)
+        await tracer.update_run(state.status, terminal=True)
         self.repository.append_event(
             thread_id,
             "run.completed",
@@ -635,6 +676,7 @@ class RuntimeApiServer:
             store=self.checkpoint_store,
             retry_policy=self.retry_policy,
             event_sink=self._runtime_event_sink(thread_id),
+            tracer=RunTracer(self.observability_store),
         )
 
     def _runtime_event_sink(self, thread_id: str):
@@ -690,13 +732,39 @@ class RuntimeApiServer:
             raise ValueError(f"run in {state.status.value} cannot change status")
         if status == RunStatus.INTERRUPTED and state.status != RunStatus.RUNNING:
             raise ValueError(f"run in {state.status.value} cannot be manually interrupted")
+        tracer = RunTracer(self.observability_store)
+        await tracer.start_run(state)
         state.status = status
         state.interrupt = (
             Interrupt(kind="manual", reason=reason or "manual interrupt")
             if status == RunStatus.INTERRUPTED
             else None
         )
-        await self.checkpoint_store.save(state)
+        checkpoint_span = await tracer.start_span(
+            SpanType.CHECKPOINT,
+            "checkpoint.save",
+            attributes={"sequence": state.sequence, "run_status": status.value},
+        )
+        try:
+            await self.checkpoint_store.save(state)
+        except Exception as exc:
+            await tracer.finish_span(
+                checkpoint_span,
+                SpanStatus.FAILED,
+                attributes={"error": _safe_error(exc)},
+            )
+            raise
+        await tracer.finish_span(checkpoint_span, SpanStatus.SUCCEEDED)
+        if status == RunStatus.INTERRUPTED:
+            span = await tracer.start_span(
+                SpanType.INTERRUPT,
+                "interrupt",
+                attributes={"kind": "manual", "reason": reason or "manual interrupt"},
+            )
+            await tracer.finish_span(span, SpanStatus.INTERRUPTED)
+            await tracer.update_run(status)
+        else:
+            await tracer.update_run(status, terminal=True)
         event_type = "run.interrupted" if status == RunStatus.INTERRUPTED else "run.cancelled"
         self.repository.append_event(
             state.thread_id,

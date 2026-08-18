@@ -47,7 +47,8 @@ stage. This document does not repeat the model request.
 | Multi-agent | `src/axiom/agent/orchestrator.py` | Verified | `tests/test_multi_agent.py` verifies plan parsing, independent worker parallelism, dependent worker ordering, result collection, reviewer reject-then-approve retry, and worker failure summaries with fake LLM clients. |
 | MCP client | `src/axiom/mcp/client.py`, `src/axiom/mcp/config.py` | Verified | Tests passed for stdio MCP tool discovery/call and stderr suppression. |
 | MCP server | `src/axiom/mcp/server.py` | Partially verified | Handler-level tests cover initialize, tools/list, safe tools/call, unknown tools, unknown methods, and malformed missing-method requests. Long-running stdio/http transports were not started in this baseline. |
-| Runtime API | `src/axiom/runtime/api.py`, `src/axiom/runtime/tasks.py` | Verified | Durable task tests, direct handler tests, and live localhost HTTP tests cover server start/shutdown, port `0`, health, auth, task create/list/get/cancel, fake thread turns, thread history recovery, best-effort summary checkpointing, stored SSE event replay with `after_id`, isolated `data_dir`, restart persistence, and socket release. |
+| Runtime API and durable execution | `src/axiom/runtime/*` | Verified | Runtime lifecycle/API tests plus crash recovery tests cover Memory/SQLite checkpoints, restart resume, approval/reject/manual interrupt, cancel terminality, bounded retry, successful-tool deduplication, ambiguous side-effect recovery, optimistic sequence conflicts, same-process double resume, stored SSE replay, and socket release. |
+| Runtime observability | `src/axiom/runtime/observability.py`, `src/axiom/runtime/observability_store.py` | Verified | Deterministic tests cover LLM token/TTFT/latency spans, Tool success/failure/retry/reuse and ambiguity attributes, interrupt/resume continuity, crash recovery on one trace, SQLite reload, lifecycle Events, HTTP metrics/trace endpoints, and CLI rendering. |
 
 Status definitions:
 
@@ -140,7 +141,7 @@ added for Windows.
 
 ## 6. Recommended next-stage tasks
 
-1. Add structured Agent run observability for ReAct, tool execution, Plan-and-Execute, and multi-agent workflows.
+1. Build deterministic Agent evaluation datasets and scorers on the persisted Run traces.
 2. Add MCP stdio/http transport lifecycle tests with deterministic process cleanup.
 3. Add optional LLM-backed memory extraction evaluation with strict schemas and no default network calls.
 4. Broaden no-network tests for high-risk built-in tools beyond the current read/write, code search, Runtime API, and ReAct `read_file` paths.
