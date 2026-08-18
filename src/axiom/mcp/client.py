@@ -13,14 +13,22 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 from pydantic import AnyUrl
 
+from axiom.config import ExecutionConfig
+from axiom.execution import filtered_host_environment
 from axiom.mcp.config import McpServerSpec, load_mcp_server_specs
 from axiom.policy import Capability
 from axiom.tools.base import Tool, ToolContext, ToolResult, object_schema
 
 
 class McpClientManager:
-    def __init__(self, project_root: str | Path):
+    def __init__(
+        self,
+        project_root: str | Path,
+        *,
+        execution_config: ExecutionConfig | None = None,
+    ):
         self.project_root = str(Path(project_root).resolve())
+        self.execution_config = execution_config or ExecutionConfig()
         self.specs = load_mcp_server_specs(self.project_root)
         self.last_errors: dict[str, str] = {}
 
@@ -208,10 +216,14 @@ class McpClientManager:
         if spec.type in {"stdio", "local"}:
             if not spec.command:
                 raise ValueError(f"MCP server {spec.name} is missing command")
+            environment, _filtered_count = filtered_host_environment(
+                self.execution_config.allowed_env_names
+            )
+            environment.update(spec.env)
             params = StdioServerParameters(
                 command=spec.command,
                 args=spec.args,
-                env={**os.environ, **spec.env},
+                env=environment,
                 cwd=spec.cwd or self.project_root,
                 encoding="utf-8",
             )

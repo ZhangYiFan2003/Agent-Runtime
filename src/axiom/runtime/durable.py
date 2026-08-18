@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from axiom.config import AxiomConfig
+from axiom.execution import ExecutionBackend, create_execution_backend
 from axiom.llm.base import LlmClient
 from axiom.policy import (
     Capability,
@@ -82,6 +83,7 @@ class DurableAgentRuntime:
         event_sink: EventSink | None = None,
         tracer: RunTracer | None = None,
         permission_policy: PermissionPolicy | None = None,
+        execution_backend: ExecutionBackend | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -97,6 +99,7 @@ class DurableAgentRuntime:
             cwd,
             hitl_mode=config.policy.hitl_mode,
         )
+        self.execution_backend = execution_backend or create_execution_backend(config, cwd)
         self.max_turns = max_turns
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -732,6 +735,7 @@ class DurableAgentRuntime:
                     existing and existing.status == ToolExecutionStatus.RUNNING
                 ),
                 "tool_call_id": tool_call_id,
+                **self._execution_start_attributes(tool, payload),
             },
             reopen=bool(existing and existing.status == ToolExecutionStatus.RUNNING),
         )
@@ -757,6 +761,7 @@ class DurableAgentRuntime:
                     "tool_name": name,
                     "arguments": payload,
                     "attempt": record.attempt,
+                    **self._execution_start_attributes(tool, payload),
                 },
             )
 
@@ -772,8 +777,40 @@ class DurableAgentRuntime:
                 workspace=self.cwd,
                 permission_policy=self.permission_policy,
                 preauthorized_invocation_id=invocation_id,
+                execution_backend=self.execution_backend,
             )
-            result = await ToolExecutor(self.tool_registry).execute_one(execution_call, context)
+            try:
+                result = await ToolExecutor(
+                    self.tool_registry,
+                    execution_backend=self.execution_backend,
+                ).execute_one(execution_call, context)
+            except asyncio.CancelledError:
+                record.status = ToolExecutionStatus.FAILED
+                record.is_error = True
+                record.error = "tool execution cancelled"
+                record.completed_at = _now()
+                await self.store.save_tool_execution(record)
+                cancelled = {
+                    **self._execution_start_attributes(tool, payload),
+                    "cancelled": True,
+                }
+                await self._finish_span(
+                    tool_span,
+                    SpanStatus.CANCELLED,
+                    attributes={"error": record.error, **cancelled},
+                )
+                await self._emit(
+                    "tool.failed",
+                    {
+                        "run_id": state.run_id,
+                        "invocation_id": invocation_id,
+                        "tool_name": name,
+                        "attempt": record.attempt,
+                        "error": record.error,
+                        "execution": cancelled,
+                    },
+                )
+                raise
             if not result.is_error:
                 record.status = ToolExecutionStatus.SUCCEEDED
                 record.result = result.content
@@ -787,6 +824,7 @@ class DurableAgentRuntime:
                     attributes={
                         "attempt": record.attempt,
                         "retry_count": max(0, record.attempt - 1),
+                        **result.metadata,
                     },
                 )
                 return await self._apply_tool_result(
@@ -811,6 +849,7 @@ class DurableAgentRuntime:
                     "tool_name": name,
                     "attempt": record.attempt,
                     "error": result.content,
+                    "execution": result.metadata or None,
                 },
             )
             retry_is_safe = bool(
@@ -827,6 +866,7 @@ class DurableAgentRuntime:
                         "attempt": record.attempt,
                         "retry_count": max(0, record.attempt - 1),
                         "error": result.content,
+                        **result.metadata,
                     },
                 )
                 return await self._apply_tool_result(
@@ -875,6 +915,7 @@ class DurableAgentRuntime:
                 "reused": reused,
                 "tool_call_id": result.tool_use_id,
                 "result": result.content,
+                "execution": result.metadata or None,
             },
         )
         return state
@@ -1036,6 +1077,19 @@ class DurableAgentRuntime:
             Capability.EXTERNAL_SIDE_EFFECT.value,
         }
         return bool(set(tool.capabilities) & sensitive)
+
+    def _execution_start_attributes(
+        self,
+        tool: Tool | None,
+        arguments: dict[str, Any],
+    ) -> dict[str, object]:
+        if tool is None or Capability.SHELL_EXECUTE.value not in tool.capabilities:
+            return {}
+        return {
+            "execution_backend": self.execution_backend.name,
+            "workspace": self.cwd,
+            "timeout_seconds": float(arguments.get("timeout") or self.config.tools.timeout),
+        }
 
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         return self._locks.setdefault(run_id, asyncio.Lock())

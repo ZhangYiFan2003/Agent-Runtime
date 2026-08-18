@@ -99,6 +99,7 @@ async def query(
                 "name": _tool_name_by_id(tool_calls, result.tool_use_id or ""),
                 "result": result.content,
                 "is_error": result.is_error,
+                "execution": result.metadata or None,
             }
             messages.append(
                 Message(

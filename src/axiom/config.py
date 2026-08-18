@@ -51,6 +51,29 @@ class ToolsConfig:
 
 
 @dataclass(slots=True)
+class ExecutionConfig:
+    backend: str = "restricted"
+    stdout_limit_bytes: int = 20_000
+    stderr_limit_bytes: int = 20_000
+    termination_grace_seconds: float = 1.0
+    allowed_env_names: list[str] = field(
+        default_factory=lambda: [
+            "PATH",
+            "PATHEXT",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+        ]
+    )
+
+
+@dataclass(slots=True)
 class McpConfig:
     servers: list[dict[str, Any]] = field(default_factory=list)
     auto_start: bool = True
@@ -117,6 +140,7 @@ class AxiomConfig:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     render_mode: str = "inline"
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
@@ -210,6 +234,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     embedding = result.setdefault("embedding", {})
     features = result.setdefault("features", {})
     policy = result.setdefault("policy", {})
+    execution = result.setdefault("execution", {})
 
     mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_API_KEY", "api_key", str),
@@ -289,6 +314,15 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     if hitl in {"always", "auto", "never"}:
         policy["hitl_mode"] = hitl
 
+    execution_backend = env.get("AXIOM_EXECUTION_BACKEND")
+    if execution_backend in {"local", "restricted"}:
+        execution["backend"] = execution_backend
+    allowed_env = env.get("AXIOM_EXECUTION_ALLOWED_ENV")
+    if allowed_env is not None:
+        execution["allowed_env_names"] = [
+            name.strip() for name in allowed_env.split(",") if name.strip()
+        ]
+
     return result
 
 
@@ -315,6 +349,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         embedding=EmbeddingConfig(**data.get("embedding", {})),
         render_mode=data.get("render_mode", "inline"),
         tools=ToolsConfig(**data.get("tools", {})),
+        execution=ExecutionConfig(**data.get("execution", {})),
         mcp=McpConfig(**data.get("mcp", {})),
         memory=MemoryConfig(**data.get("memory", {})),
         policy=PolicyConfig(**data.get("policy", {})),

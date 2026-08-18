@@ -4,6 +4,7 @@ import asyncio
 import inspect
 from typing import Any
 
+from axiom.execution import ExecutionBackend, create_execution_backend
 from axiom.policy import (
     AuditLog,
     DefaultPermissionPolicy,
@@ -15,14 +16,20 @@ from axiom.tools.registry import ToolRegistry
 
 
 class ToolExecutor:
-    def __init__(self, registry: ToolRegistry):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        execution_backend: ExecutionBackend | None = None,
+    ):
         self.registry = registry
+        self.execution_backend = execution_backend
 
     async def execute_all(
         self,
         calls: list[dict[str, Any]],
         context: ToolContext,
     ) -> list[ToolResult]:
+        self._ensure_execution_backend(context)
         read_calls: list[tuple[dict[str, Any], Tool]] = []
         sequential_calls: list[tuple[dict[str, Any], Tool | None]] = []
 
@@ -57,7 +64,15 @@ class ToolExecutor:
         context: ToolContext,
     ) -> ToolResult:
         """Execute one call while preserving the normal validation and policy path."""
+        self._ensure_execution_backend(context)
         return await self._execute_single(call, self.registry.get(_tool_call_name(call)), context)
+
+    def _ensure_execution_backend(self, context: ToolContext) -> None:
+        if context.execution_backend is None:
+            context.execution_backend = self.execution_backend or create_execution_backend(
+                context.config,
+                context.workspace or context.cwd,
+            )
 
     async def _execute_single(
         self,

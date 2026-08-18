@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import glob as glob_module
-import os
 import re
 from pathlib import Path
 from typing import Any
 
+from axiom.execution import ExecutionRequest
 from axiom.lsp import diagnose_file
 from axiom.memory import MemoryManager
 from axiom.policy import Capability, CommandGuard, PathGuard
@@ -474,25 +474,33 @@ async def bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     command = str(payload["command"])
     CommandGuard(context.config.policy.command_blacklist).validate(command)
     timeout = float(payload.get("timeout") or context.config.tools.timeout)
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        cwd=context.cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=os.environ.copy(),
+    if context.execution_backend is None:
+        raise RuntimeError("shell execution requires an ExecutionBackend")
+    execution = await context.execution_backend.execute(
+        ExecutionRequest(
+            command=command,
+            cwd=context.cwd,
+            workspace=context.workspace or context.cwd,
+            timeout_seconds=timeout,
+            stdout_limit_bytes=context.config.execution.stdout_limit_bytes,
+            stderr_limit_bytes=context.config.execution.stderr_limit_bytes,
+            run_id=context.run_id,
+            invocation_id=context.invocation_id,
+        )
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return ToolResult(f"Command timed out after {timeout:.0f}s", is_error=True)
-    output = (stdout + stderr).decode("utf-8", errors="replace")
-    if len(output) > 20_000:
-        output = output[:20_000] + "\n... [truncated]"
+    output = execution.stdout + execution.stderr
+    if execution.stdout_truncated:
+        output += "\n... [stdout truncated]"
+    if execution.stderr_truncated:
+        output += "\n... [stderr truncated]"
+    if execution.timed_out:
+        output = f"Command timed out after {timeout:.2f}s\n{output}".rstrip()
+    if not output:
+        output = f"(exit {execution.exit_code}, no output)"
     return ToolResult(
-        output or f"(exit {proc.returncode}, no output)",
-        is_error=proc.returncode != 0,
+        output,
+        is_error=execution.timed_out or execution.exit_code != 0,
+        metadata=execution.metadata(),
     )
 
 

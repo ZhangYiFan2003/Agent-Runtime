@@ -5,6 +5,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from axiom.policy.path_guard import PathGuard, PathPolicyError
+
 
 class Capability(StrEnum):
     FILESYSTEM_READ = "filesystem.read"
@@ -128,13 +130,10 @@ class DefaultPermissionPolicy:
         )
 
     def _outside_workspace(self, paths: tuple[str, ...]) -> str | None:
+        guard = PathGuard(self.workspace)
         for value in paths:
-            candidate = Path(value).expanduser()
-            if not candidate.is_absolute():
-                candidate = self.workspace / candidate
-            resolved = candidate.resolve()
             try:
-                resolved.relative_to(self.workspace)
-            except ValueError:
+                guard.validate(value)
+            except PathPolicyError:
                 return value
         return None

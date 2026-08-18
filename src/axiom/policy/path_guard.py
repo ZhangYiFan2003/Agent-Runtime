@@ -14,7 +14,7 @@ class PathGuard:
         self.root = Path(root).resolve()
 
     def validate(self, value: str | Path) -> Path:
-        candidate = Path(value)
+        candidate = Path(value).expanduser()
         if not candidate.is_absolute():
             candidate = self.root / candidate
         resolved = candidate.resolve()

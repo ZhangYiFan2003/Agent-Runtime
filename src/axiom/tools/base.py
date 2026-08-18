@@ -9,6 +9,7 @@ from axiom.config import AxiomConfig
 from axiom.policy.permissions import PermissionRequest
 
 if TYPE_CHECKING:
+    from axiom.execution import ExecutionBackend
     from axiom.policy.permissions import PermissionDecision, PermissionPolicy
 
 DangerLevel = Literal["safe", "medium", "high"]
@@ -21,6 +22,7 @@ class ToolResult:
     is_error: bool = False
     display_summary: str | None = None
     tool_use_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -41,6 +43,7 @@ class ToolContext:
     permission_event_sink: (
         Callable[[PermissionRequest, PermissionDecision], Awaitable[None] | None] | None
     ) = None
+    execution_backend: ExecutionBackend | None = None
 
 
 @dataclass(slots=True)

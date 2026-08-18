@@ -40,6 +40,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Observability | Persists Run traces and Agent/LLM/Tool/checkpoint/interrupt spans, including tokens, TTFT, latency, retries, and Run summaries. | SQLite reload, API, CLI, and crash continuity tested |
 | Agent Evaluation | Runs JSON task datasets through the durable Runtime, applies deterministic scorers, writes JSON reports, and compares functional/performance regressions. | Runner, scorer, report, comparison, and CLI tested |
 | Permission Policy | Evaluates capability, arguments, workspace scope, and Run context before Tool execution; supports durable per-invocation approval and policy audit spans. | Policy, restart approval, denial, audit, and Evaluation compatibility tested |
+| Execution Isolation | Routes approved Shell calls through Local/Restricted backends with filtered environment, bounded output, timeout, and process-tree cleanup. This is not a complete OS sandbox. | Cross-platform backend, approval, restart, trace, and safety regression tests |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
 | REPL | Interactive prompt-toolkit entrypoint and slash commands. | Not fully verified |
 
@@ -115,6 +116,13 @@ Before a Tool handler executes, Axiom evaluates its declared capabilities and re
 `ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Approval is durably bound to one invocation and survives a
 Runtime restart. This authorization layer is not an OS sandbox. See
 [`docs/permissions.md`](docs/permissions.md) for default rules, audit events, and security limits.
+
+### Execution isolation
+
+Approved Shell calls use an `ExecutionBackend`; the default restricted local backend filters inherited
+environment variables, validates workspace cwd, bounds stdout/stderr, and cleans process trees on
+timeout or task cancellation. It does not enforce a host filesystem jail or network isolation. See
+[`docs/execution-isolation.md`](docs/execution-isolation.md) for platform behavior and non-guarantees.
 
 See [`docs/architecture-current.md`](docs/architecture-current.md) for the detailed architecture baseline.
 
@@ -209,7 +217,7 @@ uv run pytest
 Current baseline:
 
 ```text
-188 tests passing
+204 tests passing
 ```
 
 The default tests use fake LLM clients, temporary directories, temporary SQLite databases, deterministic code-search fixtures, and localhost-safe HTTP paths. They do not require API keys and do not call external model providers.
