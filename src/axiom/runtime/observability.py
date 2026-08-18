@@ -16,6 +16,7 @@ class SpanType(StrEnum):
     TOOL = "tool"
     CHECKPOINT = "checkpoint"
     INTERRUPT = "interrupt"
+    POLICY = "policy"
 
 
 class SpanStatus(StrEnum):

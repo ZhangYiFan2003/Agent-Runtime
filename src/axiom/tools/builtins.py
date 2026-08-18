@@ -9,7 +9,7 @@ from typing import Any
 
 from axiom.lsp import diagnose_file
 from axiom.memory import MemoryManager
-from axiom.policy import CommandGuard, PathGuard
+from axiom.policy import Capability, CommandGuard, PathGuard
 from axiom.rag.code_index_factory import create_code_index
 from axiom.rag.context import serialized_item_text
 from axiom.rag.embeddings import EmbeddingError
@@ -34,6 +34,8 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["path"],
             handler=read_file,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
+            path_argument_names=("path",),
         ),
         Tool(
             name="write_file",
@@ -51,6 +53,8 @@ def get_builtin_tools() -> list[Tool]:
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
+            capabilities=(Capability.FILESYSTEM_WRITE.value,),
+            path_argument_names=("path",),
         ),
         Tool(
             name="list_dir",
@@ -61,6 +65,8 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["path"],
             handler=list_dir,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
+            path_argument_names=("path",),
         ),
         Tool(
             name="glob",
@@ -74,6 +80,8 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["pattern"],
             handler=glob_files,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
+            path_argument_names=("pattern",),
         ),
         Tool(
             name="glob_files",
@@ -87,6 +95,8 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["pattern"],
             handler=glob_files,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
+            path_argument_names=("pattern",),
         ),
         Tool(
             name="grep",
@@ -102,6 +112,8 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["pattern"],
             handler=grep,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
+            path_argument_names=("path",),
         ),
         Tool(
             name="grep_code",
@@ -117,6 +129,8 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["pattern"],
             handler=grep,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
+            path_argument_names=("path",),
         ),
         Tool(
             name="bash",
@@ -134,6 +148,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            capabilities=(Capability.SHELL_EXECUTE.value,),
         ),
         Tool(
             name="execute_command",
@@ -151,6 +166,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            capabilities=(Capability.SHELL_EXECUTE.value,),
         ),
         Tool(
             name="web_search",
@@ -166,6 +182,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["query"],
             handler=web_search,
+            capabilities=(Capability.NETWORK_READ.value,),
         ),
         Tool(
             name="web_fetch",
@@ -179,6 +196,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["url"],
             handler=web_fetch,
+            capabilities=(Capability.NETWORK_READ.value,),
         ),
         Tool(
             name="save_memory",
@@ -192,12 +210,12 @@ def get_builtin_tools() -> list[Tool]:
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
+            capabilities=(Capability.EXTERNAL_SIDE_EFFECT.value,),
         ),
         Tool(
             name="load_skill",
             description=(
-                "Load a named Axiom Agent Runtime skill manual from user/project "
-                "skill directories."
+                "Load a named Axiom Agent Runtime skill manual from user/project skill directories."
             ),
             parameters=object_schema(
                 {"name": {"type": "string", "description": "Skill name"}},
@@ -205,6 +223,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["name"],
             handler=load_skill,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="search_code",
@@ -221,6 +240,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["query"],
             handler=search_code,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="get_code_context",
@@ -246,6 +266,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["query"],
             handler=get_code_context,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="find_symbol",
@@ -259,6 +280,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["name"],
             handler=find_symbol,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="find_references",
@@ -275,6 +297,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["symbol"],
             handler=find_references,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="find_callers",
@@ -291,6 +314,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["symbol"],
             handler=find_callers,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="find_callees",
@@ -307,6 +331,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["symbol"],
             handler=find_callees,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="trace_call_chain",
@@ -325,6 +350,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["symbol"],
             handler=trace_call_chain,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="find_recursive_components",
@@ -335,12 +361,12 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=[],
             handler=find_recursive_components,
+            capabilities=(Capability.FILESYSTEM_READ.value,),
         ),
         Tool(
             name="revert_turn",
             description=(
-                "Restore the workspace to a previous Axiom Agent Runtime "
-                "side-history snapshot."
+                "Restore the workspace to a previous Axiom Agent Runtime side-history snapshot."
             ),
             parameters=object_schema(
                 {"snapshot": {"type": "string", "description": "Snapshot id or 1-based index"}},
@@ -352,6 +378,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            capabilities=(Capability.FILESYSTEM_WRITE.value,),
         ),
     ]
     return tools
@@ -646,9 +673,7 @@ async def trace_call_chain(payload: dict[str, Any], context: ToolContext) -> Too
     rows = []
     for path in result.paths:
         labels = [
-            definitions[symbol_id].qualified_name
-            if symbol_id in definitions
-            else symbol_id[:12]
+            definitions[symbol_id].qualified_name if symbol_id in definitions else symbol_id[:12]
             for symbol_id in path.symbol_ids
         ]
         rows.append(" -> ".join(labels) + (" [cycle]" if path.cycle else ""))
@@ -668,9 +693,7 @@ async def find_recursive_components(
     rows = []
     for component in components[:limit]:
         names = [
-            definitions[symbol_id].qualified_name
-            if symbol_id in definitions
-            else symbol_id[:12]
+            definitions[symbol_id].qualified_name if symbol_id in definitions else symbol_id[:12]
             for symbol_id in component.symbol_ids
         ]
         rows.append(f"{component.recursion_kind}: " + " <-> ".join(names))

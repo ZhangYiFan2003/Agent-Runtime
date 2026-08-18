@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any
 
-from axiom.policy import AuditLog
+from axiom.policy import (
+    AuditLog,
+    DefaultPermissionPolicy,
+    PermissionAction,
+    PermissionDecision,
+)
 from axiom.tools.base import Tool, ToolContext, ToolDecision, ToolResult
 from axiom.tools.registry import ToolRegistry
 
@@ -77,23 +83,44 @@ class ToolExecutor:
         approver = "none"
         try:
             data = tool.validate(payload)
-            decision = await self._approval_decision(tool, data, context)
-            if decision in {"deny", "skip"}:
-                approver = "hitl"
+            permission = await self._permission_decision(
+                tool,
+                data,
+                context,
+                invocation_id=context.invocation_id or tool_call_id or f"tool:{tool.name}",
+            )
+            if permission.action == PermissionAction.DENY:
                 audit.record(
                     tool_name=tool.name,
                     input_data=data,
-                    outcome=decision,
+                    outcome="deny",
                     approver=approver,
                     cwd=context.cwd,
                 )
                 return ToolResult(
                     tool_use_id=tool_call_id,
-                    content=f'Tool "{tool.name}" was {decision}ed by approval policy.',
+                    content=(
+                        f'Tool "{tool.name}" execution denied by permission policy: '
+                        f"{permission.reason}"
+                    ),
                     is_error=True,
                 )
-            if tool.requires_approval or context.config.policy.hitl_mode == "always":
+            if permission.action == PermissionAction.REQUIRE_APPROVAL:
                 approver = "hitl"
+                approval = await self._approval_decision(tool, data, context)
+                if approval in {"deny", "skip"}:
+                    audit.record(
+                        tool_name=tool.name,
+                        input_data=data,
+                        outcome=approval,
+                        approver=approver,
+                        cwd=context.cwd,
+                    )
+                    return ToolResult(
+                        tool_use_id=tool_call_id,
+                        content=f'Tool "{tool.name}" was rejected by approval policy.',
+                        is_error=True,
+                    )
 
             result = await tool.execute(data, context)
             result.tool_use_id = tool_call_id
@@ -127,11 +154,6 @@ class ToolExecutor:
         payload: dict[str, Any],
         context: ToolContext,
     ) -> ToolDecision:
-        mode = context.config.policy.hitl_mode
-        if mode == "never":
-            return "approve"
-        if mode == "auto" and not tool.requires_approval:
-            return "approve"
         if not context.approval_callback:
             return "deny"
         result = context.approval_callback(
@@ -145,6 +167,33 @@ class ToolExecutor:
         if asyncio.iscoroutine(result):
             result = await result
         return result
+
+    async def _permission_decision(
+        self,
+        tool: Tool,
+        payload: dict[str, Any],
+        context: ToolContext,
+        *,
+        invocation_id: str,
+    ) -> PermissionDecision:
+        request = tool.permission_request(payload, context, invocation_id=invocation_id)
+        if context.preauthorized_invocation_id == invocation_id:
+            decision = PermissionDecision(
+                PermissionAction.ALLOW,
+                "invocation was authorized by the durable runtime",
+                "invocation.preauthorized",
+            )
+        else:
+            policy = context.permission_policy or DefaultPermissionPolicy(
+                request.workspace,
+                hitl_mode=context.config.policy.hitl_mode,
+            )
+            decision = await policy.evaluate(request)
+        if context.permission_event_sink is not None:
+            emitted = context.permission_event_sink(request, decision)
+            if inspect.isawaitable(emitted):
+                await emitted
+        return decision
 
 
 def _tool_call_name(call: dict[str, Any]) -> str:

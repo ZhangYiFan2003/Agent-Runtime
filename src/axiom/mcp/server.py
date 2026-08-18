@@ -9,6 +9,7 @@ from typing import Any
 from axiom.config import load_config
 from axiom.tools import ToolRegistry, get_builtin_tools
 from axiom.tools.base import ToolContext
+from axiom.tools.executor import ToolExecutor
 
 
 def _build_registry() -> ToolRegistry:
@@ -50,10 +51,13 @@ async def _handle_request(request: dict[str, Any], cwd: str) -> dict[str, Any]:
                 "error": {"message": f'Tool "{name}" not found'},
             }
         config = load_config(project_root=cwd)
-        config.policy.hitl_mode = "never"
-        result = await tool.execute(
-            params.get("arguments") or {},
-            ToolContext(cwd=cwd, config=config),
+        result = await ToolExecutor(registry).execute_one(
+            {
+                "id": f"mcp:{request_id}",
+                "name": str(name),
+                "arguments": params.get("arguments") or {},
+            },
+            ToolContext(cwd=cwd, config=config, workspace=cwd),
         )
         return {
             "jsonrpc": "2.0",

@@ -39,6 +39,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Runtime API | Provides threads, turns, resumable Runs, Memory/SQLite checkpoints, interrupt/resume/cancel, durable tool records, task CRUD, and stored SSE event replay. | Live localhost and crash recovery tested |
 | Observability | Persists Run traces and Agent/LLM/Tool/checkpoint/interrupt spans, including tokens, TTFT, latency, retries, and Run summaries. | SQLite reload, API, CLI, and crash continuity tested |
 | Agent Evaluation | Runs JSON task datasets through the durable Runtime, applies deterministic scorers, writes JSON reports, and compares functional/performance regressions. | Runner, scorer, report, comparison, and CLI tested |
+| Permission Policy | Evaluates capability, arguments, workspace scope, and Run context before Tool execution; supports durable per-invocation approval and policy audit spans. | Policy, restart approval, denial, audit, and Evaluation compatibility tested |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
 | REPL | Interactive prompt-toolkit entrypoint and slash commands. | Not fully verified |
 
@@ -49,7 +50,8 @@ flowchart TD
     A["CLI / Runtime API"] --> B["QueryEngine"]
     B --> C["Agent Runtime"]
     C --> D["LLM Client"]
-    C --> E["Tool Registry"]
+    C --> P["Permission Policy"]
+    P --> E["Tool Registry"]
     D <--> E
     E --> F["Memory"]
     E --> G["Snapshots"]
@@ -106,6 +108,13 @@ Run a fixed task dataset with `axiom eval run <dataset.json> --output result.jso
 later candidate with `axiom eval compare baseline.json result.json`. Evaluation uses real durable
 Runs and persisted traces rather than calling the model directly. See
 [`docs/evaluation.md`](docs/evaluation.md) for the dataset and scorer formats.
+
+### Permission policy
+
+Before a Tool handler executes, Axiom evaluates its declared capabilities and relevant arguments as
+`ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Approval is durably bound to one invocation and survives a
+Runtime restart. This authorization layer is not an OS sandbox. See
+[`docs/permissions.md`](docs/permissions.md) for default rules, audit events, and security limits.
 
 See [`docs/architecture-current.md`](docs/architecture-current.md) for the detailed architecture baseline.
 
@@ -200,7 +209,7 @@ uv run pytest
 Current baseline:
 
 ```text
-177 tests passing
+188 tests passing
 ```
 
 The default tests use fake LLM clients, temporary directories, temporary SQLite databases, deterministic code-search fixtures, and localhost-safe HTTP paths. They do not require API keys and do not call external model providers.

@@ -529,6 +529,9 @@ def _span_label(span: Span) -> str:
         return "Checkpoint"
     if span.span_type == SpanType.INTERRUPT:
         return f"Interrupt {span.attributes.get('kind') or ''}".rstrip()
+    if span.span_type == SpanType.POLICY:
+        decision = span.attributes.get("decision") or "unknown"
+        return f"Policy {span.attributes.get('tool_name') or span.name} {decision}"
     if span.name == "resume":
         return "Resume"
     return "Agent step" if span.name == "agent.step" else span.name

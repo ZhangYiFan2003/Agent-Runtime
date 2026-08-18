@@ -14,6 +14,7 @@ from mcp.client.streamable_http import create_mcp_http_client, streamable_http_c
 from pydantic import AnyUrl
 
 from axiom.mcp.config import McpServerSpec, load_mcp_server_specs
+from axiom.policy import Capability
 from axiom.tools.base import Tool, ToolContext, ToolResult, object_schema
 
 
@@ -116,6 +117,14 @@ class McpClientManager:
                     is_concurrency_safe=False,
                     danger_level="safe" if read_only else "medium",
                     requires_approval=not read_only,
+                    capabilities=(
+                        (Capability.NETWORK_READ.value,)
+                        if read_only
+                        else (
+                            Capability.NETWORK_WRITE.value,
+                            Capability.EXTERNAL_SIDE_EFFECT.value,
+                        )
+                    ),
                 )
             )
         return wrapped
@@ -136,6 +145,7 @@ class McpClientManager:
                 parameters=object_schema({}),
                 handler=list_handler,
                 is_read_only=True,
+                capabilities=(Capability.NETWORK_READ.value,),
             ),
             Tool(
                 name=f"mcp__{spec.name}__read_resource",
@@ -147,6 +157,7 @@ class McpClientManager:
                 required_keys=["uri"],
                 handler=read_handler,
                 is_read_only=True,
+                capabilities=(Capability.NETWORK_READ.value,),
             ),
         ]
 
@@ -173,6 +184,7 @@ class McpClientManager:
                 parameters=object_schema({}),
                 handler=list_handler,
                 is_read_only=True,
+                capabilities=(Capability.NETWORK_READ.value,),
             ),
             Tool(
                 name=f"mcp__{spec.name}__get_prompt",
@@ -187,6 +199,7 @@ class McpClientManager:
                 required_keys=["name"],
                 handler=get_handler,
                 is_read_only=True,
+                capabilities=(Capability.NETWORK_READ.value,),
             ),
         ]
 

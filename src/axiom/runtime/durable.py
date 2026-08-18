@@ -12,6 +12,13 @@ from typing import Any
 
 from axiom.config import AxiomConfig
 from axiom.llm.base import LlmClient
+from axiom.policy import (
+    Capability,
+    DefaultPermissionPolicy,
+    PermissionAction,
+    PermissionDecision,
+    PermissionPolicy,
+)
 from axiom.runtime.checkpoints import RuntimeStore
 from axiom.runtime.models import (
     Checkpoint,
@@ -74,6 +81,7 @@ class DurableAgentRuntime:
         retry_policy: RetryPolicy | None = None,
         event_sink: EventSink | None = None,
         tracer: RunTracer | None = None,
+        permission_policy: PermissionPolicy | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -85,6 +93,10 @@ class DurableAgentRuntime:
         self.retry_policy = retry_policy or RetryPolicy()
         self.event_sink = event_sink
         self.tracer = tracer
+        self.permission_policy = permission_policy or DefaultPermissionPolicy(
+            cwd,
+            hitl_mode=config.policy.hitl_mode,
+        )
         self.max_turns = max_turns
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -551,7 +563,7 @@ class DurableAgentRuntime:
         arguments_hash = _arguments_hash(payload)
         invocation_id = f"{state.run_id}:{tool_call_id}"
         tool = self.tool_registry.get(name)
-        decision = state.decisions.get(invocation_id)
+        approval_decision = state.decisions.get(invocation_id)
         existing = await self.store.load_tool_execution(invocation_id)
 
         if existing and existing.arguments_hash != arguments_hash:
@@ -567,7 +579,7 @@ class DurableAgentRuntime:
                 name,
                 parent_span_id=parent_span_id,
                 attributes={
-                    "approval_required": self._requires_approval(tool),
+                    "approval_required": self._may_require_approval(tool),
                     "reused_result": True,
                     "retry_count": max(0, existing.attempt - 1),
                 },
@@ -596,13 +608,13 @@ class DurableAgentRuntime:
 
         if existing and existing.status == ToolExecutionStatus.RUNNING:
             retry_is_safe = bool(tool and (tool.is_read_only or tool.idempotency_key_parameter))
-            if not retry_is_safe and decision != "approve":
+            if not retry_is_safe and approval_decision != "approve":
                 tool_span = await self._start_tool_span(
                     invocation_id,
                     name,
                     parent_span_id=parent_span_id,
                     attributes={
-                        "approval_required": self._requires_approval(tool),
+                        "approval_required": self._may_require_approval(tool),
                         "ambiguous_execution": True,
                         "retry_count": max(0, existing.attempt - 1),
                     },
@@ -625,18 +637,25 @@ class DurableAgentRuntime:
                     parent_span_id=parent_span_id,
                 )
 
-        if self._requires_approval(tool) and decision is None:
+        permission = await self._permission_decision(
+            state,
+            tool=tool,
+            arguments=payload,
+            invocation_id=invocation_id,
+            parent_span_id=parent_span_id,
+        )
+        if permission.action == PermissionAction.REQUIRE_APPROVAL:
             return await self._wait_for_approval(
                 state,
                 invocation_id=invocation_id,
                 tool_name=name,
                 arguments=payload,
                 kind="tool_approval",
-                reason=f'Tool "{name}" requires approval.',
+                reason=permission.reason,
                 parent_span_id=parent_span_id,
             )
 
-        if decision == "reject":
+        if permission.action == PermissionAction.DENY:
             record = existing or ToolExecutionRecord(
                 invocation_id=invocation_id,
                 run_id=state.run_id,
@@ -646,7 +665,7 @@ class DurableAgentRuntime:
                 status=ToolExecutionStatus.FAILED,
             )
             record.status = ToolExecutionStatus.FAILED
-            record.error = "rejected by approval policy"
+            record.error = f"denied by permission policy: {permission.reason}"
             record.is_error = True
             record.completed_at = _now()
             await self.store.save_tool_execution(record)
@@ -659,15 +678,24 @@ class DurableAgentRuntime:
                     "reused_result": False,
                     "retry_count": max(0, record.attempt - 1),
                     "rejected": True,
+                    "permission_action": permission.action.value,
+                    "permission_reason": permission.reason,
+                    "permission_rule": permission.matched_rule,
                 },
             )
             await self._finish_span(
                 tool_span,
                 SpanStatus.FAILED,
-                attributes={"error": record.error, "rejected": True},
+                attributes={
+                    "error": record.error,
+                    "rejected": True,
+                    "permission_action": permission.action.value,
+                    "permission_reason": permission.reason,
+                    "permission_rule": permission.matched_rule,
+                },
             )
             result = ToolResult(
-                content=f'Tool "{name}" was rejected by approval policy.',
+                content=f'Tool "{name}" execution denied by permission policy: {permission.reason}',
                 is_error=True,
                 tool_use_id=tool_call_id,
             )
@@ -695,7 +723,10 @@ class DurableAgentRuntime:
             name,
             parent_span_id=parent_span_id,
             attributes={
-                "approval_required": self._requires_approval(tool),
+                "approval_required": self._may_require_approval(tool),
+                "permission_action": permission.action.value,
+                "permission_reason": permission.reason,
+                "permission_rule": permission.matched_rule,
                 "reused_result": False,
                 "ambiguous_execution": bool(
                     existing and existing.status == ToolExecutionStatus.RUNNING
@@ -735,6 +766,12 @@ class DurableAgentRuntime:
                 config=self.config,
                 approval_callback=lambda _request: "approve",
                 invocation_id=invocation_id,
+                run_id=state.run_id,
+                thread_id=state.thread_id,
+                turn_id=state.turn_id,
+                workspace=self.cwd,
+                permission_policy=self.permission_policy,
+                preauthorized_invocation_id=invocation_id,
             )
             result = await ToolExecutor(self.tool_registry).execute_one(execution_call, context)
             if not result.is_error:
@@ -917,10 +954,88 @@ class DurableAgentRuntime:
             raise ValueError(f"run not found: {run_id}")
         return state
 
-    def _requires_approval(self, tool: Tool | None) -> bool:
+    async def _permission_decision(
+        self,
+        state: Checkpoint,
+        *,
+        tool: Tool | None,
+        arguments: dict[str, Any],
+        invocation_id: str,
+        parent_span_id: str | None,
+    ) -> PermissionDecision:
+        if tool is None:
+            return PermissionDecision(
+                PermissionAction.ALLOW,
+                "unknown tool will be rejected by the executor",
+                "tool.not_found",
+            )
+        request = tool.permission_request(
+            arguments,
+            ToolContext(
+                cwd=self.cwd,
+                config=self.config,
+                invocation_id=invocation_id,
+                run_id=state.run_id,
+                thread_id=state.thread_id,
+                turn_id=state.turn_id,
+                workspace=self.cwd,
+            ),
+            invocation_id=invocation_id,
+        )
+        policy_decision = await self.permission_policy.evaluate(request)
+        approved = state.decisions.get(invocation_id)
+        if approved == "reject":
+            decision = PermissionDecision(
+                PermissionAction.DENY,
+                "this invocation was explicitly rejected",
+                "invocation.rejected",
+            )
+        elif approved == "approve" and policy_decision.action != PermissionAction.DENY:
+            decision = PermissionDecision(
+                PermissionAction.ALLOW,
+                "this invocation was explicitly approved",
+                "invocation.approved",
+            )
+        else:
+            decision = policy_decision
+        payload = {
+            "run_id": state.run_id,
+            "thread_id": state.thread_id,
+            "turn_id": state.turn_id,
+            "invocation_id": invocation_id,
+            "tool_name": tool.name,
+            "capabilities": list(request.capabilities),
+            "decision": decision.action.value,
+            "reason": decision.reason,
+            "matched_rule": decision.matched_rule,
+        }
+        await self._emit("policy.decision", payload)
+        span_status = {
+            PermissionAction.ALLOW: SpanStatus.SUCCEEDED,
+            PermissionAction.DENY: SpanStatus.FAILED,
+            PermissionAction.REQUIRE_APPROVAL: SpanStatus.INTERRUPTED,
+        }[decision.action]
+        span = await self._start_span(
+            SpanType.POLICY,
+            f"policy.{tool.name}",
+            attributes=payload,
+            parent_span_id=parent_span_id,
+        )
+        await self._finish_span(span, span_status)
+        return decision
+
+    def _may_require_approval(self, tool: Tool | None) -> bool:
         if tool is None or self.config.policy.hitl_mode == "never":
             return False
-        return self.config.policy.hitl_mode == "always" or tool.requires_approval
+        if self.config.policy.hitl_mode == "always" or tool.requires_approval:
+            return True
+        sensitive = {
+            Capability.FILESYSTEM_WRITE.value,
+            Capability.SHELL_EXECUTE.value,
+            Capability.NETWORK_WRITE.value,
+            Capability.EXTERNAL_SIDE_EFFECT.value,
+        }
+        return bool(set(tool.capabilities) & sensitive)
 
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         return self._locks.setdefault(run_id, asyncio.Lock())
