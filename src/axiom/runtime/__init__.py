@@ -5,6 +5,14 @@ from axiom.runtime.checkpoints import (
     MemoryCheckpointStore,
     SQLiteCheckpointStore,
 )
+from axiom.runtime.control_plane import (
+    ApiError,
+    ControlOperationName,
+    ControlOperationRecord,
+    ControlOperationStatus,
+    SQLiteControlOperationStore,
+    allowed_operations,
+)
 from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
 from axiom.runtime.models import (
     Checkpoint,
@@ -41,6 +49,10 @@ __all__ = [
     "Checkpoint",
     "CheckpointConflictError",
     "CheckpointStore",
+    "ApiError",
+    "ControlOperationName",
+    "ControlOperationRecord",
+    "ControlOperationStatus",
     "DurableAgentRuntime",
     "DurableTaskManager",
     "MemoryCheckpointStore",
@@ -60,6 +72,7 @@ __all__ = [
     "WorkerAssignment",
     "child_run_id",
     "SQLiteCheckpointStore",
+    "SQLiteControlOperationStore",
     "SQLiteObservabilityStore",
     "Span",
     "SpanStatus",
@@ -69,4 +82,5 @@ __all__ = [
     "ToolExecutionStatus",
     "Trace",
     "TraceBundle",
+    "allowed_operations",
 ]

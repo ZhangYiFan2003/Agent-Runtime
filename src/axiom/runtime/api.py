@@ -25,6 +25,15 @@ from axiom.runtime.checkpoints import (
     RuntimeStore,
     SQLiteCheckpointStore,
 )
+from axiom.runtime.control_plane import (
+    ApiError,
+    ControlOperationName,
+    ControlOperationStatus,
+    SQLiteControlOperationStore,
+    allowed_operations,
+    child_view,
+    run_view,
+)
 from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
 from axiom.runtime.models import Checkpoint, Interrupt, RunError, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType
@@ -45,6 +54,11 @@ class RuntimeEvent:
     type: str
     payload: dict[str, Any]
     created_at: str
+    turn_id: str | None = None
+    run_id: str | None = None
+    parent_run_id: str | None = None
+    parent_step_id: str | None = None
+    assignment_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -84,17 +98,29 @@ class ThreadEventRepository:
             row = conn.execute("select 1 from threads where id = ?", (thread_id,)).fetchone()
         return row is not None
 
+    def list_threads(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute("select id from threads order by created_at, id").fetchall()
+        return [str(row[0]) for row in rows]
+
     def append_event(self, thread_id: str, event_type: str, payload: dict[str, Any]) -> int:
         if not self.thread_exists(thread_id):
             raise ValueError("thread not found")
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                insert into events(thread_id, type, payload, created_at)
-                values (?, ?, ?, ?)
+                insert into events(
+                    thread_id, turn_id, run_id, parent_run_id, parent_step_id,
+                    assignment_id, type, payload, created_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     thread_id,
+                    _optional_text(payload.get("turn_id")),
+                    _optional_text(payload.get("run_id")),
+                    _optional_text(payload.get("parent_run_id")),
+                    _optional_text(payload.get("parent_step_id")),
+                    _optional_text(payload.get("assignment_id")),
                     event_type,
                     json.dumps(_jsonable(payload), ensure_ascii=False),
                     _now(),
@@ -102,7 +128,13 @@ class ThreadEventRepository:
             )
             return int(cursor.lastrowid)
 
-    def list_events(self, thread_id: str, after_id: int | None = None) -> list[RuntimeEvent]:
+    def list_events(
+        self,
+        thread_id: str,
+        after_id: int | None = None,
+        *,
+        run_id: str | None = None,
+    ) -> list[RuntimeEvent]:
         if not self.thread_exists(thread_id):
             return []
         clause = "thread_id = ?"
@@ -110,10 +142,14 @@ class ThreadEventRepository:
         if after_id is not None:
             clause += " and id > ?"
             params.append(after_id)
+        if run_id is not None:
+            clause += " and run_id = ?"
+            params.append(run_id)
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                select id, thread_id, type, payload, created_at
+                select id, thread_id, type, payload, created_at,
+                       turn_id, run_id, parent_run_id, parent_step_id, assignment_id
                 from events
                 where {clause}
                 order by id
@@ -127,6 +163,11 @@ class ThreadEventRepository:
                 type=str(row[2]),
                 payload=_decode_payload(str(row[3])),
                 created_at=str(row[4]),
+                turn_id=_optional_text(row[5]),
+                run_id=_optional_text(row[6]),
+                parent_run_id=_optional_text(row[7]),
+                parent_step_id=_optional_text(row[8]),
+                assignment_id=_optional_text(row[9]),
             )
             for row in rows
         ]
@@ -160,7 +201,18 @@ class ThreadEventRepository:
                 )
                 """
             )
+            for name in (
+                "turn_id",
+                "run_id",
+                "parent_run_id",
+                "parent_step_id",
+                "assignment_id",
+            ):
+                _ensure_sqlite_column(conn, "events", name, "text")
             conn.execute("create index if not exists idx_events_thread_id on events(thread_id, id)")
+            conn.execute(
+                "create index if not exists idx_events_run_id on events(thread_id, run_id, id)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -198,6 +250,7 @@ class RuntimeApiServer:
         )
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.repository = ThreadEventRepository(self.data_dir / "runtime.db")
+        self.control_operations = SQLiteControlOperationStore(self.data_dir / "runtime.db")
         self.checkpoint_store = checkpoint_store or SQLiteCheckpointStore(
             self.data_dir / "runtime.db"
         )
@@ -234,6 +287,7 @@ class RuntimeApiServer:
         if self._httpd is not None:
             return
         self._stop.clear()
+        asyncio.run(self._recover_waiting_parents())
         self._start_workers()
         self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self._handler_class())
         self._server_thread = threading.Thread(
@@ -246,6 +300,7 @@ class RuntimeApiServer:
 
     def serve_forever(self) -> None:
         self._stop.clear()
+        asyncio.run(self._recover_waiting_parents())
         self._start_workers()
         self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self._handler_class())
         self.port = self.address[1]
@@ -363,10 +418,19 @@ class RuntimeApiServer:
             elif method == "GET" and path.startswith("/v1/threads/") and path.endswith("/events"):
                 thread_id = path.split("/")[3]
                 after_id = _first_int(query.get("after_id"))
+                run_filter = _first_text(query.get("run_id"))
                 if not self.repository.thread_exists(thread_id):
                     _send_json(request, 404, {"error": "thread not found"})
                     return
-                self._send_events(request, thread_id, after_id=after_id)
+                self._send_events(
+                    request,
+                    thread_id,
+                    after_id=after_id,
+                    run_id=run_filter,
+                )
+            elif method == "GET" and path == "/v1/runs":
+                runs = asyncio.run(self._list_run_views())
+                _send_json(request, 200, {"runs": runs})
             elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/trace"):
                 run_id = path.split("/")[3]
                 bundle = asyncio.run(self.observability.trace(run_id))
@@ -381,42 +445,65 @@ class RuntimeApiServer:
                     _send_json(request, 404, {"error": "metrics not found"})
                     return
                 _send_json(request, 200, metrics.to_dict())
+            elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/children"):
+                run_id = path.split("/")[3]
+                state = asyncio.run(self.checkpoint_store.load(run_id))
+                if state is None:
+                    raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
+                children = asyncio.run(self._children(state))
+                metadata = self._assignment_metadata(state)
+                _send_json(
+                    request,
+                    200,
+                    {
+                        "parent_run_id": run_id,
+                        "children": [
+                            child_view(child, assignment=metadata.get(child.run_id))
+                            for child in children
+                        ],
+                    },
+                )
+            elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/interrupts"):
+                run_id = path.split("/")[3]
+                state = asyncio.run(self.checkpoint_store.load(run_id))
+                if state is None:
+                    raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
+                view = asyncio.run(self._run_view(state))
+                _send_json(
+                    request,
+                    200,
+                    {"run_id": run_id, "pending_interrupts": view["pending_interrupts"]},
+                )
             elif method == "GET" and path.startswith("/v1/runs/"):
                 run_id = path.split("/")[3]
                 state = asyncio.run(self.checkpoint_store.load(run_id))
                 if state is None:
-                    _send_json(request, 404, {"error": "run not found"})
-                    return
-                _send_json(request, 200, state.public_dict())
+                    raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
+                _send_json(request, 200, asyncio.run(self._run_view(state)))
             elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/resume"):
                 run_id = path.split("/")[3]
-                lock = self._run_lock(run_id)
-                if not lock.acquire(blocking=False):
-                    _send_json(request, 409, {"error": "run already advancing"})
-                    return
-                try:
-                    decision = body.get("decision")
-                    if decision is None and "approved" in body:
-                        decision = "approve" if body.get("approved") else "reject"
-                    result = asyncio.run(
-                        self._resume_run(
-                            run_id,
-                            decision=str(decision) if decision is not None else None,
-                        )
-                    )
-                    response_status = (
-                        202
-                        if result.get("status")
-                        in {RunStatus.WAITING_APPROVAL.value, RunStatus.WAITING_CHILD.value}
-                        else 200
-                    )
-                    _send_json(request, response_status, result)
-                finally:
-                    lock.release()
+                result = self._execute_control_operation(
+                    request,
+                    run_id,
+                    body,
+                    requested_operation=None,
+                )
+                response_status = (
+                    202
+                    if result.get("status")
+                    in {RunStatus.WAITING_APPROVAL.value, RunStatus.WAITING_CHILD.value}
+                    else 200
+                )
+                _send_json(request, response_status, result)
             elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/cancel"):
                 run_id = path.split("/")[3]
-                state = asyncio.run(self._set_run_status(run_id, RunStatus.CANCELLED))
-                _send_json(request, 200, state.public_dict())
+                result = self._execute_control_operation(
+                    request,
+                    run_id,
+                    body,
+                    requested_operation=ControlOperationName.CANCEL,
+                )
+                _send_json(request, 200, result)
             elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/interrupt"):
                 run_id = path.split("/")[3]
                 reason = str(body.get("reason") or "manual interrupt")
@@ -442,8 +529,14 @@ class RuntimeApiServer:
                 _send_json(request, 200, {"canceled": self.task_manager.cancel(task_id)})
             else:
                 _send_json(request, 404, {"error": "not found"})
-        except (CheckpointConflictError, ValueError) as exc:
-            _send_json(request, 409, {"error": _safe_error(exc)})
+        except ApiError as exc:
+            _send_json(request, exc.http_status, exc.to_dict())
+        except CheckpointConflictError as exc:
+            error = ApiError("checkpoint_conflict", _safe_error(exc), 409)
+            _send_json(request, error.http_status, error.to_dict())
+        except ValueError as exc:
+            error = ApiError("invalid_request", _safe_error(exc), 400)
+            _send_json(request, error.http_status, error.to_dict())
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": _safe_error(exc)})
 
@@ -612,7 +705,7 @@ class RuntimeApiServer:
     async def _resume_run(self, run_id: str, *, decision: str | None) -> dict[str, Any]:
         state = await self.checkpoint_store.load(run_id)
         if state is None:
-            raise ValueError("run not found")
+            raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
         context = RuntimeTurnContext(
             thread_id=state.thread_id,
             message=state.input,
@@ -645,6 +738,259 @@ class RuntimeApiServer:
                 result["child_status"] = state.status.value
                 return result
         return await self._finish_durable_turn(state)
+
+    def _execute_control_operation(
+        self,
+        request: BaseHTTPRequestHandler,
+        run_id: str,
+        body: dict[str, Any],
+        *,
+        requested_operation: ControlOperationName | None,
+    ) -> dict[str, Any]:
+        idempotency_key = _idempotency_key(request, body)
+        existing = (
+            self.control_operations.lookup(run_id, idempotency_key) if idempotency_key else None
+        )
+        operation = requested_operation or _resume_operation(body)
+        normalized = _control_request(operation, body, existing=existing)
+        if existing is not None:
+            record, _created = self.control_operations.begin(
+                run_id=run_id,
+                idempotency_key=idempotency_key,
+                operation=operation,
+                request=normalized,
+            )
+            return self._replay_operation(record)
+
+        lock = self._run_lock(run_id)
+        if not lock.acquire(blocking=False):
+            raise ApiError(
+                "operation_in_progress",
+                "another control operation is advancing this run",
+                409,
+                run_id=run_id,
+                operation=operation.value,
+            )
+        record = None
+        state = None
+        try:
+            state = asyncio.run(self.checkpoint_store.load(run_id))
+            if state is None:
+                raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
+            normalized = self._normalize_control_request(state, operation, normalized)
+            key = idempotency_key or f"implicit_{uuid4().hex}"
+            record, _created = self.control_operations.begin(
+                run_id=run_id,
+                idempotency_key=key,
+                operation=operation,
+                request=normalized,
+            )
+            self._validate_control_operation(state, operation, normalized)
+            if operation == ControlOperationName.CANCEL:
+                result = asyncio.run(self._cancel_run(state))
+            else:
+                decision = (
+                    operation.value
+                    if operation in {ControlOperationName.APPROVE, ControlOperationName.REJECT}
+                    else None
+                )
+                result = asyncio.run(self._resume_run(run_id, decision=decision))
+            self.control_operations.complete(record.operation_id, result)
+            return result
+        except ApiError as exc:
+            if record is not None:
+                self.control_operations.fail(record.operation_id, exc)
+            raise
+        except CheckpointConflictError as exc:
+            error = ApiError(
+                "checkpoint_conflict",
+                _safe_error(exc),
+                409,
+                run_id=run_id,
+                operation=operation.value,
+            )
+            if record is not None:
+                self.control_operations.fail(record.operation_id, error)
+            raise error from exc
+        except ValueError as exc:
+            error = ApiError(
+                "invalid_run_transition",
+                _safe_error(exc),
+                409,
+                run_id=run_id,
+                status=state.status.value if state is not None else None,
+                operation=operation.value,
+            )
+            if record is not None:
+                self.control_operations.fail(record.operation_id, error)
+            raise error from exc
+        finally:
+            lock.release()
+
+    def _replay_operation(self, record) -> dict[str, Any]:
+        if record.status == ControlOperationStatus.COMPLETED and record.result is not None:
+            return record.result
+        if record.status == ControlOperationStatus.FAILED and record.error is not None:
+            raise ApiError.from_dict(record.error)
+        raise ApiError(
+            "operation_in_progress",
+            "control operation has not completed",
+            409,
+            run_id=record.run_id,
+            operation=record.operation.value,
+        )
+
+    def _normalize_control_request(
+        self,
+        state: Checkpoint,
+        operation: ControlOperationName,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        if operation not in {ControlOperationName.APPROVE, ControlOperationName.REJECT}:
+            return request
+        invocation_id = _optional_text(request.get("invocation_id"))
+        if invocation_id is None and state.interrupt is not None:
+            invocation_id = state.interrupt.invocation_id
+        return {"decision": operation.value, "invocation_id": invocation_id}
+
+    def _validate_control_operation(
+        self,
+        state: Checkpoint,
+        operation: ControlOperationName,
+        request: dict[str, Any],
+    ) -> None:
+        invocation_id = _optional_text(request.get("invocation_id"))
+        if operation in {ControlOperationName.APPROVE, ControlOperationName.REJECT}:
+            if state.status != RunStatus.WAITING_APPROVAL or state.interrupt is None:
+                if invocation_id and self.control_operations.find_interrupt_resolution(
+                    state.run_id, invocation_id
+                ):
+                    raise ApiError(
+                        "interrupt_already_resolved",
+                        "interrupt was already resolved",
+                        409,
+                        run_id=state.run_id,
+                        status=state.status.value,
+                        operation=operation.value,
+                    )
+            elif not state.interrupt.invocation_id:
+                raise ApiError(
+                    "interrupt_not_found",
+                    "run has no approvable invocation",
+                    404,
+                    run_id=state.run_id,
+                    status=state.status.value,
+                    operation=operation.value,
+                )
+            elif invocation_id != state.interrupt.invocation_id:
+                raise ApiError(
+                    "interrupt_not_found",
+                    "invocation does not match the pending interrupt",
+                    404,
+                    run_id=state.run_id,
+                    status=state.status.value,
+                    operation=operation.value,
+                )
+
+        if operation not in allowed_operations(state.status):
+            raise ApiError(
+                "invalid_run_transition",
+                f"{operation.value} is not allowed while run is {state.status.value}",
+                409,
+                run_id=state.run_id,
+                status=state.status.value,
+                operation=operation.value,
+            )
+        if state.status == RunStatus.WAITING_CHILD and operation == ControlOperationName.RESUME:
+            children = asyncio.run(self._children(state))
+            active = [child.run_id for child in children if not child.finished]
+            if active:
+                raise ApiError(
+                    "invalid_run_transition",
+                    "parent cannot resume while child runs are non-terminal",
+                    409,
+                    run_id=state.run_id,
+                    status=state.status.value,
+                    operation=operation.value,
+                    details={"active_child_run_ids": active},
+                )
+
+    async def _cancel_run(self, state: Checkpoint) -> dict[str, Any]:
+        if state.status == RunStatus.CANCELLED:
+            return await self._run_view(state)
+        context = RuntimeTurnContext(
+            thread_id=state.thread_id,
+            message=state.input,
+            history=list(state.messages),
+            cwd=self.cwd,
+            config=self.config,
+            turn_id=state.turn_id,
+            run_id=state.run_id,
+        )
+        engine = await self._engine(context)
+        if not isinstance(engine, QueryEngine):
+            raise ApiError(
+                "invalid_request",
+                "custom engine does not support durable cancellation",
+                422,
+                run_id=state.run_id,
+                operation=ControlOperationName.CANCEL.value,
+            )
+        runtime = self._durable_runtime(
+            engine,
+            state.thread_id,
+            execution_strategy=state.execution_strategy,
+        )
+        cancelled = await runtime.cancel(state.run_id)
+        return await self._run_view(cancelled)
+
+    async def _children(self, state: Checkpoint) -> list[Checkpoint]:
+        runs = await self.checkpoint_store.list(state.thread_id)
+        return sorted(
+            (item for item in runs if item.parent_run_id == state.run_id),
+            key=lambda item: (item.created_at, item.run_id),
+        )
+
+    async def _run_view(self, state: Checkpoint) -> dict[str, Any]:
+        children = await self._children(state)
+        parent = (
+            await self.checkpoint_store.load(state.parent_run_id) if state.parent_run_id else state
+        )
+        metadata = self._assignment_metadata(parent) if parent is not None else {}
+        return run_view(
+            state,
+            children=children,
+            assignment_metadata=metadata,
+        )
+
+    async def _list_run_views(self) -> list[dict[str, Any]]:
+        states = await self._all_runs()
+        return [await self._run_view(state) for state in states]
+
+    async def _all_runs(self) -> list[Checkpoint]:
+        by_id: dict[str, Checkpoint] = {}
+        for thread_id in self.repository.list_threads():
+            for state in await self.checkpoint_store.list(thread_id):
+                by_id[state.run_id] = state
+        return sorted(by_id.values(), key=lambda item: (item.created_at, item.run_id))
+
+    def _assignment_metadata(self, parent: Checkpoint) -> dict[str, dict[str, Any]]:
+        if parent.execution_strategy != "multi_agent":
+            return {}
+        from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
+
+        orchestration = MultiAgentExecutionStrategy.load_state(parent)
+        if orchestration is None:
+            return {}
+        return {
+            assignment.child_run_id: {
+                "assignment_id": assignment.assignment_id,
+                "worker_role": assignment.worker_role,
+                "attempt": assignment.attempt,
+            }
+            for assignment in orchestration.assignments
+            if assignment.child_run_id
+        }
 
     async def _finish_durable_turn(self, state: Checkpoint) -> dict[str, Any]:
         if state.parent_run_id:
@@ -754,13 +1100,26 @@ class RuntimeApiServer:
         )
 
     def _runtime_event_sink(self, thread_id: str):
-        def emit(event_type: str, payload: dict[str, Any]) -> None:
-            self.repository.append_event(thread_id, event_type, payload)
+        async def emit(event_type: str, payload: dict[str, Any]) -> None:
+            enriched = await self._enrich_runtime_event(thread_id, payload)
+            self.repository.append_event(thread_id, event_type, enriched)
+            hierarchy = {
+                key: enriched.get(key)
+                for key in (
+                    "thread_id",
+                    "turn_id",
+                    "run_id",
+                    "parent_run_id",
+                    "parent_step_id",
+                    "assignment_id",
+                )
+            }
             if event_type == "tool.started":
                 self.repository.append_event(
                     thread_id,
                     "tool_call",
                     {
+                        **hierarchy,
                         "name": payload.get("tool_name"),
                         "input": payload.get("arguments", {}),
                         "tool_call_id": payload.get("tool_call_id"),
@@ -772,6 +1131,7 @@ class RuntimeApiServer:
                     thread_id,
                     "tool_result",
                     {
+                        **hierarchy,
                         "name": payload.get("tool_name"),
                         "result": payload.get("result", ""),
                         "is_error": bool(payload.get("is_error")),
@@ -790,6 +1150,30 @@ class RuntimeApiServer:
 
         return emit
 
+    async def _enrich_runtime_event(
+        self,
+        thread_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        enriched = dict(payload)
+        enriched.setdefault("thread_id", thread_id)
+        run_id = _optional_text(enriched.get("run_id"))
+        if run_id is None:
+            return enriched
+        state = await self.checkpoint_store.load(run_id)
+        if state is None:
+            return enriched
+        enriched.setdefault("turn_id", state.turn_id)
+        enriched.setdefault("parent_run_id", state.parent_run_id)
+        enriched.setdefault("parent_step_id", state.parent_step_id)
+        if not enriched.get("assignment_id") and state.parent_run_id:
+            parent = await self.checkpoint_store.load(state.parent_run_id)
+            if parent is not None:
+                assignment = self._assignment_metadata(parent).get(state.run_id)
+                if assignment:
+                    enriched["assignment_id"] = assignment.get("assignment_id")
+        return enriched
+
     async def _set_run_status(
         self,
         run_id: str,
@@ -799,13 +1183,27 @@ class RuntimeApiServer:
     ) -> Checkpoint:
         state = await self.checkpoint_store.load(run_id)
         if state is None:
-            raise ValueError("run not found")
+            raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
         if state.finished:
             if state.status == status:
                 return state
-            raise ValueError(f"run in {state.status.value} cannot change status")
+            raise ApiError(
+                "invalid_run_transition",
+                f"run in {state.status.value} cannot change status",
+                409,
+                run_id=run_id,
+                status=state.status.value,
+                operation="interrupt",
+            )
         if status == RunStatus.INTERRUPTED and state.status != RunStatus.RUNNING:
-            raise ValueError(f"run in {state.status.value} cannot be manually interrupted")
+            raise ApiError(
+                "invalid_run_transition",
+                f"run in {state.status.value} cannot be manually interrupted",
+                409,
+                run_id=run_id,
+                status=state.status.value,
+                operation="interrupt",
+            )
         tracer = RunTracer(self.observability_store)
         await tracer.start_run(state)
         state.status = status
@@ -846,6 +1244,52 @@ class RuntimeApiServer:
             {"run_id": state.run_id, "status": state.status.value, "reason": reason},
         )
         return state
+
+    async def _recover_waiting_parents(self) -> None:
+        for state in await self._all_runs():
+            if state.status != RunStatus.WAITING_CHILD:
+                continue
+            children = await self._children(state)
+            if not children or any(not child.finished for child in children):
+                continue
+            lock = self._run_lock(state.run_id)
+            if not lock.acquire(blocking=False):
+                continue
+            try:
+                self.repository.append_event(
+                    state.thread_id,
+                    "run.recovery.started",
+                    {
+                        "thread_id": state.thread_id,
+                        "turn_id": state.turn_id,
+                        "run_id": state.run_id,
+                        "run_status": state.status.value,
+                    },
+                )
+                result = await self._resume_run(state.run_id, decision=None)
+                self.repository.append_event(
+                    state.thread_id,
+                    "run.recovery.completed",
+                    {
+                        "thread_id": state.thread_id,
+                        "turn_id": state.turn_id,
+                        "run_id": state.run_id,
+                        "result_status": result.get("status") or RunStatus.COMPLETED.value,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - startup recovery is best effort
+                self.repository.append_event(
+                    state.thread_id,
+                    "run.recovery.failed",
+                    {
+                        "thread_id": state.thread_id,
+                        "turn_id": state.turn_id,
+                        "run_id": state.run_id,
+                        "error": _safe_error(exc),
+                    },
+                )
+            finally:
+                lock.release()
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -988,11 +1432,12 @@ class RuntimeApiServer:
         thread_id: str,
         *,
         after_id: int | None = None,
+        run_id: str | None = None,
     ) -> None:
-        rows = self.repository.list_events(thread_id, after_id=after_id)
+        rows = self.repository.list_events(thread_id, after_id=after_id, run_id=run_id)
         body = "".join(
             f"id: {event.id}\nevent: {event.type}\ndata: "
-            f"{json.dumps(event.payload, ensure_ascii=False)}\n\n"
+            f"{json.dumps(_event_envelope(event), ensure_ascii=False)}\n\n"
             for event in rows
         ).encode("utf-8")
         request.send_response(200)
@@ -1040,6 +1485,84 @@ def _send_json(request: BaseHTTPRequestHandler, status: int, payload: dict[str, 
     request.wfile.write(body)
 
 
+def _idempotency_key(
+    request: BaseHTTPRequestHandler,
+    body: dict[str, Any],
+) -> str | None:
+    value = body.get("request_id")
+    if value is None:
+        value = request.headers.get("Idempotency-Key") or request.headers.get("idempotency-key")
+    if value is None:
+        return None
+    key = str(value).strip()
+    if not key or len(key) > 200:
+        raise ApiError(
+            "invalid_request",
+            "idempotency key must contain 1 to 200 characters",
+            400,
+        )
+    return key
+
+
+def _resume_operation(body: dict[str, Any]) -> ControlOperationName:
+    decision = body.get("decision")
+    if decision is None and "approved" in body:
+        decision = "approve" if body.get("approved") else "reject"
+    if decision is None:
+        return ControlOperationName.RESUME
+    normalized = str(decision).strip().lower()
+    if normalized in {"approve", "approved", "allow"}:
+        return ControlOperationName.APPROVE
+    if normalized in {"reject", "rejected", "deny"}:
+        return ControlOperationName.REJECT
+    raise ApiError(
+        "invalid_request",
+        "decision must be approve or reject",
+        400,
+        operation="resume",
+    )
+
+
+def _control_request(
+    operation: ControlOperationName,
+    body: dict[str, Any],
+    *,
+    existing=None,
+) -> dict[str, Any]:
+    if operation in {ControlOperationName.APPROVE, ControlOperationName.REJECT}:
+        invocation_id = _optional_text(body.get("invocation_id"))
+        if invocation_id is None and existing is not None:
+            invocation_id = _optional_text(existing.request.get("invocation_id"))
+        return {"decision": operation.value, "invocation_id": invocation_id}
+    return {}
+
+
+def _event_envelope(event: RuntimeEvent) -> dict[str, Any]:
+    return {
+        **event.payload,
+        "event_id": event.id,
+        "thread_id": event.thread_id,
+        "turn_id": event.turn_id,
+        "run_id": event.run_id,
+        "parent_run_id": event.parent_run_id,
+        "parent_step_id": event.parent_step_id,
+        "assignment_id": event.assignment_id,
+        "event_type": event.type,
+        "timestamp": event.created_at,
+    }
+
+
+def _ensure_sqlite_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = {str(row[1]) for row in conn.execute(f"pragma table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"alter table {table} add column {column} {definition}")
+
+
 def _jsonable(event: dict[str, Any]) -> dict[str, Any]:
     return {str(key): _json_value(value) for key, value in event.items()}
 
@@ -1070,6 +1593,17 @@ def _first_int(values: list[str] | None) -> int | None:
     except ValueError:
         return None
     return value if value >= 0 else None
+
+
+def _first_text(values: list[str] | None) -> str | None:
+    if not values:
+        return None
+    value = values[0].strip()
+    return value or None
+
+
+def _optional_text(value: object) -> str | None:
+    return str(value) if value is not None else None
 
 
 def _safe_error(exc: Exception) -> str:

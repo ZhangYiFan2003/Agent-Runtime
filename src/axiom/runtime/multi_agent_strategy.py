@@ -203,13 +203,14 @@ class MultiAgentExecutionStrategy:
         orchestration = self.load_state(state)
         if orchestration is None:
             return
-        current = orchestration.assignment(orchestration.current_assignment_id)
-        if current and current.child_run_id:
-            child_state = await runtime.store.load(current.child_run_id)
+        for assignment in orchestration.assignments:
+            if not assignment.child_run_id:
+                continue
+            child_state = await runtime.store.load(assignment.child_run_id)
             if child_state is not None and not child_state.finished:
-                child_runtime = self._child_runtime(runtime, current)
-                await child_runtime.cancel(current.child_run_id)
-                current.status = AssignmentStatus.CANCELLED
+                child_runtime = self._child_runtime(runtime, assignment)
+                await child_runtime.cancel(assignment.child_run_id)
+                assignment.status = AssignmentStatus.CANCELLED
         orchestration.status = MultiAgentStatus.CANCELLED
         self.store_state(state, orchestration)
 

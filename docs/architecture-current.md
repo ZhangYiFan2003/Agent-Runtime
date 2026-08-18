@@ -204,14 +204,14 @@ flowchart TD
 - `src/axiom/policy/audit_log.py`
   - Writes JSONL audit entries with sensitive input fields redacted.
 - `src/axiom/runtime/api.py`
-  - Provides a local Runtime API for threads, turns, events, and background
-    tasks.
+  - Provides a local Runtime control-plane API for threads, turns, hierarchical
+    Runs, interrupts, idempotent state transitions, events, and background tasks.
   - Supports explicit `data_dir` injection, ephemeral localhost port binding,
     start/shutdown/context-manager lifecycle, `/health`, fake engine injection
     for no-network tests, and a thread/event repository boundary.
-  - Thread events are persisted with monotonic IDs and can be replayed through
-    stored SSE with `after_id` cursors. This is replay, not an unlimited live
-    event stream.
+  - Thread events are persisted with monotonic IDs and explicit Run/parent/assignment
+    lineage, and can be replayed through stored SSE with `after_id` cursors and an
+    optional Run filter. This is replay, not an unlimited live event stream.
   - Restores prior user/assistant messages from persisted thread events before
     each turn and writes bounded typed memory records for conversation messages
     and tool-result digests.
@@ -227,6 +227,9 @@ flowchart TD
   - Defines the async-compatible checkpoint/tool execution store protocols and
     Memory/SQLite implementations. SQLite appends checkpoint sequences and uses
     optimistic sequence checks to reject stale workers.
+- `src/axiom/runtime/control_plane.py`
+  - Defines the stable public Run projection, allowed control operations, structured
+    API errors, child/interrupt summaries, and restart-safe SQLite idempotency records.
 - `src/axiom/runtime/durable.py`
   - Advances the default ReAct loop across LLM and per-tool durable boundaries,
     persists approval interrupts, resumes after restart, applies bounded retry,

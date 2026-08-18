@@ -94,6 +94,10 @@ must enforce it.
 See [`docs/durable-execution.md`](docs/durable-execution.md) for state transitions, API endpoints,
 crash-window behavior, serialization boundaries, and current limitations.
 
+The `/v1` control plane exposes stable Run representations, parent/child discovery, aggregated
+pending interrupts, restart-safe idempotent resume/approval/cancel operations, structured conflict
+errors, and hierarchical SSE replay. See [`docs/runtime-api.md`](docs/runtime-api.md).
+
 ### Run observability
 
 The durable Runtime writes a single trace per Run with hierarchical Agent, LLM, Tool, checkpoint,

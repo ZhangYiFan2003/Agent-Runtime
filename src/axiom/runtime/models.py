@@ -35,6 +35,7 @@ class Interrupt:
     invocation_id: str | None = None
     tool_name: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +44,7 @@ class Interrupt:
             "invocation_id": self.invocation_id,
             "tool_name": self.tool_name,
             "arguments": _json_value(self.arguments),
+            "created_at": self.created_at,
         }
 
     @classmethod
@@ -53,6 +55,7 @@ class Interrupt:
             invocation_id=_optional_str(data.get("invocation_id")),
             tool_name=_optional_str(data.get("tool_name")),
             arguments=_dict(data.get("arguments")),
+            created_at=str(data.get("created_at") or datetime.now(UTC).isoformat()),
         )
 
 
