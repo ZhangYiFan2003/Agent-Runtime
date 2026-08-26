@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from axiom.plan import ExecutionPlan, Planner, PlannerResult, PlanStatus, Task, TaskStatus
+from axiom.runtime.checkpoints import CheckpointConflictError
 from axiom.runtime.models import Checkpoint, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType
+from axiom.runtime.observability_store import RunTracer
 from axiom.types import Message
 
 if TYPE_CHECKING:
@@ -15,12 +20,108 @@ if TYPE_CHECKING:
     from axiom.runtime.durable import DurableAgentRuntime
 
 _PLAN_KEY = "plan"
-_CURRENT_TASK_KEY = "current_task_id"
-_TASK_OUTPUT_KEY = "current_task_output"
-_TASK_ERROR_KEY = "current_task_error"
-_TASK_COMPLETE_KEY = "current_task_complete"
-_TASK_TURN_START_KEY = "current_task_turn_start"
-_TASK_MESSAGE_START_KEY = "current_task_message_start"
+_LEGACY_TASK_KEYS = (
+    "current_task_id",
+    "current_task_output",
+    "current_task_error",
+    "current_task_complete",
+    "current_task_turn_start",
+    "current_task_message_start",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanSchedulerSnapshot:
+    ready_task_ids: tuple[str, ...]
+    active_task_ids: tuple[str, ...]
+    waiting_task_ids: tuple[str, ...]
+    terminal_task_ids: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class LocalPlanTaskScheduler:
+    max_parallel_tasks: int
+
+    def snapshot(
+        self,
+        plan: ExecutionPlan,
+        child_states: dict[str, Checkpoint | None],
+    ) -> PlanSchedulerSnapshot:
+        statuses = {task.id: task.status for task in plan.all_tasks()}
+        ready = tuple(
+            task.id
+            for task in _tasks_in_plan_order(plan)
+            if task.status == TaskStatus.PENDING
+            and all(statuses.get(dep) == TaskStatus.COMPLETED for dep in task.dependencies)
+        )
+        active: list[str] = []
+        waiting: list[str] = []
+        terminal: list[str] = []
+        for task in _tasks_in_plan_order(plan):
+            child = child_states.get(task.id)
+            if task.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.SKIPPED,
+                TaskStatus.CANCELLED,
+            }:
+                terminal.append(task.id)
+            elif child is not None and child.status in {
+                RunStatus.WAITING_APPROVAL,
+                RunStatus.INTERRUPTED,
+            }:
+                waiting.append(task.id)
+            elif task.status == TaskStatus.RUNNING:
+                active.append(task.id)
+        return PlanSchedulerSnapshot(tuple(ready), tuple(active), tuple(waiting), tuple(terminal))
+
+    async def execute(
+        self,
+        tasks: list[Task],
+        runner: Callable[[Task], Awaitable[Checkpoint]],
+        observer: Callable[[Task, Checkpoint], Awaitable[bool]] | None = None,
+    ) -> dict[str, Checkpoint]:
+        queue = list(tasks)
+        running: dict[asyncio.Task[Checkpoint], Task] = {}
+        results: dict[str, Checkpoint] = {}
+        limit = max(1, int(self.max_parallel_tasks))
+        stop_launching = False
+        try:
+            while running or (queue and not stop_launching):
+                while queue and not stop_launching and len(running) < limit:
+                    task = queue.pop(0)
+                    execution = asyncio.create_task(
+                        runner(task),
+                        name=f"axiom-plan-task-{task.id}",
+                    )
+                    running[execution] = task
+                if not running:
+                    break
+                done, _pending = await asyncio.wait(
+                    running,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                completed: list[tuple[Task, Checkpoint]] = []
+                for execution in done:
+                    task = running.pop(execution)
+                    child = execution.result()
+                    results[task.id] = child
+                    completed.append((task, child))
+                    if child.status in {RunStatus.FAILED, RunStatus.CANCELLED}:
+                        stop_launching = True
+                if observer is not None:
+                    decisions = await asyncio.gather(
+                        *(observer(task, child) for task, child in completed)
+                    )
+                    if not all(decisions):
+                        stop_launching = True
+        except BaseException:
+            for execution in running:
+                execution.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+            raise
+        return results
 
 
 @dataclass(slots=True)
@@ -28,22 +129,21 @@ class PlanExecuteStrategy:
     planner: Planner
     max_task_turns: int = 8
     max_replans: int = 1
+    max_parallel_tasks: int | None = None
+    checkpoint_retry_attempts: int = 8
     name: str = "plan_execute"
 
     @classmethod
     def for_llm(cls, llm_client: LlmClient) -> PlanExecuteStrategy:
         return cls(planner=Planner(llm_client))
 
-    async def advance(
-        self,
-        runtime: DurableAgentRuntime,
-        state: Checkpoint,
-    ) -> Checkpoint:
+    async def advance(self, runtime: DurableAgentRuntime, state: Checkpoint) -> Checkpoint:
         while state.status == RunStatus.RUNNING:
             state = await runtime._refresh(state)
             if state.status != RunStatus.RUNNING:
                 return state
 
+            raw_plan = state.strategy_state.get(_PLAN_KEY)
             plan = self._load_plan(state)
             if plan is None:
                 state = await self._create_plan(runtime, state)
@@ -51,20 +151,34 @@ class PlanExecuteStrategy:
                     return state
                 continue
 
-            current_task = self._current_task(state, plan)
-            if current_task is not None:
-                state = await self._advance_task(runtime, state, plan, current_task)
+            if _legacy_plan_state(state, raw_plan):
+                self._clear_legacy_parent_task_state(state)
+                self._store_plan(state, plan)
+                await runtime._save_checkpoint(state, operation="plan.schema.migrated")
                 continue
 
+            state = await self._reconcile_children(runtime, state)
+            plan = self._load_plan(state)
+            if plan is None:
+                raise RuntimeError("plan state disappeared during child reconciliation")
             if plan.is_all_completed():
                 return await self._complete_plan(runtime, state, plan)
 
-            executable = _executable_tasks_in_order(plan)
-            if executable:
-                state = await self._start_task(runtime, state, plan, executable[0])
-                continue
-
+            child_states = await self._child_states(runtime, plan)
+            scheduler = self._scheduler(runtime)
             if plan.has_failed():
+                state = await self._release_unstarted_tasks(runtime, state, plan, child_states)
+                plan = self._load_plan(state)
+                if plan is None:
+                    raise RuntimeError("plan state disappeared during replan barrier")
+                state = await self._skip_failed_dependents(runtime, state, plan)
+                plan = self._load_plan(state)
+                if plan is None:
+                    raise RuntimeError("plan state disappeared while skipping dependents")
+                child_states = await self._child_states(runtime, plan)
+                snapshot = scheduler.snapshot(plan, child_states)
+                if snapshot.active_task_ids or snapshot.waiting_task_ids:
+                    return await self._wait_for_children(runtime, state, plan, snapshot)
                 if plan.replan_count < self.max_replans:
                     state = await self._replan(runtime, state, plan)
                     continue
@@ -75,6 +189,49 @@ class PlanExecuteStrategy:
                     "plan failed after exhausting replan attempts",
                 )
 
+            snapshot = scheduler.snapshot(plan, child_states)
+            if snapshot.ready_task_ids:
+                state = await self._persist_ready_tasks(
+                    runtime,
+                    state,
+                    plan,
+                    snapshot.ready_task_ids,
+                )
+                plan = self._load_plan(state)
+                if plan is None:
+                    raise RuntimeError("plan state disappeared after task scheduling")
+                child_states = await self._child_states(runtime, plan)
+
+            launchable = [
+                task
+                for task in _tasks_in_plan_order(plan)
+                if task.status == TaskStatus.RUNNING
+                and task.child_run_id
+                and (
+                    child_states.get(task.id) is None
+                    or child_states[task.id].status == RunStatus.RUNNING
+                )
+            ]
+            if launchable:
+                await scheduler.execute(
+                    launchable,
+                    partial(self._start_child, runtime, state, plan),
+                    partial(self._observe_scheduled_child, runtime, state.run_id),
+                )
+                state = await runtime._require(state.run_id)
+                if state.status != RunStatus.RUNNING:
+                    return state
+                state = await self._reconcile_children(runtime, state)
+                continue
+
+            child_states = await self._child_states(runtime, plan)
+            snapshot = scheduler.snapshot(plan, child_states)
+            if snapshot.active_task_ids or snapshot.waiting_task_ids:
+                return await self._wait_for_children(runtime, state, plan, snapshot)
+            if plan.is_all_completed():
+                return await self._complete_plan(runtime, state, plan)
+            if plan.has_failed():
+                continue
             return await self._fail_plan(
                 runtime,
                 state,
@@ -83,45 +240,64 @@ class PlanExecuteStrategy:
             )
         return state
 
-    async def on_cancel(
-        self,
-        runtime: DurableAgentRuntime,
-        state: Checkpoint,
-    ) -> None:
-        del runtime
+    async def on_cancel(self, runtime: DurableAgentRuntime, state: Checkpoint) -> None:
         plan = self._load_plan(state)
         if plan is None:
             return
+        for task in plan.all_tasks():
+            if task.child_run_id:
+                child = await runtime.store.load(task.child_run_id)
+                if child is not None and not child.finished:
+                    await self._child_runtime(runtime, task).cancel(child.run_id)
+            if task.status not in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.SKIPPED,
+                TaskStatus.CANCELLED,
+            }:
+                task.mark_cancelled()
+                task.execution_state = RunStatus.CANCELLED.value
         plan.status = PlanStatus.CANCELLED
         plan.end_time = time.time()
         self._store_plan(state, plan)
 
-    async def after_cancel(
-        self,
-        runtime: DurableAgentRuntime,
-        state: Checkpoint,
-    ) -> None:
+    async def after_cancel(self, runtime: DurableAgentRuntime, state: Checkpoint) -> None:
         plan = self._load_plan(state)
         if plan is None:
             return
-        task = self._current_task(state, plan)
-        if task is not None:
-            span = await self._plan_step_span(runtime, state, plan, task, reopen=True)
-            await runtime._finish_span(span, SpanStatus.CANCELLED)
-        await runtime._emit(
-            "plan.cancelled",
-            {
-                "run_id": state.run_id,
-                "plan_id": plan.id,
-                "plan_version": plan.version,
-            },
-        )
+        for task in plan.all_tasks():
+            if task.status == TaskStatus.CANCELLED and task.child_run_id:
+                span = await self._plan_step_span(runtime, state, plan, task, reopen=True)
+                await runtime._finish_span(span, SpanStatus.CANCELLED)
+        await runtime._emit("plan.cancelled", self._plan_event(state, plan))
 
-    async def _create_plan(
+    async def resume_waiting_child(
         self,
         runtime: DurableAgentRuntime,
-        state: Checkpoint,
+        parent: Checkpoint,
+        *,
+        decision: str,
+        child_run_id: str | None = None,
     ) -> Checkpoint:
+        plan = self._load_plan(parent)
+        if plan is None:
+            raise ValueError("parent has no active plan")
+        waiting: list[Task] = []
+        for task in plan.all_tasks():
+            if not task.child_run_id or (child_run_id and task.child_run_id != child_run_id):
+                continue
+            child = await runtime.store.load(task.child_run_id)
+            if child is not None and child.status == RunStatus.WAITING_APPROVAL:
+                waiting.append(task)
+        if len(waiting) != 1:
+            raise ValueError("approval must identify exactly one waiting plan child run")
+        task = waiting[0]
+        return await self._child_runtime(runtime, task).resume(
+            task.child_run_id or "",
+            decision=decision,
+        )
+
+    async def _create_plan(self, runtime: DurableAgentRuntime, state: Checkpoint) -> Checkpoint:
         result, planning_span = await self._call_planner(
             runtime,
             state,
@@ -144,12 +320,7 @@ class PlanExecuteStrategy:
         )
         await runtime._emit(
             "plan.created",
-            {
-                "run_id": state.run_id,
-                "plan_id": plan.id,
-                "plan_version": plan.version,
-                "steps": len(plan.tasks),
-            },
+            {**self._plan_event(state, plan), "steps": len(plan.tasks)},
         )
         return state
 
@@ -160,7 +331,11 @@ class PlanExecuteStrategy:
         failed_plan: ExecutionPlan,
     ) -> Checkpoint:
         failed = next(
-            (task for task in failed_plan.all_tasks() if task.status == TaskStatus.FAILED),
+            (
+                task
+                for task in failed_plan.all_tasks()
+                if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}
+            ),
             None,
         )
         reason = failed.error if failed and failed.error else "plan step failed"
@@ -173,13 +348,11 @@ class PlanExecuteStrategy:
         )
         if result is None:
             return state
-
         replacement = result.plan
         replacement.version = failed_plan.version + 1
         replacement.replan_count = failed_plan.replan_count + 1
         replacement.history = [*failed_plan.history, failed_plan.snapshot(reason)]
         _reuse_completed_tasks(failed_plan, replacement)
-        self._clear_current_task(state)
         state.error = None
         self._store_plan(state, replacement)
         await runtime._save_checkpoint(
@@ -200,10 +373,8 @@ class PlanExecuteStrategy:
         await runtime._emit(
             "plan.replanned",
             {
-                "run_id": state.run_id,
+                **self._plan_event(state, replacement),
                 "previous_plan_id": failed_plan.id,
-                "plan_id": replacement.id,
-                "plan_version": replacement.version,
                 "reason": reason,
             },
         )
@@ -257,14 +428,9 @@ class PlanExecuteStrategy:
                 SpanStatus.FAILED,
                 attributes={"error": str(exc), "latency_ms": latency_ms},
             )
-            await runtime._finish_span(
-                plan_span,
-                SpanStatus.FAILED,
-                attributes={"error": str(exc)},
-            )
+            await runtime._finish_span(plan_span, SpanStatus.FAILED, attributes={"error": str(exc)})
             await runtime._fail(state, exc, step="planning" if previous_plan is None else "replan")
             return None, plan_span
-
         latency_ms = round((time.perf_counter() - started) * 1000, 3)
         state.total_tokens += result.prompt_tokens + result.completion_tokens
         await runtime._finish_span(
@@ -282,154 +448,269 @@ class PlanExecuteStrategy:
         )
         return result, plan_span
 
-    async def _start_task(
+    def _scheduler(self, runtime: DurableAgentRuntime) -> LocalPlanTaskScheduler:
+        configured = self.max_parallel_tasks
+        if configured is None:
+            configured = runtime.config.plan.max_parallel_tasks
+        return LocalPlanTaskScheduler(max(1, int(configured)))
+
+    async def _child_states(
+        self,
+        runtime: DurableAgentRuntime,
+        plan: ExecutionPlan,
+    ) -> dict[str, Checkpoint | None]:
+        tasks = plan.all_tasks()
+        states = await asyncio.gather(
+            *(
+                runtime.store.load(task.child_run_id) if task.child_run_id else _none_checkpoint()
+                for task in tasks
+            )
+        )
+        return {task.id: child for task, child in zip(tasks, states, strict=True)}
+
+    async def _persist_ready_tasks(
         self,
         runtime: DurableAgentRuntime,
         state: Checkpoint,
         plan: ExecutionPlan,
-        task: Task,
+        ready_task_ids: tuple[str, ...],
     ) -> Checkpoint:
+        scheduled: list[Task] = []
         if plan.status == PlanStatus.CREATED:
             plan.mark_started()
-        task.mark_started()
-        state.strategy_state[_CURRENT_TASK_KEY] = task.id
-        state.strategy_state[_TASK_OUTPUT_KEY] = ""
-        state.strategy_state[_TASK_ERROR_KEY] = ""
-        state.strategy_state[_TASK_COMPLETE_KEY] = False
-        state.strategy_state[_TASK_TURN_START_KEY] = state.agent_turn
-        state.strategy_state[_TASK_MESSAGE_START_KEY] = len(state.messages)
-        state.pending_tool_calls = []
-        state.next_tool_index = 0
-        state.messages.append(Message(role="user", content=_task_context(plan, task)))
+        for task_id in ready_task_ids:
+            task = plan.get_task(task_id)
+            if task is None or task.status != TaskStatus.PENDING:
+                continue
+            if task.child_run_id is None:
+                task.mark_started()
+                task.child_run_id = plan_task_child_run_id(
+                    state.run_id,
+                    plan.version,
+                    task.id,
+                    task.attempt,
+                )
+            else:
+                task.status = TaskStatus.RUNNING
+                if not task.start_time:
+                    task.start_time = time.time()
+            task.execution_state = "ASSIGNED"
+            scheduled.append(task)
+        if not scheduled:
+            return state
         self._store_plan(state, plan)
-        step_span = await self._plan_step_span(runtime, state, plan, task, reopen=True)
-        await runtime._save_checkpoint(
-            state,
-            operation="plan.step.started",
-            parent_span_id=_span_id(step_span),
-        )
-        await runtime._emit(
-            "plan.step.started",
-            {
-                "run_id": state.run_id,
-                "plan_id": plan.id,
-                "plan_version": plan.version,
-                "step_id": task.id,
-                "attempt": task.attempt,
-            },
-        )
+        await runtime._save_checkpoint(state, operation="plan.step.batch.scheduled")
+        for task in scheduled:
+            await self._plan_step_span(runtime, state, plan, task, reopen=True)
+            await runtime._emit("plan.step.scheduled", self._task_event(state, plan, task))
         return state
 
-    async def _advance_task(
+    async def _start_child(
         self,
         runtime: DurableAgentRuntime,
         state: Checkpoint,
         plan: ExecutionPlan,
         task: Task,
     ) -> Checkpoint:
-        step_span = await self._plan_step_span(runtime, state, plan, task, reopen=True)
-        if state.strategy_state.get(_TASK_ERROR_KEY):
-            return await self._fail_task(runtime, state, plan, task, step_span)
-        if bool(state.strategy_state.get(_TASK_COMPLETE_KEY)):
-            return await self._complete_task(runtime, state, plan, task, step_span)
-
-        if state.pending_tool_calls and state.next_tool_index < len(state.pending_tool_calls):
-            return await runtime._execute_pending_tool(
-                state,
-                parent_span_id=_span_id(step_span),
+        if task.child_run_id is None:
+            raise RuntimeError("scheduled plan task is missing child_run_id")
+        existing = await runtime.store.load(task.child_run_id)
+        child_runtime = self._child_runtime(runtime, task)
+        if existing is not None and existing.status == RunStatus.RUNNING:
+            return await child_runtime.resume(existing.run_id)
+        if existing is not None:
+            return existing
+        await runtime._emit("plan.step.started", self._task_event(state, plan, task))
+        try:
+            return await child_runtime.start(
+                thread_id=state.thread_id,
+                turn_id=state.turn_id,
+                run_id=task.child_run_id,
+                input=_task_context(plan, task),
+                parent_run_id=state.run_id,
+                parent_step_id=plan_task_span_id(state.run_id, plan.version, task.id, task.attempt),
+                run_kind="plan_task",
             )
+        except ValueError as exc:
+            existing = await runtime.store.load(task.child_run_id)
+            if existing is None or "run already exists" not in str(exc):
+                raise
+            return existing
 
-        turn_start = int(state.strategy_state.get(_TASK_TURN_START_KEY) or 0)
-        if state.agent_turn - turn_start >= self.max_task_turns:
-            state.strategy_state[_TASK_ERROR_KEY] = (
-                f"plan step exceeded max_task_turns={self.max_task_turns}"
-            )
-            return await self._fail_task(runtime, state, plan, task, step_span)
-
-        state.pending_tool_calls = []
-        state.next_tool_index = 0
-        return await runtime._execute_llm_step(
-            state,
-            system_prompt=_task_system_prompt(runtime, task),
-            parent_span_id=_span_id(step_span),
-            complete_run=False,
-            fail_run=False,
-            output_state_key=_TASK_OUTPUT_KEY,
-            tool_call_scope=f"plan_v{plan.version}:{task.id}:turn_{state.agent_turn}",
-        )
-
-    async def _complete_task(
+    async def _reconcile_children(
         self,
         runtime: DurableAgentRuntime,
         state: Checkpoint,
-        plan: ExecutionPlan,
-        task: Task,
-        step_span: Any,
     ) -> Checkpoint:
-        result = str(state.strategy_state.get(_TASK_OUTPUT_KEY) or "").strip()
-        if not result:
-            start = int(state.strategy_state.get(_TASK_MESSAGE_START_KEY) or 0)
-            result = "\n".join(
-                str(message.content)
-                for message in state.messages[start:]
-                if message.role == "tool" and message.content
-            ).strip()
-        task.mark_completed(result)
-        self._clear_current_task(state)
-        self._store_plan(state, plan)
-        await runtime._save_checkpoint(
-            state,
-            operation="plan.step.completed",
-            parent_span_id=_span_id(step_span),
-        )
-        await runtime._finish_span(
-            step_span,
-            SpanStatus.SUCCEEDED,
-            attributes={"attempt": task.attempt, "output_chars": len(result)},
-        )
-        await runtime._emit(
-            "plan.step.completed",
-            {
-                "run_id": state.run_id,
-                "plan_id": plan.id,
-                "plan_version": plan.version,
-                "step_id": task.id,
-                "attempt": task.attempt,
-            },
-        )
+        plan = self._load_plan(state)
+        if plan is None:
+            return state
+        observable: list[str] = []
+        for task in plan.all_tasks():
+            if task.status != TaskStatus.RUNNING or not task.child_run_id:
+                continue
+            child = await runtime.store.load(task.child_run_id)
+            if child is not None and child.status != RunStatus.RUNNING:
+                observable.append(task.id)
+        if observable:
+            await asyncio.gather(
+                *(self._observe_child(runtime, state.run_id, task_id) for task_id in observable)
+            )
+            return await runtime._require(state.run_id)
         return state
 
-    async def _fail_task(
+    async def _observe_scheduled_child(
+        self,
+        runtime: DurableAgentRuntime,
+        parent_run_id: str,
+        task: Task,
+        _child: Checkpoint,
+    ) -> bool:
+        await self._observe_child(runtime, parent_run_id, task.id)
+        parent = await runtime._require(parent_run_id)
+        if parent.status != RunStatus.RUNNING:
+            return False
+        plan = self._load_plan(parent)
+        return plan is not None and not plan.has_failed()
+
+    async def _observe_child(
+        self,
+        runtime: DurableAgentRuntime,
+        parent_run_id: str,
+        task_id: str,
+    ) -> None:
+        for _attempt in range(max(1, self.checkpoint_retry_attempts)):
+            parent = await runtime._require(parent_run_id)
+            if parent.finished:
+                return
+            plan = self._load_plan(parent)
+            task = plan.get_task(task_id) if plan else None
+            if plan is None or task is None or not task.child_run_id:
+                return
+            if task.status != TaskStatus.RUNNING:
+                return
+            child = await runtime.store.load(task.child_run_id)
+            if child is None or child.status == RunStatus.RUNNING:
+                return
+
+            event_type = "plan.step.waiting"
+            span_status = SpanStatus.INTERRUPTED
+            operation = "plan.step.waiting"
+            if child.status in {RunStatus.WAITING_APPROVAL, RunStatus.INTERRUPTED}:
+                if task.execution_state == child.status.value:
+                    return
+                task.execution_state = child.status.value
+            elif child.status == RunStatus.COMPLETED:
+                task.mark_completed(child.output_text)
+                task.error = ""
+                task.execution_state = child.status.value
+                parent.total_tokens += child.total_tokens
+                operation = "plan.step.completed"
+                event_type = "plan.step.completed"
+                span_status = SpanStatus.SUCCEEDED
+            else:
+                error = child.error.message if child.error else child.status.value.lower()
+                if child.status == RunStatus.CANCELLED:
+                    task.mark_cancelled(error)
+                    event_type = "plan.step.cancelled"
+                    span_status = SpanStatus.CANCELLED
+                else:
+                    task.mark_failed(error)
+                    event_type = "plan.step.failed"
+                    span_status = SpanStatus.FAILED
+                task.execution_state = child.status.value
+                operation = event_type
+
+            self._store_plan(parent, plan)
+            span = await self._plan_step_span(runtime, parent, plan, task, reopen=True)
+            try:
+                await runtime._save_checkpoint(
+                    parent,
+                    operation=operation,
+                    parent_span_id=_span_id(span),
+                )
+            except CheckpointConflictError:
+                continue
+            attributes: dict[str, object] = {"child_run_id": child.run_id}
+            if child.status == RunStatus.COMPLETED:
+                attributes["output_chars"] = len(child.output_text)
+            elif child.error:
+                attributes["error"] = child.error.message
+            await runtime._finish_span(span, span_status, attributes=attributes)
+            await runtime._emit(event_type, self._task_event(parent, plan, task))
+            return
+        raise CheckpointConflictError(
+            f"could not reconcile plan task {task_id} after concurrent parent updates"
+        )
+
+    async def _release_unstarted_tasks(
         self,
         runtime: DurableAgentRuntime,
         state: Checkpoint,
         plan: ExecutionPlan,
-        task: Task,
-        step_span: Any,
+        child_states: dict[str, Checkpoint | None],
     ) -> Checkpoint:
-        error = str(state.strategy_state.get(_TASK_ERROR_KEY) or "plan step failed")
-        task.mark_failed(error)
-        self._clear_current_task(state)
+        changed = False
+        for task in plan.all_tasks():
+            if (
+                task.status == TaskStatus.RUNNING
+                and task.child_run_id
+                and child_states.get(task.id) is None
+            ):
+                task.status = TaskStatus.PENDING
+                task.execution_state = ""
+                changed = True
+        if changed:
+            self._store_plan(state, plan)
+            await runtime._save_checkpoint(state, operation="plan.replan.barrier")
+        return state
+
+    async def _skip_failed_dependents(
+        self,
+        runtime: DurableAgentRuntime,
+        state: Checkpoint,
+        plan: ExecutionPlan,
+    ) -> Checkpoint:
+        changed = False
+        failed_states = {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.SKIPPED}
+        while True:
+            round_changed = False
+            statuses = {task.id: task.status for task in plan.all_tasks()}
+            for task in plan.all_tasks():
+                if task.status != TaskStatus.PENDING:
+                    continue
+                failed = [dep for dep in task.dependencies if statuses.get(dep) in failed_states]
+                if not failed:
+                    continue
+                task.mark_skipped()
+                task.error = f"dependency did not complete successfully: {', '.join(failed)}"
+                task.execution_state = TaskStatus.SKIPPED.value
+                round_changed = True
+                changed = True
+            if not round_changed:
+                break
+        if changed:
+            self._store_plan(state, plan)
+            await runtime._save_checkpoint(state, operation="plan.dependencies.skipped")
+        return state
+
+    async def _wait_for_children(
+        self,
+        runtime: DurableAgentRuntime,
+        state: Checkpoint,
+        plan: ExecutionPlan,
+        snapshot: PlanSchedulerSnapshot,
+    ) -> Checkpoint:
+        state.status = RunStatus.WAITING_CHILD
         self._store_plan(state, plan)
-        await runtime._save_checkpoint(
-            state,
-            operation="plan.step.failed",
-            parent_span_id=_span_id(step_span),
-        )
-        await runtime._finish_span(
-            step_span,
-            SpanStatus.FAILED,
-            attributes={"attempt": task.attempt, "error": error},
-        )
+        await runtime._save_checkpoint(state, operation="plan.scheduler.waiting")
+        await runtime._update_run_trace(state.status)
         await runtime._emit(
-            "plan.step.failed",
+            "plan.waiting",
             {
-                "run_id": state.run_id,
-                "plan_id": plan.id,
-                "plan_version": plan.version,
-                "step_id": task.id,
-                "attempt": task.attempt,
-                "error": error,
+                **self._plan_event(state, plan),
+                "active_task_ids": list(snapshot.active_task_ids),
+                "waiting_task_ids": list(snapshot.waiting_task_ids),
             },
         )
         return state
@@ -449,9 +730,7 @@ class PlanExecuteStrategy:
         await runtime._emit(
             "plan.completed",
             {
-                "run_id": state.run_id,
-                "plan_id": plan.id,
-                "plan_version": plan.version,
+                **self._plan_event(state, plan),
                 "steps": len(plan.tasks),
                 "replan_count": plan.replan_count,
             },
@@ -475,14 +754,28 @@ class PlanExecuteStrategy:
         await runtime._save_checkpoint(state, operation="plan.failed")
         await runtime._emit(
             "plan.failed",
-            {
-                "run_id": state.run_id,
-                "plan_id": plan.id,
-                "plan_version": plan.version,
-                "reason": reason,
-            },
+            {**self._plan_event(state, plan), "reason": reason},
         )
         return await runtime._fail(state, RuntimeError(reason), step="plan")
+
+    def _child_runtime(self, runtime: DurableAgentRuntime, task: Task) -> DurableAgentRuntime:
+        from axiom.runtime.durable import DurableAgentRuntime
+
+        return DurableAgentRuntime(
+            llm_client=runtime.llm_client,
+            tool_registry=runtime.tool_registry,
+            system_prompt=_task_system_prompt(runtime, task),
+            cwd=runtime.cwd,
+            config=runtime.config,
+            store=runtime.store,
+            retry_policy=runtime.retry_policy,
+            event_sink=runtime.event_sink,
+            tracer=RunTracer(runtime.tracer.store) if runtime.tracer is not None else None,
+            permission_policy=runtime.permission_policy,
+            execution_backend=runtime.execution_backend,
+            execution_strategy="react",
+            max_turns=self.max_task_turns,
+        )
 
     async def _plan_step_span(
         self,
@@ -496,14 +789,16 @@ class PlanExecuteStrategy:
         return await runtime._start_span(
             SpanType.AGENT,
             "plan.step",
-            span_id=_plan_step_span_id(state.run_id, plan.version, task.id),
+            span_id=plan_task_span_id(state.run_id, plan.version, task.id, task.attempt),
             reopen=reopen,
             attributes={
                 "plan_id": plan.id,
                 "plan_version": plan.version,
                 "step_id": task.id,
+                "task_id": task.id,
                 "description": task.description,
                 "attempt": task.attempt,
+                "child_run_id": task.child_run_id,
             },
         )
 
@@ -514,28 +809,63 @@ class PlanExecuteStrategy:
     def _store_plan(self, state: Checkpoint, plan: ExecutionPlan) -> None:
         state.strategy_state[_PLAN_KEY] = plan.to_dict()
 
-    def _current_task(self, state: Checkpoint, plan: ExecutionPlan) -> Task | None:
-        task_id = state.strategy_state.get(_CURRENT_TASK_KEY)
-        return plan.get_task(str(task_id)) if task_id else None
-
-    def _clear_current_task(self, state: Checkpoint) -> None:
-        for key in (
-            _CURRENT_TASK_KEY,
-            _TASK_OUTPUT_KEY,
-            _TASK_ERROR_KEY,
-            _TASK_COMPLETE_KEY,
-            _TASK_TURN_START_KEY,
-            _TASK_MESSAGE_START_KEY,
-        ):
+    def _clear_legacy_parent_task_state(self, state: Checkpoint) -> None:
+        for key in _LEGACY_TASK_KEYS:
             state.strategy_state.pop(key, None)
         state.pending_tool_calls = []
         state.next_tool_index = 0
         state.error = None
 
+    def _plan_event(self, state: Checkpoint, plan: ExecutionPlan) -> dict[str, Any]:
+        return {
+            "run_id": state.run_id,
+            "thread_id": state.thread_id,
+            "turn_id": state.turn_id,
+            "plan_id": plan.id,
+            "plan_version": plan.version,
+            "status": plan.status.value,
+        }
 
-def _executable_tasks_in_order(plan: ExecutionPlan) -> list[Task]:
-    executable = {task.id for task in plan.executable_tasks()}
-    return [plan.tasks[task_id] for task_id in plan.execution_order() if task_id in executable]
+    def _task_event(
+        self,
+        state: Checkpoint,
+        plan: ExecutionPlan,
+        task: Task,
+    ) -> dict[str, Any]:
+        return {
+            **self._plan_event(state, plan),
+            "step_id": task.id,
+            "task_id": task.id,
+            "attempt": task.attempt,
+            "child_run_id": task.child_run_id,
+            "task_status": task.status.value,
+            "child_status": task.execution_state or None,
+            "error": task.error or None,
+        }
+
+
+def plan_task_child_run_id(
+    parent_run_id: str,
+    plan_version: int,
+    task_id: str,
+    attempt: int,
+) -> str:
+    raw = f"{parent_run_id}:plan_v{plan_version}:{task_id}:{attempt}".encode()
+    return f"run_plan_{hashlib.sha256(raw).hexdigest()[:32]}"
+
+
+def plan_task_span_id(
+    parent_run_id: str,
+    plan_version: int,
+    task_id: str,
+    attempt: int,
+) -> str:
+    raw = f"{parent_run_id}:plan_v{plan_version}:{task_id}:{attempt}".encode()
+    return f"span_plan_{hashlib.sha256(raw).hexdigest()[:32]}"
+
+
+def _tasks_in_plan_order(plan: ExecutionPlan) -> list[Task]:
+    return [plan.tasks[task_id] for task_id in plan.execution_order()]
 
 
 def _task_context(plan: ExecutionPlan, task: Task) -> str:
@@ -560,7 +890,7 @@ def _task_context(plan: ExecutionPlan, task: Task) -> str:
 def _task_system_prompt(runtime: DurableAgentRuntime, task: Task) -> str:
     return (
         runtime.system_prompt
-        + "\n\nYou are executing one durable step inside a Plan-and-Execute strategy.\n"
+        + "\n\nYou are executing one durable task inside a Plan-and-Execute strategy.\n"
         + f"Task id: {task.id}\nTask type: {task.type.value}\n"
         + "Complete only this task. Use tools when needed and return the concrete result."
     )
@@ -589,6 +919,9 @@ def _reuse_completed_tasks(previous: ExecutionPlan, replacement: ExecutionPlan) 
         task.result = prior.result
         task.error = ""
         task.attempt = prior.attempt
+        task.child_run_id = prior.child_run_id
+        task.reused_from = f"plan_v{previous.version}:{prior.id}"
+        task.execution_state = prior.execution_state
         task.start_time = prior.start_time
         task.end_time = prior.end_time
 
@@ -606,13 +939,18 @@ def _completed_history(plan: ExecutionPlan) -> list[tuple[str, str]]:
     return result
 
 
+def _legacy_plan_state(state: Checkpoint, raw_plan: object) -> bool:
+    return (isinstance(raw_plan, dict) and int(raw_plan.get("schema_version") or 0) == 1) or any(
+        key in state.strategy_state for key in _LEGACY_TASK_KEYS
+    )
+
+
 def _normalized_description(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
-def _plan_step_span_id(run_id: str, plan_version: int, task_id: str) -> str:
-    raw = f"{run_id}:{plan_version}:{task_id}".encode()
-    return f"span_plan_{hashlib.sha256(raw).hexdigest()[:32]}"
+async def _none_checkpoint() -> Checkpoint | None:
+    return None
 
 
 def _span_id(span: Any) -> str | None:

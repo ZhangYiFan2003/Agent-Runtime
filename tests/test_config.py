@@ -49,3 +49,12 @@ def test_multi_agent_parallelism_environment_override(tmp_path, monkeypatch):
     config = load_config(project_root=tmp_path)
 
     assert config.multi_agent.max_parallel_workers == 3
+
+
+def test_plan_parallelism_environment_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AXIOM_PLAN_MAX_PARALLEL_TASKS", "3")
+
+    config = load_config(project_root=tmp_path)
+
+    assert config.plan.max_parallel_tasks == 3

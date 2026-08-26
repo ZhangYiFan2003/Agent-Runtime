@@ -43,7 +43,7 @@ stage. This document does not repeat the model request.
 | Memory | `src/axiom/memory/*` | Verified | Memory tests verify legacy save/list/search/clear compatibility, additive schema migration, typed memory kinds and scopes, fact extraction, duplicate merge, conflict supersession, retraction, scoped preference reuse, bounded tool-result digests, Map-Reduce summary checkpoints, single-active-summary invariants, incremental ranges, failure fallback, and budgeted deterministic memory context with temporary SQLite databases. |
 | Skills | `src/axiom/skill/registry.py`, `src/axiom/tools/builtins.py` | Verified | Skill registry, skill context buffer, and `load_skill` context behavior tests passed. |
 | Snapshots | `src/axiom/snapshot/service.py` | Verified | `tests/test_snapshot.py` verifies snapshot creation, restore, listing, cleanup, and ignored cache directory behavior under an isolated temporary home. |
-| Plan-execute | `src/axiom/agent/plan_execute.py`, `src/axiom/plan/*`, `src/axiom/runtime/plan_strategy.py` | Verified | `tests/test_plan.py` and `tests/test_durable_plan_runtime.py` verify versioned JSON Plan state, sequential durable dependency execution, SQLite recovery, Tool result reuse, approval/restart, isolation, replan history, trace hierarchy, cancellation, Runtime API selection, and Evaluation integration. |
+| Plan-execute | `src/axiom/agent/plan_execute.py`, `src/axiom/plan/*`, `src/axiom/runtime/plan_strategy.py` | Verified | Plan tests verify schema migration, bounded parallel overlap, sequential compatibility, dependency joins, stable Child identity, CAS-safe completion, SQLite recovery, independent approvals, replan barriers/reuse, cancellation, isolation, linked traces, Runtime API hierarchy, and Evaluation aggregation. |
 | Multi-agent | `src/axiom/agent/orchestrator.py`, `src/axiom/runtime/multi_agent_strategy.py` | Verified | Parent/Child identity, bounded parallel overlap, dependency joins, CAS-safe concurrent completion, approval slot release, mixed-state restart, Tool reuse, reviewer retry, cancellation, linked traces, isolation, events, and Evaluation are covered by the durable Multi-Agent test suites. |
 | MCP client | `src/axiom/mcp/client.py`, `src/axiom/mcp/config.py` | Verified | Tests passed for stdio MCP tool discovery/call and stderr suppression. |
 | MCP server | `src/axiom/mcp/server.py` | Partially verified | Handler-level tests cover initialize, tools/list, safe tools/call, unknown tools, unknown methods, and malformed missing-method requests. Long-running stdio/http transports were not started in this baseline. |
@@ -75,7 +75,7 @@ secrets and external services unless explicitly noted.
 | Tool calling/ReAct | Run existing `tests/test_query.py` | None expected | Temp files plus snapshot state |
 | Skills | Run existing `tests/test_skill.py` | None expected | Temp files and temp home state |
 | Snapshots | Run existing `tests/test_snapshot.py` | None expected | Temp project and snapshot state |
-| Plan-execute | Run existing `tests/test_plan.py` | None expected | Temp files plus snapshot state |
+| Plan-execute | Run `tests/test_plan.py`, `tests/test_durable_plan_runtime.py`, and `tests/test_durable_plan_parallelism.py` | None expected | Temp files plus SQLite/checkpoint state |
 | Multi-agent | Run existing `tests/test_multi_agent.py` | None expected | Temp files plus snapshot state |
 | MCP client/server handler | Run existing `tests/test_mcp.py` | None expected | Temp MCP server files |
 | Runtime task/API live localhost | Run existing `tests/test_runtime.py` | Localhost only | Temp SQLite files under isolated `data_dir` |
@@ -88,7 +88,7 @@ Pytest configuration:
 - `testpaths = ["tests"]`
 - `addopts = "-q"`
 
-Test files:
+Representative test files (pytest discovers the complete `tests/test_*.py` suite):
 
 - `tests/test_code_call_graph.py`
 - `tests/test_code_context.py`
@@ -105,6 +105,8 @@ Test files:
 - `tests/test_memory_summary.py`
 - `tests/test_multi_agent.py`
 - `tests/test_plan.py`
+- `tests/test_durable_plan_runtime.py`
+- `tests/test_durable_plan_parallelism.py`
 - `tests/test_policy.py`
 - `tests/test_query.py`
 - `tests/test_render.py`
@@ -121,10 +123,10 @@ uv run pytest
 
 Result:
 
-- Passed: 145
+- Passed: 305
 - Failed: 0
 - Skipped: 0
-- Total executed: 145
+- Total executed: 305
 
 The pytest baseline is currently green after test home-directory isolation was
 added for Windows.
@@ -136,14 +138,13 @@ added for Windows.
 - Interactive REPL behavior is less extensively covered than non-interactive paths, though code context slash-command dispatch is now covered without launching a terminal.
 - Runtime API public deployment, load testing, distributed queues, real-provider CI, and unlimited live streaming are not covered by the current automated baseline.
 - Runtime thread events, typed memory records, Map-Reduce summary checkpoints, and conservative scoped fact/preference extraction are persisted locally, but semantic memory retrieval, production LLM extraction evaluation, remote summarization/extraction CI, and cross-project preference sharing are not implemented yet.
-- MCP long-running stdio/http server behavior is only partially covered through
-  request handler and client tests.
+- MCP client lifecycle tests cover both stdio and Streamable HTTP. The built-in server's
+  long-running transport lifecycle remains less extensively covered than its request handlers.
 - Broader end-to-end coverage for every built-in tool is still incomplete, though code search, symbol, call graph, and graph-aware context tools now have deterministic fixture coverage.
 
-## 6. Recommended next-stage tasks
+## 6. Feature-freeze posture
 
-1. Add a capability-based permission policy before expanding evaluation tasks that mutate workspaces or external systems.
-2. Add MCP stdio/http transport lifecycle tests with deterministic process cleanup.
-3. Add optional LLM-backed memory extraction evaluation with strict schemas and no default network calls.
-4. Broaden no-network tests for high-risk built-in tools beyond the current read/write, code search, Runtime API, and ReAct `read_file` paths.
-5. Keep paid model verification as an explicit manual smoke command, never as a default automated test.
+The current Runtime feature set is intentionally frozen after durable bounded Plan DAG parallelism.
+Known limitations remain documented rather than being expanded into another feature stage. Paid
+model verification remains an explicit manual smoke command and is never part of the default
+automated suite.

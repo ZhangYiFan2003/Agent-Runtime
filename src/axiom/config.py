@@ -79,6 +79,11 @@ class MultiAgentConfig:
 
 
 @dataclass(slots=True)
+class PlanConfig:
+    max_parallel_tasks: int = 2
+
+
+@dataclass(slots=True)
 class McpConfig:
     servers: list[dict[str, Any]] = field(default_factory=list)
     auto_start: bool = True
@@ -147,6 +152,7 @@ class AxiomConfig:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
+    plan: PlanConfig = field(default_factory=PlanConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
@@ -242,6 +248,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     policy = result.setdefault("policy", {})
     execution = result.setdefault("execution", {})
     multi_agent = result.setdefault("multi_agent", {})
+    plan = result.setdefault("plan", {})
 
     mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_API_KEY", "api_key", str),
@@ -333,6 +340,10 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     if max_parallel_workers not in (None, ""):
         with suppress(TypeError, ValueError):
             multi_agent["max_parallel_workers"] = max(1, int(max_parallel_workers))
+    max_parallel_tasks = env.get("AXIOM_PLAN_MAX_PARALLEL_TASKS")
+    if max_parallel_tasks not in (None, ""):
+        with suppress(TypeError, ValueError):
+            plan["max_parallel_tasks"] = max(1, int(max_parallel_tasks))
 
     return result
 
@@ -362,6 +373,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         tools=ToolsConfig(**data.get("tools", {})),
         execution=ExecutionConfig(**data.get("execution", {})),
         multi_agent=MultiAgentConfig(**data.get("multi_agent", {})),
+        plan=PlanConfig(**data.get("plan", {})),
         mcp=McpConfig(**data.get("mcp", {})),
         memory=MemoryConfig(**data.get("memory", {})),
         policy=PolicyConfig(**data.get("policy", {})),

@@ -910,7 +910,7 @@ class RuntimeApiServer:
         if state.status == RunStatus.WAITING_CHILD and operation == ControlOperationName.RESUME:
             children = asyncio.run(self._children(state))
             active = [child.run_id for child in children if not child.finished]
-            if active and state.execution_strategy != "multi_agent":
+            if active and state.execution_strategy not in {"multi_agent", "plan_execute"}:
                 raise ApiError(
                     "invalid_run_transition",
                     "parent cannot resume while child runs are non-terminal",
@@ -981,22 +981,38 @@ class RuntimeApiServer:
         return sorted(by_id.values(), key=lambda item: (item.created_at, item.run_id))
 
     def _assignment_metadata(self, parent: Checkpoint) -> dict[str, dict[str, Any]]:
-        if parent.execution_strategy != "multi_agent":
-            return {}
-        from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
+        if parent.execution_strategy == "multi_agent":
+            from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
 
-        orchestration = MultiAgentExecutionStrategy.load_state(parent)
-        if orchestration is None:
-            return {}
-        return {
-            assignment.child_run_id: {
-                "assignment_id": assignment.assignment_id,
-                "worker_role": assignment.worker_role,
-                "attempt": assignment.attempt,
+            orchestration = MultiAgentExecutionStrategy.load_state(parent)
+            if orchestration is None:
+                return {}
+            return {
+                assignment.child_run_id: {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_role": assignment.worker_role,
+                    "attempt": assignment.attempt,
+                }
+                for assignment in orchestration.assignments
+                if assignment.child_run_id
             }
-            for assignment in orchestration.assignments
-            if assignment.child_run_id
-        }
+        if parent.execution_strategy == "plan_execute":
+            from axiom.plan import ExecutionPlan
+
+            raw = parent.strategy_state.get("plan")
+            plan = ExecutionPlan.from_dict(raw) if isinstance(raw, dict) else None
+            if plan is None:
+                return {}
+            return {
+                task.child_run_id: {
+                    "assignment_id": task.id,
+                    "worker_role": "plan_task",
+                    "attempt": task.attempt,
+                }
+                for task in plan.all_tasks()
+                if task.child_run_id
+            }
+        return {}
 
     async def _finish_durable_turn(self, state: Checkpoint) -> dict[str, Any]:
         if state.parent_run_id:
@@ -1253,7 +1269,7 @@ class RuntimeApiServer:
             children = await self._children(state)
             if not children:
                 continue
-            if state.execution_strategy != "multi_agent" and any(
+            if state.execution_strategy not in {"multi_agent", "plan_execute"} and any(
                 not child.finished for child in children
             ):
                 continue

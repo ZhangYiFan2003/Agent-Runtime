@@ -43,7 +43,12 @@ from axiom.runtime.observability_store import (
     ObservabilityService,
     SQLiteObservabilityStore,
 )
-from axiom.runtime.plan_strategy import PlanExecuteStrategy
+from axiom.runtime.plan_strategy import (
+    LocalPlanTaskScheduler,
+    PlanExecuteStrategy,
+    PlanSchedulerSnapshot,
+    plan_task_child_run_id,
+)
 from axiom.runtime.strategies import ReactExecutionStrategy, RuntimeExecutionStrategy
 from axiom.runtime.tasks import DurableTaskManager, TaskRecord
 
@@ -61,6 +66,9 @@ __all__ = [
     "MemoryObservabilityStore",
     "ObservabilityService",
     "PlanExecuteStrategy",
+    "LocalPlanTaskScheduler",
+    "PlanSchedulerSnapshot",
+    "plan_task_child_run_id",
     "ReactExecutionStrategy",
     "RetryPolicy",
     "RunStatus",

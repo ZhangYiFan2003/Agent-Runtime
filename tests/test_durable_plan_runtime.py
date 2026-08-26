@@ -272,7 +272,7 @@ def test_plan_checkpoint_json_round_trip_preserves_versions_and_step_state():
 
     restored = ExecutionPlan.from_dict(json.loads(json.dumps(plan.to_dict())))
 
-    assert restored.schema_version == 1
+    assert restored.schema_version == 2
     assert restored.version == 2
     assert restored.replan_count == 1
     assert restored.get_task("task_1").result == "output"
@@ -369,7 +369,10 @@ def test_succeeded_tool_record_is_reused_across_plan_checkpoint_gap(tmp_path):
         completed = await _runtime(client, store, tmp_path, tools=tools).resume("run-tool")
         assert completed.status == RunStatus.COMPLETED
         assert len(calls) == 1
-        record = await store.load_tool_execution("run-tool:plan_v1:task_1:turn_0:provider_call")
+        plan = ExecutionPlan.from_dict(completed.strategy_state["plan"])
+        record = await store.load_tool_execution(
+            f"{plan.get_task('task_1').child_run_id}:provider_call"
+        )
         assert record is not None
         assert record.status == ToolExecutionStatus.SUCCEEDED
 
@@ -383,15 +386,19 @@ def test_plan_write_step_waits_for_approval(tmp_path):
             [_task("Write")],
             tool_steps={"Write": ("write_data", {"path": "inside.txt"})},
         )
+        store = MemoryCheckpointStore()
         state = await _runtime(
             client,
-            MemoryCheckpointStore(),
+            store,
             tmp_path,
             tools=_registry(_side_effect_tool(calls)),
             hitl="auto",
         ).start(thread_id="thread-approval", input="complex goal")
-        assert state.status == RunStatus.WAITING_APPROVAL
-        assert state.interrupt.invocation_id.startswith(f"{state.run_id}:plan_v1:task_1")
+        assert state.status == RunStatus.WAITING_CHILD
+        plan = ExecutionPlan.from_dict(state.strategy_state["plan"])
+        child = await store.load(plan.get_task("task_1").child_run_id)
+        assert child.status == RunStatus.WAITING_APPROVAL
+        assert child.interrupt.invocation_id.startswith(child.run_id)
         assert calls == []
 
     asyncio.run(scenario())
@@ -414,13 +421,21 @@ def test_plan_approval_survives_sqlite_restart_and_continues_same_step(tmp_path)
             hitl="auto",
         ).start(thread_id="thread-restart", run_id="run-restart", input="complex goal")
 
-        completed = await _runtime(
+        restarted = _runtime(
             client,
             SQLiteCheckpointStore(database),
             tmp_path,
             tools=tools,
             hitl="auto",
-        ).resume(waiting.run_id, decision="approve")
+        )
+        plan = ExecutionPlan.from_dict(waiting.strategy_state["plan"])
+        await restarted.execution_strategy.resume_waiting_child(
+            restarted,
+            waiting,
+            child_run_id=plan.get_task("task_1").child_run_id,
+            decision="approve",
+        )
+        completed = await restarted.resume(waiting.run_id)
         assert completed.status == RunStatus.COMPLETED
         assert len(calls) == 1
         assert client.planner_calls == 1
@@ -442,9 +457,15 @@ def test_plan_reject_does_not_execute_tool_and_agent_handles_result(tmp_path):
         waiting = await _runtime(client, store, tmp_path, tools=tools, hitl="auto").start(
             thread_id="thread-reject", input="complex goal"
         )
-        completed = await _runtime(client, store, tmp_path, tools=tools, hitl="auto").resume(
-            waiting.run_id, decision="reject"
+        restarted = _runtime(client, store, tmp_path, tools=tools, hitl="auto")
+        plan = ExecutionPlan.from_dict(waiting.strategy_state["plan"])
+        await restarted.execution_strategy.resume_waiting_child(
+            restarted,
+            waiting,
+            child_run_id=plan.get_task("task_1").child_run_id,
+            decision="reject",
         )
+        completed = await restarted.resume(waiting.run_id)
         assert completed.status == RunStatus.COMPLETED
         assert calls == []
         assert "denied by permission policy" in completed.output_text
@@ -464,14 +485,22 @@ def test_hard_deny_cannot_be_bypassed_by_persisted_approval(tmp_path):
         waiting = await _runtime(client, store, tmp_path, tools=tools, hitl="auto").start(
             thread_id="thread-deny", input="complex goal"
         )
-        completed = await _runtime(
+        restarted = _runtime(
             client,
             store,
             tmp_path,
             tools=tools,
             policy=DenyPolicy(),
             hitl="auto",
-        ).resume(waiting.run_id, decision="approve")
+        )
+        plan = ExecutionPlan.from_dict(waiting.strategy_state["plan"])
+        await restarted.execution_strategy.resume_waiting_child(
+            restarted,
+            waiting,
+            child_run_id=plan.get_task("task_1").child_run_id,
+            decision="approve",
+        )
+        completed = await restarted.resume(waiting.run_id)
         assert completed.status == RunStatus.COMPLETED
         assert calls == []
         assert "test hard deny" in completed.output_text
@@ -496,7 +525,8 @@ def test_plan_shell_step_uses_restricted_execution_backend(tmp_path):
         ).start(thread_id="thread-shell", input="complex goal")
         assert completed.status == RunStatus.COMPLETED
         assert len(backend.calls) == 1
-        assert backend.calls[0].invocation_id.startswith(f"{completed.run_id}:plan_v1:task_1")
+        plan = ExecutionPlan.from_dict(completed.strategy_state["plan"])
+        assert backend.calls[0].invocation_id.startswith(plan.get_task("task_1").child_run_id)
 
     asyncio.run(scenario())
 
@@ -564,21 +594,26 @@ def test_plan_trace_contains_planning_step_and_nested_llm_tool_spans(tmp_path):
             capabilities=("filesystem.read",),
         )
         observations = MemoryObservabilityStore()
+        store = MemoryCheckpointStore()
         completed = await _runtime(
             client,
-            MemoryCheckpointStore(),
+            store,
             tmp_path,
             tools=_registry(tool),
             observations=observations,
         ).start(thread_id="thread-trace", run_id="run-trace", input="complex goal")
-        bundle = await ObservabilityService(observations).trace(completed.run_id)
+        service = ObservabilityService(observations)
+        bundle = await service.trace(completed.run_id)
         names = {span.name for span in bundle.spans}
-        assert {"plan.create", "plan.step", "llm.plan", "llm.chat", "tool.read_data"} <= names
+        assert {"plan.create", "plan.step", "llm.plan"} <= names
         plan_step = next(span for span in bundle.spans if span.name == "plan.step")
-        agent_steps = [span for span in bundle.spans if span.name == "agent.step"]
-        assert all(span.parent_span_id == plan_step.span_id for span in agent_steps)
-        llm = next(span for span in bundle.spans if span.name == "llm.chat")
-        assert llm.parent_span_id in {span.span_id for span in agent_steps}
+        plan = ExecutionPlan.from_dict(completed.strategy_state["plan"])
+        child_run_id = plan.get_task("task_1").child_run_id
+        child_bundle = await service.trace(child_run_id)
+        child_names = {span.name for span in child_bundle.spans}
+        assert {"llm.chat", "tool.read_data"} <= child_names
+        child = await store.load(child_run_id)
+        assert child.parent_step_id == plan_step.span_id
         assert len(calls) == 1
 
     asyncio.run(scenario())
@@ -588,7 +623,7 @@ def test_external_cancellation_stops_plan_before_next_step(tmp_path):
     async def scenario():
         client = ScriptedPlanClient([_task("A"), _task("B")])
         store = MemoryCheckpointStore()
-        strategy = PlanExecuteStrategy(Planner(client))
+        strategy = PlanExecuteStrategy(Planner(client), max_parallel_tasks=1)
         runtime: DurableAgentRuntime
 
         async def cancel_after_first(event_type: str, payload: dict[str, Any]) -> None:
@@ -683,9 +718,11 @@ def test_runtime_api_uses_durable_plan_strategy_from_config(tmp_path):
         result = await server._run_turn(thread_id, "perform a complex API plan task")
         runs = await server.checkpoint_store.list(thread_id)
         assert "result:API task" in result["text"]
-        assert len(runs) == 1
-        assert runs[0].execution_strategy == "plan_execute"
-        assert ExecutionPlan.from_dict(runs[0].strategy_state["plan"]).is_all_completed()
+        assert len(runs) == 2
+        parent = next(run for run in runs if run.execution_strategy == "plan_execute")
+        child = next(run for run in runs if run.run_kind == "plan_task")
+        assert child.parent_run_id == parent.run_id
+        assert ExecutionPlan.from_dict(parent.strategy_state["plan"]).is_all_completed()
 
     asyncio.run(scenario())
 

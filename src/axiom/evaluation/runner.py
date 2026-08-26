@@ -104,6 +104,7 @@ class DurableEvaluationExecutor:
         metrics = await self.observability.metrics(run_id)
         child_bundles = []
         child_metrics = []
+        child_run_ids: set[str] = set()
         if state is not None and state.execution_strategy == "multi_agent":
             orchestration = MultiAgentExecutionStrategy.load_state(state)
             child_run_ids = (
@@ -115,13 +116,27 @@ class DurableEvaluationExecutor:
                 if orchestration is not None
                 else set()
             )
-            for child_run_id in sorted(child_run_ids):
-                child_bundle = await self.observability.trace(child_run_id)
-                child_metric = await self.observability.metrics(child_run_id)
-                if child_bundle is not None:
-                    child_bundles.append(child_bundle)
-                if child_metric is not None:
-                    child_metrics.append(child_metric)
+        elif state is not None and state.execution_strategy == "plan_execute":
+            from axiom.plan import ExecutionPlan
+
+            raw = state.strategy_state.get("plan")
+            plan = ExecutionPlan.from_dict(raw) if isinstance(raw, dict) else None
+            if plan is not None:
+                child_run_ids = {
+                    task.child_run_id
+                    for task in [
+                        *plan.all_tasks(),
+                        *(task for revision in plan.history for task in revision.tasks),
+                    ]
+                    if task.child_run_id
+                }
+        for child_run_id in sorted(child_run_ids):
+            child_bundle = await self.observability.trace(child_run_id)
+            child_metric = await self.observability.metrics(child_run_id)
+            if child_bundle is not None:
+                child_bundles.append(child_bundle)
+            if child_metric is not None:
+                child_metrics.append(child_metric)
         tool_calls = (
             [
                 str(span.attributes.get("tool_name") or span.name.removeprefix("tool."))

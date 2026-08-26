@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
 
 
 class TaskType(StrEnum):
@@ -23,6 +23,7 @@ class TaskStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+    CANCELLED = "CANCELLED"
 
 
 class PlanStatus(StrEnum):
@@ -44,6 +45,9 @@ class Task:
     result: str = ""
     error: str = ""
     attempt: int = 0
+    child_run_id: str | None = None
+    reused_from: str | None = None
+    execution_state: str = ""
     start_time: float = 0.0
     end_time: float = 0.0
 
@@ -74,6 +78,11 @@ class Task:
         self.status = TaskStatus.SKIPPED
         self.end_time = time.time()
 
+    def mark_cancelled(self, error: str = "cancelled") -> None:
+        self.status = TaskStatus.CANCELLED
+        self.error = error
+        self.end_time = time.time()
+
     def is_executable(self, all_tasks: dict[str, Task]) -> bool:
         if self.status != TaskStatus.PENDING:
             return False
@@ -93,6 +102,9 @@ class Task:
             "result": self.result,
             "error": self.error,
             "attempt": self.attempt,
+            "child_run_id": self.child_run_id,
+            "reused_from": self.reused_from,
+            "execution_state": self.execution_state,
             "start_time": self.start_time,
             "end_time": self.end_time,
         }
@@ -109,6 +121,9 @@ class Task:
             result=str(data.get("result") or ""),
             error=str(data.get("error") or ""),
             attempt=int(data.get("attempt") or 0),
+            child_run_id=_optional_string(data.get("child_run_id")),
+            reused_from=_optional_string(data.get("reused_from")),
+            execution_state=str(data.get("execution_state") or ""),
             start_time=float(data.get("start_time") or 0.0),
             end_time=float(data.get("end_time") or 0.0),
         )
@@ -250,7 +265,9 @@ class ExecutionPlan:
         return all(task.status == TaskStatus.COMPLETED for task in self.tasks.values())
 
     def has_failed(self) -> bool:
-        return any(task.status == TaskStatus.FAILED for task in self.tasks.values())
+        return any(
+            task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED} for task in self.tasks.values()
+        )
 
     def mark_started(self) -> None:
         self.status = PlanStatus.RUNNING
@@ -305,13 +322,13 @@ class ExecutionPlan:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ExecutionPlan:
         schema_version = int(data.get("schema_version") or 0)
-        if schema_version != PLAN_SCHEMA_VERSION:
+        if schema_version not in {1, PLAN_SCHEMA_VERSION}:
             raise ValueError(f"unsupported plan schema version: {schema_version}")
         plan = cls(
             id=str(data["id"]),
             goal=str(data.get("goal") or ""),
             status=PlanStatus(str(data.get("status") or PlanStatus.CREATED.value)),
-            schema_version=schema_version,
+            schema_version=PLAN_SCHEMA_VERSION,
             version=int(data.get("version") or 1),
             replan_count=int(data.get("replan_count") or 0),
             summary=str(data.get("summary") or ""),
@@ -323,7 +340,19 @@ class ExecutionPlan:
         if isinstance(raw_tasks, list):
             for item in raw_tasks:
                 if isinstance(item, dict):
-                    plan.add_task(Task.from_dict(item))
+                    task = Task.from_dict(item)
+                    if schema_version == 1 and task.status == TaskStatus.RUNNING:
+                        # Schema v1 executed the active task inside the Parent Run. There is no
+                        # durable Child identity to recover, so restart that in-flight logical
+                        # attempt under the v2 Child-Run contract. Persisted completed work is
+                        # preserved unchanged.
+                        task.status = TaskStatus.PENDING
+                        task.attempt = max(0, task.attempt - 1)
+                        task.start_time = 0.0
+                        task.end_time = 0.0
+                        task.result = ""
+                        task.error = ""
+                    plan.add_task(task)
         raw_history = data.get("history")
         if isinstance(raw_history, list):
             plan.history = [
@@ -336,3 +365,7 @@ class ExecutionPlan:
 
 def _strings(value: Any) -> list[str]:
     return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _optional_string(value: Any) -> str | None:
+    return str(value) if value is not None else None

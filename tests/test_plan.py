@@ -76,7 +76,7 @@ def test_plan_execute_runs_independent_tasks_at_durable_boundaries(tmp_path, mon
 
     assert "Completed [task_1]" in result
     assert "Completed [task_2]" in result
-    assert client.peak_concurrency == 1
+    assert client.peak_concurrency == 2
     assert client.starts == ["Task A", "Task B"]
 
 
@@ -158,7 +158,7 @@ def test_plan_execute_runs_dependent_task_after_dependencies_and_injects_results
     text = "".join(str(event.get("text") or "") for event in events)
     done = events[-1]
 
-    assert client.peak_concurrency == 1
+    assert client.peak_concurrency == 2
     assert client.starts[:2] == ["Task A", "Task B"]
     assert client.starts[-1] == "Task C"
     assert set(client.completed_before_c) == {"Task A", "Task B"}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -103,12 +104,28 @@ class PlanExecuteAgent:
                 input=message,
                 history=self.history,
             )
-            while state.status == RunStatus.WAITING_APPROVAL and self.approval_callback:
-                decision = await self._approval_decision(state)
-                state = await runtime.resume(
-                    state.run_id,
+            while self.approval_callback and state.status in {
+                RunStatus.WAITING_APPROVAL,
+                RunStatus.WAITING_CHILD,
+            }:
+                if state.status == RunStatus.WAITING_APPROVAL:
+                    decision = await self._approval_decision(state)
+                    state = await runtime.resume(
+                        state.run_id,
+                        decision="approve" if decision == "approve" else "reject",
+                    )
+                    continue
+                waiting_child = await self._waiting_plan_child(strategy, state)
+                if waiting_child is None:
+                    break
+                decision = await self._approval_decision(waiting_child)
+                await strategy.resume_waiting_child(
+                    runtime,
+                    state,
+                    child_run_id=waiting_child.run_id,
                     decision="approve" if decision == "approve" else "reject",
                 )
+                state = await runtime.resume(state.run_id)
         except Exception as exc:  # noqa: BLE001 - streaming facade boundary
             yield {"type": "error", "error": exc}
             return
@@ -128,6 +145,19 @@ class PlanExecuteAgent:
                 "run_id": state.run_id,
                 "interrupt": state.interrupt.to_dict() if state.interrupt else None,
             }
+        elif state.status == RunStatus.WAITING_CHILD:
+            plan = strategy._load_plan(state)
+            child_run_ids = (
+                [task.child_run_id for task in plan.all_tasks() if task.child_run_id]
+                if plan
+                else []
+            )
+            yield {
+                "type": "interrupt",
+                "run_id": state.run_id,
+                "child_run_ids": child_run_ids,
+                "status": state.status.value,
+            }
         elif state.status == RunStatus.FAILED:
             yield {
                 "type": "error",
@@ -142,11 +172,12 @@ class PlanExecuteAgent:
                 Message(role="user", content=message),
                 Message(role="assistant", content=state.output_text),
             ]
+        total_turns = await self._total_plan_turns(strategy, state)
         yield {
             "type": "done",
             "run_id": state.run_id,
             "status": state.status.value,
-            "total_turns": state.agent_turn,
+            "total_turns": total_turns,
             "total_tokens": state.total_tokens,
             "messages": self.history,
         }
@@ -164,6 +195,37 @@ class PlanExecuteAgent:
         if inspect.isawaitable(result):
             result = await result
         return "approve" if str(result).lower() == "approve" else "reject"
+
+    async def _waiting_plan_child(self, strategy, parent: Checkpoint) -> Checkpoint | None:
+        from axiom.runtime.models import RunStatus
+
+        plan = strategy._load_plan(parent)
+        if plan is None:
+            return None
+        for task in plan.all_tasks():
+            if not task.child_run_id:
+                continue
+            child = await self.checkpoint_store.load(task.child_run_id)
+            if child is not None and child.status == RunStatus.WAITING_APPROVAL:
+                return child
+        return None
+
+    async def _total_plan_turns(self, strategy, parent: Checkpoint) -> int:
+        plan = strategy._load_plan(parent)
+        if plan is None:
+            return parent.agent_turn
+        child_ids = {
+            task.child_run_id
+            for task in [
+                *plan.all_tasks(),
+                *(task for revision in plan.history for task in revision.tasks),
+            ]
+            if task.child_run_id
+        }
+        children = await asyncio.gather(
+            *(self.checkpoint_store.load(child_run_id) for child_run_id in child_ids)
+        )
+        return parent.agent_turn + sum(child.agent_turn for child in children if child is not None)
 
     def _system_prompt(self) -> str:
         from axiom.prompt import PromptAssembler

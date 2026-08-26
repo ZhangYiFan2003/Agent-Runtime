@@ -1,173 +1,160 @@
 # Durable Plan-Execute
 
-Axiom implements Plan-Execute as an execution strategy hosted by the same
-`DurableAgentRuntime` used by ReAct. It is not a second Runtime implementation.
+Axiom hosts Plan-Execute in `DurableAgentRuntime`; it is an execution strategy, not a second
+Runtime. Planning, replan, DAG join, and finalize remain durable Parent Run transitions. Each
+tool-capable Plan task executes as an independent durable React Child Run.
 
 ```text
-DurableAgentRuntime
-├── Run lifecycle and Run lock
-├── CheckpointStore
-├── ToolExecution and retry
-├── PermissionPolicy and durable approval
-├── ExecutionBackend
-├── Trace / Span / Event
-└── RuntimeExecutionStrategy
-    ├── ReactExecutionStrategy
-    └── PlanExecuteStrategy
+Parent Plan Run
+├── plan.create
+├── Plan Task A Child Run ─┐
+├── Plan Task B Child Run ─┤ bounded parallel wave
+├── plan.join              ┘
+├── optional plan.replan
+└── finalize
 ```
 
-## Lifecycle
-
-```text
-Run started
-↓
-plan.create
-↓ checkpoint: plan.created
-plan.step.started
-↓ LLM / Tool loop
-↓ checkpoint after every LLM and Tool boundary
-plan.step.completed or plan.step.failed
-↓ checkpoint
-optional plan.replan
-↓ checkpoint
-plan.completed or plan.failed
-↓ terminal Run checkpoint
-```
-
-Planning that crashes before `plan.created` is persisted may be repeated. Once the Plan checkpoint
-exists, recovery loads it and does not call the Planner again.
+Parent and Child Runs share `thread_id` and `turn_id`. Each Child has its own `run_id`,
+`parent_run_id`, stable `parent_step_id`, `run_kind="plan_task"`, checkpoint, messages, trace, and
+React execution state.
 
 ## State model
 
-The generic Checkpoint records `execution_strategy="plan_execute"` and a JSON-compatible
-`strategy_state`. The active Plan contains:
+The Parent checkpoint records `execution_strategy="plan_execute"` and a JSON-compatible Plan
+schema version 2:
 
 ```text
-schema_version
-id
-goal
-version
-replan_count
-status
-summary
-tasks[]
-history[]
+Plan
+├── id / goal / version / replan_count / status / summary
+├── tasks[]
+│   ├── id / description / type
+│   ├── dependencies / dependents
+│   ├── status / attempt / execution_state
+│   ├── child_run_id / reused_from
+│   ├── result / error
+│   └── start_time / end_time
+└── history[]: PlanVersion
 ```
 
-Each task records:
+Ready, active, waiting, and terminal sets are derived from persisted Task state and Child Run
+checkpoints. Coroutines, asyncio Tasks, Futures, semaphores, locks, clients, Tool objects, and
+callbacks never enter the checkpoint.
+
+Schema version 1 checkpoints are migrated on load. Completed work is preserved. A version 1 task
+that was in flight without a Child identity is reset to pending and may be replayed because the old
+schema cannot identify an independently durable task attempt.
+
+## Stable identity and durable spawn
+
+A logical task attempt has a deterministic Child identity derived from:
 
 ```text
-id
-description
-type
-dependencies / dependents
-status: PENDING | RUNNING | COMPLETED | FAILED | SKIPPED
-attempt
-result
-error
-start_time / end_time
+parent_run_id + plan_version + task_id + attempt
 ```
 
-Plan history contains explicit `PlanVersion` snapshots. Coroutines, tasks, locks, clients, Tool
-functions, callbacks, and other live Python objects never enter the checkpoint.
+Before any Child starts, the Parent persists the Task status, attempt, and `child_run_id` with
+checkpoint CAS. Starting then uses start-or-find semantics. A crash after identity persistence
+therefore reconnects to the same Child instead of creating a duplicate.
+
+## Bounded DAG scheduling
+
+`plan.max_parallel_tasks` controls local concurrency and defaults to `2`. The environment override
+is `AXIOM_PLAN_MAX_PARALLEL_TASKS`. Setting the limit to `1` preserves sequential semantics.
+
+A pending Task is ready only when every required dependency is `COMPLETED`. Ready Tasks are chosen
+in stable Plan order. Child execution can overlap, but correctness comes from persisted Child Run
+status rather than in-memory Task/Future state.
+
+Slot accounting is:
+
+- `RUNNING` occupies a compute slot.
+- `WAITING_APPROVAL` and `INTERRUPTED` do not occupy a slot.
+- terminal Children do not occupy a slot.
+
+Consequently, one Task waiting for approval does not freeze independent ready Tasks. The Parent may
+remain `WAITING_CHILD` while the scheduler continues reconciling runnable work.
+
+## Concurrent completion
+
+Child terminal observation updates the Parent by `task_id`:
+
+```text
+load latest Parent checkpoint
+→ apply idempotent Task transition
+→ checkpoint CAS
+→ on conflict, reload and re-apply
+```
+
+Observing an already terminal Task is a no-op, so simultaneous Child completions cannot overwrite
+one another. The Parent stores only each Task's result/error and references. Child message histories
+remain isolated and are never interleaved back into the Parent conversation.
 
 ## Durable boundaries and recovery
 
-- **Plan creation:** the generated Plan is saved before any Plan task starts.
-- **Task start:** status, attempt, current task identity, task message offset, and turn offset are
-  saved before the worker LLM loop starts.
-- **LLM completion:** messages, token usage, pending Tool calls, and task completion marker are saved.
-- **Tool completion:** the normal ToolExecution record is saved before the Tool result is applied to
-  the Plan checkpoint.
-- **Task completion/failure:** output or error and the active Plan snapshot are saved.
-- **Replan:** the old Plan becomes a history revision and the new active version is saved before it
-  executes.
-- **Interrupt:** `WAITING_APPROVAL`, invocation identity, and Plan worker state share one checkpoint.
+- The generated Plan is saved before scheduling.
+- Stable Child identities are saved before Child start.
+- Child LLM and Tool boundaries use normal React checkpoints and ToolExecution records.
+- Waiting, terminal Task observation, dependency skips, join, replan, and Parent terminal state are
+  checkpointed.
+- A completed ToolExecution is reused after recovery rather than repeated.
+- An abandoned `RUNNING` Child follows the existing Runtime recovery policy; no replacement Child is
+  generated.
 
-Completed tasks are not selected again after recovery. If a ToolExecution is already `SUCCEEDED`
-but the Plan checkpoint still contains the pending call, the normal durable Tool path reuses the
-stored result and completes the state transition without repeating the Tool.
+An LLM stream is not token-resumable. A crash before its completion checkpoint can repeat that LLM
+call, while completed Tool boundaries remain durable.
 
-An LLM stream itself is not resumable. A crash before an LLM completion checkpoint repeats that LLM
-call; no completed Tool boundary is lost by doing so.
+## Replan barrier and completed-work reuse
 
-## Stable Tool invocation identity
+Plan versions never execute speculatively together. When a v1 failure requires replan, the scheduler
+stops launching new v1 Tasks and waits for the already active wave, including unresolved approvals,
+to become terminal. It then checkpoints the v1 boundary, archives v1, creates and persists v2, and
+only then permits v2 Children to start.
 
-Plan Tool call IDs are scoped by active Plan version, task ID, and durable Agent turn:
+Exact normalized task-description matches can reuse completed v1 work. The v2 Task records
+`reused_from` and the prior Child/result provenance; the old Child terminal history is not changed.
+Semantic equivalence is not inferred.
 
-```text
-plan_v{version}:{task_id}:turn_{turn}:{provider_call_id}
-```
+## Permission, approval, and isolation
 
-The normal Runtime then prefixes this with `run_id` for `invocation_id`. This prevents providers that
-reuse Tool call IDs across Plan tasks from colliding in the ToolExecution store. Pending Tool calls
-are checkpointed, so restart uses the same identity.
-
-## Replan semantics
-
-Plan v1 is not overwritten. On replan:
-
-1. v1 is appended to `history` with the failure reason and full task states;
-2. the new Plan becomes v2;
-3. `replan_count` increments;
-4. exactly matching completed task descriptions are reused rather than executed again;
-5. earlier completed outputs remain available as context to v2 tasks.
-
-v1 uses one automatic replan by default. Tool retry remains the shared Runtime Tool retry policy;
-Plan task attempts and Tool attempts are separate counters.
-
-## Permission and execution isolation
-
-Plan workers call the same internal durable LLM/Tool transitions as ReAct:
+Every Plan Child uses the shared React path:
 
 ```text
-Plan Step
-↓
 ToolExecution lookup
-↓
-PermissionPolicy
-↓
-ALLOW / DENY / WAITING_APPROVAL
-↓
-ExecutionBackend
+→ PermissionPolicy
+→ ALLOW / DENY / WAITING_APPROVAL
+→ ExecutionBackend
 ```
 
-Approval is bound to the same stable invocation ID. A restart while waiting resumes the current
-Plan task. Shell calls continue through `RestrictedExecutionBackend`, including environment
-filtering, timeout, bounded output, workspace cwd, and process cleanup.
+Approval is bound to the Child invocation. Multiple Plan Children can wait independently, Parent
+`pending_interrupts[]` identifies the exact Child, and approving one does not resume another. Hard
+DENY cannot be converted into approval. Shell calls continue through `RestrictedExecutionBackend`
+with environment filtering, timeout, bounded output, workspace cwd, and process cleanup.
 
-## Observability
+## Observability and Evaluation
 
-Plan execution uses the existing Run trace and Event pipeline:
+The Parent emits the existing `plan.*` lifecycle events, including scheduled, started, waiting,
+completed, failed, cancelled, replan, join/waiting, and terminal transitions. Child Runs keep linked
+traces with `parent_run_id`, `parent_step_id`, Plan version, and Task metadata. Runtime API
+`children[]` and aggregated `pending_interrupts[]` work unchanged for Plan Parents.
 
-```text
-plan.created
-plan.step.started
-plan.step.completed
-plan.step.failed
-plan.replanned
-plan.completed
-plan.failed
-plan.cancelled
-```
-
-`plan.create`, `plan.replan`, and `plan.step` are Agent spans. Planner LLM spans are children of the
-planning/replan span. Worker `agent.step` spans are children of the Plan step, with LLM, Tool,
-Permission, checkpoint, and interrupt descendants below them.
+Evaluation aggregates Parent metrics plus de-duplicated active/history Plan Child metrics. This
+includes tokens, Tool calls, steps, latency inputs, and terminal status without copying full traces
+into evaluation artifacts.
 
 ## Cancellation
 
-A persisted cancelled Run does not schedule another Plan task. Runtime cancellation also marks the
-active Plan `CANCELLED`. Cancellation of an active asyncio Tool task continues to use ExecutionBackend
-process cleanup. The threaded HTTP cancellation endpoint still cannot inject cancellation into an
-already running coroutine in another thread.
+Cancelling the Parent stops new scheduling, cancels all non-terminal Plan Children (including those
+waiting for approval), marks pending work cancelled, and prevents replan/finalize. Cancelling one
+Child does not directly cancel siblings; dependency/replan semantics determine the Parent outcome.
+Repeated cancellation remains idempotent.
 
 ## Current limitations
 
-- Plan tasks execute sequentially at durable boundaries; parallel DAG scheduling is deferred.
-- There is no distributed scheduler or distributed Run lock.
-- LLM streams resume from their previous durable boundary, not from an individual token.
-- Plan schema version 1 is strict and has no migration framework yet.
-- Automatic replan uses exact normalized task descriptions to recognize completed work; semantic
-  equivalence is not inferred.
-- Multi-Agent orchestration has not yet converged on this strategy contract.
+- Scheduling is local and bounded; there is no distributed DAG scheduler or cross-process worker
+  supervisor.
+- Existing `RUNNING` Child recovery follows the Runtime's client-recovery semantics.
+- There is no speculative overlap across Plan versions.
+- LLM streams resume from a durable boundary, not an individual token.
+- Schema v1 migration cannot recover a stable identity for an already in-flight legacy task.
+- Completed-work reuse is exact-description based, not semantic.
+- This remains a Plan strategy, not a generic workflow engine.

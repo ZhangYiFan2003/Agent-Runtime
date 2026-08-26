@@ -32,7 +32,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Memory | Stores typed conversation, summary, fact/preference, and tool-result digest records with scoped SQLite persistence, Runtime thread history recovery, Map-Reduce summary checkpoints, conservative fact/preference extraction, conflict supersession, and budgeted context assembly. | Tested |
 | Snapshots | Creates, restores, lists, and cleans workspace snapshots under an isolated home in tests. | Tested |
 | Skills | Loads built-in, user, and project `SKILL.md` files and supports skill context injection. | Tested |
-| Plan-Execute | Runs serialized versioned Plans as a durable Runtime strategy, with per-step checkpoints, recovery, replan history, stable Tool invocations, approval, isolation, and trace hierarchy. | SQLite recovery and strategy convergence tested |
+| Plan-Execute | Runs versioned DAGs as bounded parallel durable React Child Runs, with stable identity, dependency joins, CAS-safe observation, approval, isolation, recovery, and replan barriers. | Sequential/parallel compatibility and SQLite recovery tested |
 | Multi-Agent | Runs bounded parallel durable React Child Runs with stable identity, dependency scheduling, approval/recovery, linked traces, and serialized reviewer transitions. | Runtime convergence and parallel recovery tested |
 | MCP Client | Discovers and calls tools from local stdio MCP servers in tests. | Tested |
 | MCP Server | Exposes built-in tools through handler-level JSON-RPC requests. | Handler tested |
@@ -134,7 +134,8 @@ Plan-Execute now runs as a strategy inside `DurableAgentRuntime`. Plan creation,
 Tool calls, approval interrupts, replans, and completion share the existing Checkpoint,
 ToolExecution, Permission, Restricted Execution, Trace, and Evaluation contracts. See
 [`docs/plan-durable-execution.md`](docs/plan-durable-execution.md) for recovery boundaries and the
-versioned Plan state model.
+versioned Plan state model. Tool-capable Tasks are stable React Child Runs scheduled with bounded
+DAG parallelism via `plan.max_parallel_tasks`; waiting approvals release compute slots.
 
 ### Durable Multi-Agent
 
@@ -238,7 +239,7 @@ uv run pytest
 Current baseline:
 
 ```text
-221 tests passing
+305 tests passing
 ```
 
 The default tests use fake LLM clients, temporary directories, temporary SQLite databases, deterministic code-search fixtures, and localhost-safe HTTP paths. They do not require API keys and do not call external model providers.

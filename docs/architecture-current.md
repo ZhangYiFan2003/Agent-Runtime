@@ -109,8 +109,9 @@ flowchart TD
     max turn limit is reached.
 - `src/axiom/agent/plan_execute.py`
   - Provides the Plan-and-Execute compatibility facade. The planner creates a
-    DAG and `PlanExecuteStrategy` advances it sequentially at durable boundaries
-    inside `DurableAgentRuntime`.
+    versioned DAG; `PlanExecuteStrategy` schedules tool-capable Tasks as bounded parallel durable
+    React Child Runs and performs planning, joins, replan barriers, and finalize as Parent
+    transitions inside `DurableAgentRuntime`.
 - `src/axiom/agent/orchestrator.py`
   - Provides the Multi-Agent compatibility facade over `MultiAgentExecutionStrategy`.
   - Planner and Reviewer remain serialized Parent steps; independent tool-capable Workers run as
@@ -481,10 +482,10 @@ MCP server expansion points:
 - Runtime API persistence is local SQLite and bound to localhost; it is not a
   distributed service, public deployment validation, load-tested API, or
   distributed queue.
-- The durable Runtime covers ReAct, Plan-Execute, and bounded local Multi-Agent scheduling.
-  Multi-Agent Parent state and tool-capable Worker Child Runs are checkpointed with stable
-  Parent/Child lineage and CAS-safe completion reconciliation. There is no distributed lock,
-  distributed scheduler, or checkpoint compaction yet.
+- The durable Runtime covers ReAct plus bounded local Plan DAG and Multi-Agent scheduling.
+  Plan Tasks and tool-capable Multi-Agent Workers use stable React Child Runs; Parent state is
+  checkpointed with stable lineage and CAS-safe terminal reconciliation. There is no distributed
+  lock, distributed scheduler, cross-process worker supervisor, or checkpoint compaction yet.
 - Runtime tool records provide best-effort deduplication after a persisted
   success, not exactly-once semantics for arbitrary external side effects.
 - Observability is local and unsampled. There is no distributed trace context,

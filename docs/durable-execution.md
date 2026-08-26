@@ -114,9 +114,9 @@ external system must enforce the key for end-to-end deduplication.
 
 ## Scope limits
 
-The current durable loop covers the default Runtime API ReAct `QueryEngine`. Custom engine
-factories keep their legacy execution path and receive terminal Run records, but their internal
-steps cannot be recovered unless they adopt the durable interface. Plan-Execute and multi-agent
-internal DAG/worker state remain in-memory in this release. Distributed scheduling, distributed
-locks, automatic recovery scanning, checkpoint compaction, and exactly-once external effects are
-not implemented.
+The durable Runtime covers ReAct, Plan-Execute, and Multi-Agent strategies. Plan Tasks and
+tool-capable Workers execute as independently checkpointed React Child Runs under bounded local
+schedulers; Parent orchestration state, dependencies, approvals, and terminal observation are
+persisted. Custom engine factories that do not adopt this contract still cannot recover internal
+steps. Distributed scheduling/locking, a cross-process worker supervisor, checkpoint compaction,
+and exactly-once arbitrary external effects are not implemented.

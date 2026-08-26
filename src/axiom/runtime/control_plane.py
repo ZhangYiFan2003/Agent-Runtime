@@ -415,7 +415,7 @@ def recovery_action(state: Checkpoint, children: list[Checkpoint]) -> str | None
     if state.status == RunStatus.RUNNING:
         return "client_resume"
     if state.status == RunStatus.WAITING_CHILD:
-        if state.execution_strategy == "multi_agent":
+        if state.execution_strategy in {"multi_agent", "plan_execute"}:
             return "reconcile_parent"
         return (
             "resume_parent"
