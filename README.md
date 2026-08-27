@@ -307,6 +307,13 @@ Format code:
 uv run ruff format .
 ```
 
+## Evaluation Evidence
+
+Reproducible evidence suites are maintained under `benchmarks/` for
+repository-grounded Code Intelligence retrieval, real-provider Agent Runtime
+fixed tasks, and deterministic durable recovery fault injection. Detailed
+metric definitions, results, and limitations stay with each benchmark artifact.
+
 ## Repository Layout
 
 ```text

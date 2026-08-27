@@ -24,12 +24,25 @@ def extract_symbols(
     chunks: list[CodeChunk],
 ) -> SymbolExtraction:
     if language == "python":
-        return _extract_python(file_path, language, source, chunks)
-    if language == "java":
-        return _extract_java(file_path, language, source, chunks)
-    if language in {"javascript", "typescript"}:
-        return _extract_jsts(file_path, language, source, chunks)
-    return SymbolExtraction([], [], [])
+        extracted = _extract_python(file_path, language, source, chunks)
+    elif language == "java":
+        extracted = _extract_java(file_path, language, source, chunks)
+    elif language in {"javascript", "typescript"}:
+        extracted = _extract_jsts(file_path, language, source, chunks)
+    else:
+        return SymbolExtraction([], [], [])
+    # Repository-scale extraction can observe the same stable entity more than
+    # once (for example repeated nested definitions or nested calls on one
+    # source line). Collapse identical stable IDs before SQLite uniqueness
+    # boundaries while preserving extraction order.
+    extracted.definitions = list(
+        {definition.id: definition for definition in extracted.definitions}.values()
+    )
+    extracted.imports = list({binding.id: binding for binding in extracted.imports}.values())
+    extracted.references = list(
+        {reference.id: reference for reference in extracted.references}.values()
+    )
+    return extracted
 
 
 def stable_symbol_id(
@@ -136,7 +149,9 @@ def _extract_java(
                     module_name,
                     "*" if wildcard else module_name.rsplit(".", 1)[-1],
                     "*" if wildcard else module_name.rsplit(".", 1)[-1],
-                    "static_wildcard" if wildcard and imported.group(1) else "wildcard"
+                    "static_wildcard"
+                    if wildcard and imported.group(1)
+                    else "wildcard"
                     if wildcard
                     else "static"
                     if imported.group(1)

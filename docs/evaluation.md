@@ -151,3 +151,15 @@ failures because a single model call's latency is not statistically stable.
 - No web dashboard, leaderboard, evaluation database, or historical result service.
 - Plan/Multi-Agent internal spans remain coarse, so their evaluation metrics are less detailed than
   the durable ReAct path.
+
+## Evidence benchmarks
+
+The maintained evidence pack lives under `benchmarks/`: repository-grounded
+Code Intelligence retrieval, 40 read-only Agent Runtime fixed tasks, and
+deterministic durable recovery fault injection.
+
+Offline hash embeddings are pipeline fixtures, not production semantic models.
+Fake LLM results are execution-correctness evidence, not Task Success Rate.
+Real-provider runs must identify the exact provider/model and may vary. Recovery
+metrics come from deterministic crash hooks and separate recovered outcomes
+from expected-safe ambiguous outcomes.

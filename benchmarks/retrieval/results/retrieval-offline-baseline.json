@@ -1,0 +1,204 @@
+{
+  "benchmark": "axiom-repository-retrieval",
+  "benchmark_type": "offline deterministic fixture",
+  "dataset": {
+    "categories": {
+      "API endpoint implementation": 5,
+      "MCP integration": 5,
+      "Multi-Agent scheduler": 5,
+      "Plan scheduler": 7,
+      "callee query": 3,
+      "caller query": 3,
+      "checkpoint/recovery path": 8,
+      "code intelligence": 9,
+      "configuration location": 1,
+      "cross-file reference query": 5,
+      "evaluation": 4,
+      "memory path": 6,
+      "observability path": 4,
+      "permission/security path": 9,
+      "runtime lifecycle": 4,
+      "tool execution": 2
+    },
+    "name": "axiom-repository-retrieval",
+    "query_count": 80,
+    "query_types": {
+      "graph/context-oriented": 20,
+      "lexical-oriented": 20,
+      "semantic/paraphrase-oriented": 20,
+      "symbol-oriented": 20
+    },
+    "version": "1.0.0"
+  },
+  "environment": {
+    "git_commit": "2516518260894f350aa4e3df9ed937ff2d382d0f",
+    "platform": "Windows-11-10.0.22621-SP0",
+    "python": "3.12.13",
+    "timestamp": "2026-08-26T02:40:56.046967+00:00",
+    "working_tree_dirty": true
+  },
+  "graph_aware_context": {
+    "case_hit_rate": 0.7,
+    "relevant_target_coverage": 0.4417,
+    "scope": "bounded context coverage; not ranked retrieval Recall"
+  },
+  "index": {
+    "chunks": 1366,
+    "embedded_chunks": 1266,
+    "failed_files": 0,
+    "indexed_files": 101,
+    "scanned_files": 101
+  },
+  "limitations": [
+    "Dataset is repository-specific and ground truth is maintained against this source tree.",
+    "The deterministic hash embedding is not a production semantic embedding model.",
+    "Vector scan is local and exhaustive; this is accuracy evidence, not a latency benchmark.",
+    "Graph-aware values are context coverage metrics and are not reported as Recall."
+  ],
+  "metric_definitions": {
+    "context_case_hit_rate": "fraction of graph cases with any target in bounded context",
+    "context_target_coverage": "mean fraction of graph-case targets in bounded context",
+    "mrr_at_5": "mean reciprocal rank of first relevant target, truncated at rank 5",
+    "recall_at_k": "fraction of queries with at least one relevant target in top K",
+    "relevant_coverage_at_5": "mean fraction of all relevant targets present in top 5"
+  },
+  "modes": {
+    "hybrid": {
+      "all": {
+        "mrr_at_5": 0.4646,
+        "recall_at_1": 0.425,
+        "recall_at_3": 0.5125,
+        "recall_at_5": 0.5125,
+        "relevant_coverage_at_5": 0.4833,
+        "top_1_accuracy": 0.425
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.2,
+          "recall_at_1": 0.15,
+          "recall_at_3": 0.25,
+          "recall_at_5": 0.25,
+          "relevant_coverage_at_5": 0.1333,
+          "top_1_accuracy": 0.15
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 0.7083,
+          "recall_at_1": 0.6,
+          "recall_at_3": 0.85,
+          "recall_at_5": 0.85,
+          "relevant_coverage_at_5": 0.85,
+          "top_1_accuracy": 0.6
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.0,
+          "recall_at_1": 0.0,
+          "recall_at_3": 0.0,
+          "recall_at_5": 0.0,
+          "relevant_coverage_at_5": 0.0,
+          "top_1_accuracy": 0.0
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.95,
+          "recall_at_1": 0.95,
+          "recall_at_3": 0.95,
+          "recall_at_5": 0.95,
+          "relevant_coverage_at_5": 0.95,
+          "top_1_accuracy": 0.95
+        }
+      }
+    },
+    "lexical": {
+      "all": {
+        "mrr_at_5": 0.4077,
+        "recall_at_1": 0.375,
+        "recall_at_3": 0.4375,
+        "recall_at_5": 0.4625,
+        "relevant_coverage_at_5": 0.4625,
+        "top_1_accuracy": 0.375
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.0,
+          "recall_at_1": 0.0,
+          "recall_at_3": 0.0,
+          "recall_at_5": 0.0,
+          "relevant_coverage_at_5": 0.0,
+          "top_1_accuracy": 0.0
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 0.7333,
+          "recall_at_1": 0.65,
+          "recall_at_3": 0.85,
+          "recall_at_5": 0.85,
+          "relevant_coverage_at_5": 0.85,
+          "top_1_accuracy": 0.65
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.0,
+          "recall_at_1": 0.0,
+          "recall_at_3": 0.0,
+          "recall_at_5": 0.0,
+          "relevant_coverage_at_5": 0.0,
+          "top_1_accuracy": 0.0
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.8975,
+          "recall_at_1": 0.85,
+          "recall_at_3": 0.9,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.85
+        }
+      }
+    },
+    "vector": {
+      "all": {
+        "mrr_at_5": 0.2435,
+        "recall_at_1": 0.1375,
+        "recall_at_3": 0.3625,
+        "recall_at_5": 0.425,
+        "relevant_coverage_at_5": 0.3604,
+        "top_1_accuracy": 0.1375
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.4375,
+          "recall_at_1": 0.25,
+          "recall_at_3": 0.65,
+          "recall_at_5": 0.7,
+          "relevant_coverage_at_5": 0.4667,
+          "top_1_accuracy": 0.25
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 0.2667,
+          "recall_at_1": 0.15,
+          "recall_at_3": 0.4,
+          "recall_at_5": 0.5,
+          "relevant_coverage_at_5": 0.475,
+          "top_1_accuracy": 0.15
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.0417,
+          "recall_at_1": 0.0,
+          "recall_at_3": 0.1,
+          "recall_at_5": 0.1,
+          "relevant_coverage_at_5": 0.1,
+          "top_1_accuracy": 0.0
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.2283,
+          "recall_at_1": 0.15,
+          "recall_at_3": 0.3,
+          "recall_at_5": 0.4,
+          "relevant_coverage_at_5": 0.4,
+          "top_1_accuracy": 0.15
+        }
+      }
+    }
+  },
+  "real_embedding_benchmark": {
+    "reason": "offline baseline intentionally uses a deterministic token/character hash fixture",
+    "status": "not executed"
+  },
+  "schema_version": 1
+}

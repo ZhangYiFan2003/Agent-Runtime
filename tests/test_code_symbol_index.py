@@ -123,6 +123,46 @@ def test_symbol_ids_are_stable_and_not_chunk_ids() -> None:
     assert ref_a != ref_b
 
 
+def test_duplicate_nested_call_references_do_not_break_index_update(tmp_path: Path) -> None:
+    project = tmp_path / "duplicate-reference-project"
+    project.mkdir()
+    (project / "calls.py").write_text(
+        'def lookup(call):\n    return call.get("function", {}).get("name")\n',
+        encoding="utf-8",
+    )
+    index = CodeIndex(project, db_path=tmp_path / "duplicate-reference.sqlite3")
+
+    stats = index.update()
+    references = index.store.list_symbol_references()
+
+    assert stats.failed_files == 0
+    assert len({reference.id for reference in references}) == len(references)
+
+
+def test_duplicate_stable_definition_ids_do_not_break_index_update(tmp_path: Path) -> None:
+    project = tmp_path / "duplicate-definition-project"
+    project.mkdir()
+    (project / "nested.py").write_text(
+        "def outer_a():\n"
+        "    def same_name():\n"
+        "        return 'a'\n"
+        "    return same_name()\n"
+        "\n"
+        "def outer_b():\n"
+        "    def same_name():\n"
+        "        return 'b'\n"
+        "    return same_name()\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(project, db_path=tmp_path / "duplicate-definition.sqlite3")
+
+    stats = index.update()
+    definitions = index.store.list_symbol_definitions()
+
+    assert stats.failed_files == 0
+    assert len({definition.id for definition in definitions}) == len(definitions)
+
+
 def test_symbol_extraction_and_resolution_across_languages(tmp_path: Path) -> None:
     project = copy_fixture(tmp_path)
     index = CodeIndex(project, db_path=tmp_path / "index.sqlite3")
@@ -196,8 +236,7 @@ def test_incremental_symbol_update_delete_and_resolution_recovery(tmp_path: Path
     renamed = index.update()
     assert renamed.parsed_files == 1
     assert any(
-        ref.resolution_status == "unresolved"
-        for ref in index.find_references("load_settings")
+        ref.resolution_status == "unresolved" for ref in index.find_references("load_settings")
     )
 
     utils.write_text(original_utils, encoding="utf-8")

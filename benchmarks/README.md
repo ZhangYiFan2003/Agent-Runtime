@@ -81,3 +81,18 @@ uv run axiom eval run benchmarks/datasets/agent-core.json `
 ```
 
 See `docs/evaluation.md` for scorer semantics and regression comparison.
+
+## Evaluation Evidence Pack
+
+Three maintained evidence suites keep different claims separate:
+
+- `retrieval/`: 80 repository-grounded queries across lexical, deterministic
+  vector, hybrid RRF, and separately reported graph-context coverage.
+- `agent-runtime/`: 40 read-only fixed tasks. A real provider is required before
+  reporting Task Success Rate.
+- `recovery/`: 21 deterministic fault scenarios with two repetitions by
+  default. No provider is required.
+
+Committed artifacts are evidence snapshots, not CI performance thresholds.
+Synthetic Tool concurrency remains `ToolExecutor.execute_all` only and is not
+Agent end-to-end latency evidence.
