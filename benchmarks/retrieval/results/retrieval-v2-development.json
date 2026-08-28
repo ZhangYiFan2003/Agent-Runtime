@@ -1,0 +1,423 @@
+{
+  "benchmark": "axiom-repository-retrieval-v2",
+  "benchmark_type": "offline deterministic fixture",
+  "candidate_recall": {
+    "v1_lexical_vector": {
+      "candidate_recall_at_20": 0.85,
+      "candidate_recall_at_50": 0.9
+    },
+    "v2_lexical_vector_symbol": {
+      "candidate_recall_at_20": 0.95,
+      "candidate_recall_at_50": 1.0
+    }
+  },
+  "comparison": {
+    "hybrid_v1_to_v2": {
+      "mrr_at_5": {
+        "absolute_delta": 0.2867,
+        "after": 0.725,
+        "before": 0.4383,
+        "relative_delta": 0.6541
+      },
+      "recall_at_1": {
+        "absolute_delta": 0.325,
+        "after": 0.675,
+        "before": 0.35,
+        "relative_delta": 0.9286
+      },
+      "recall_at_3": {
+        "absolute_delta": 0.225,
+        "after": 0.775,
+        "before": 0.55,
+        "relative_delta": 0.4091
+      },
+      "recall_at_5": {
+        "absolute_delta": 0.2,
+        "after": 0.775,
+        "before": 0.575,
+        "relative_delta": 0.3478
+      }
+    },
+    "lexical_v1_to_v2": {
+      "mrr_at_5": {
+        "absolute_delta": 0.2675,
+        "after": 0.61,
+        "before": 0.3425,
+        "relative_delta": 0.781
+      },
+      "recall_at_1": {
+        "absolute_delta": 0.225,
+        "after": 0.525,
+        "before": 0.3,
+        "relative_delta": 0.75
+      },
+      "recall_at_3": {
+        "absolute_delta": 0.3,
+        "after": 0.675,
+        "before": 0.375,
+        "relative_delta": 0.8
+      },
+      "recall_at_5": {
+        "absolute_delta": 0.325,
+        "after": 0.725,
+        "before": 0.4,
+        "relative_delta": 0.8125
+      }
+    }
+  },
+  "dataset": {
+    "categories": {
+      "API endpoint implementation": 2,
+      "MCP integration": 1,
+      "callee query": 2,
+      "caller query": 2,
+      "checkpoint/recovery path": 1,
+      "code intelligence": 12,
+      "configuration location": 3,
+      "cross-file reference query": 1,
+      "evaluation": 6,
+      "memory path": 4,
+      "permission/security path": 2,
+      "restricted execution": 3,
+      "tool execution": 1
+    },
+    "name": "axiom-repository-retrieval-development",
+    "query_count": 40,
+    "query_types": {
+      "graph/context-oriented": 10,
+      "lexical-oriented": 10,
+      "semantic/paraphrase-oriented": 10,
+      "symbol-oriented": 10
+    },
+    "role": "development",
+    "sha256": "c04a85b01e54749ead9c2e38da30dd4b31233bfbbc1300a4673a6cc9f97555d6",
+    "version": "2.0.0-dev.1"
+  },
+  "environment": {
+    "git_commit": "542952444ca2d9c40a865c828481a2bcf1809251",
+    "platform": "Windows-11-10.0.22621-SP0",
+    "python": "3.12.13",
+    "timestamp": "2026-08-28T07:02:20.350614+00:00",
+    "working_tree_dirty": true
+  },
+  "frozen_v2_configuration": {
+    "candidate_limit_per_source": 200,
+    "lexical_weight": 0.4,
+    "symbol_weight": 0.5,
+    "vector_weight": 0.1,
+    "weight_selection": "development split only"
+  },
+  "graph_aware_context_v2": {
+    "case_hit_rate": 1.0,
+    "relevant_target_coverage": 0.95,
+    "scope": "bounded context coverage; not ranked retrieval Recall"
+  },
+  "index": {
+    "chunks": 1380,
+    "embedded_chunks": 1279,
+    "failed_files": 0,
+    "indexed_files": 102,
+    "scanned_files": 102
+  },
+  "latency_ms": {
+    "hybrid_v1": {
+      "p50": 146.3369,
+      "p95": 172.8171,
+      "samples": 120
+    },
+    "hybrid_v2": {
+      "p50": 197.8937,
+      "p95": 256.8444,
+      "samples": 120
+    },
+    "lexical_v1": {
+      "p50": 2.0317,
+      "p95": 3.4236,
+      "samples": 120
+    }
+  },
+  "limitations": [
+    "Repository-specific maintained ground truth.",
+    "Deterministic hash embeddings test pipeline behavior, not semantic model quality.",
+    "Local latency is a reproducible benchmark sample, not a production SLO.",
+    "No LLM-as-a-judge is used."
+  ],
+  "metric_definitions": {
+    "candidate_recall_at_k": "fraction of queries hit by any source's top K candidates",
+    "graph_context": "bounded context coverage, not ranked retrieval Recall",
+    "latency": "warm local retrieval calls at result limit 5; milliseconds",
+    "mrr_at_5": "mean reciprocal rank of first relevant target, truncated at rank 5",
+    "recall_at_k": "fraction of queries with at least one relevant target in top K"
+  },
+  "modes": {
+    "hybrid_v1": {
+      "all": {
+        "mrr_at_5": 0.4383,
+        "recall_at_1": 0.35,
+        "recall_at_3": 0.55,
+        "recall_at_5": 0.575,
+        "relevant_coverage_at_5": 0.5125,
+        "top_1_accuracy": 0.35
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.2667,
+          "recall_at_1": 0.1,
+          "recall_at_3": 0.5,
+          "recall_at_5": 0.5,
+          "relevant_coverage_at_5": 0.25,
+          "top_1_accuracy": 0.1
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 0.8533,
+          "recall_at_1": 0.8,
+          "recall_at_3": 0.9,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.8
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.1,
+          "recall_at_1": 0.1,
+          "recall_at_3": 0.1,
+          "recall_at_5": 0.1,
+          "relevant_coverage_at_5": 0.1,
+          "top_1_accuracy": 0.1
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.5333,
+          "recall_at_1": 0.4,
+          "recall_at_3": 0.7,
+          "recall_at_5": 0.7,
+          "relevant_coverage_at_5": 0.7,
+          "top_1_accuracy": 0.4
+        }
+      }
+    },
+    "hybrid_v2": {
+      "all": {
+        "mrr_at_5": 0.725,
+        "recall_at_1": 0.675,
+        "recall_at_3": 0.775,
+        "recall_at_5": 0.775,
+        "relevant_coverage_at_5": 0.7625,
+        "top_1_accuracy": 0.675
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.95,
+          "recall_at_1": 0.9,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 0.95,
+          "top_1_accuracy": 0.9
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 1.0,
+          "recall_at_1": 1.0,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 1.0
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.1,
+          "recall_at_1": 0.1,
+          "recall_at_3": 0.1,
+          "recall_at_5": 0.1,
+          "relevant_coverage_at_5": 0.1,
+          "top_1_accuracy": 0.1
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.85,
+          "recall_at_1": 0.7,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.7
+        }
+      }
+    },
+    "lexical_v1": {
+      "all": {
+        "mrr_at_5": 0.3425,
+        "recall_at_1": 0.3,
+        "recall_at_3": 0.375,
+        "recall_at_5": 0.4,
+        "relevant_coverage_at_5": 0.4,
+        "top_1_accuracy": 0.3
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.0,
+          "recall_at_1": 0.0,
+          "recall_at_3": 0.0,
+          "recall_at_5": 0.0,
+          "relevant_coverage_at_5": 0.0,
+          "top_1_accuracy": 0.0
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 0.9,
+          "recall_at_1": 0.9,
+          "recall_at_3": 0.9,
+          "recall_at_5": 0.9,
+          "relevant_coverage_at_5": 0.9,
+          "top_1_accuracy": 0.9
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.0,
+          "recall_at_1": 0.0,
+          "recall_at_3": 0.0,
+          "recall_at_5": 0.0,
+          "relevant_coverage_at_5": 0.0,
+          "top_1_accuracy": 0.0
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.47,
+          "recall_at_1": 0.3,
+          "recall_at_3": 0.6,
+          "recall_at_5": 0.7,
+          "relevant_coverage_at_5": 0.7,
+          "top_1_accuracy": 0.3
+        }
+      }
+    },
+    "lexical_v2": {
+      "all": {
+        "mrr_at_5": 0.61,
+        "recall_at_1": 0.525,
+        "recall_at_3": 0.675,
+        "recall_at_5": 0.725,
+        "relevant_coverage_at_5": 0.7125,
+        "top_1_accuracy": 0.525
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.75,
+          "recall_at_1": 0.7,
+          "recall_at_3": 0.8,
+          "recall_at_5": 0.8,
+          "relevant_coverage_at_5": 0.75,
+          "top_1_accuracy": 0.7
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 1.0,
+          "recall_at_1": 1.0,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 1.0
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.34,
+          "recall_at_1": 0.2,
+          "recall_at_3": 0.4,
+          "recall_at_5": 0.6,
+          "relevant_coverage_at_5": 0.6,
+          "top_1_accuracy": 0.2
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.35,
+          "recall_at_1": 0.2,
+          "recall_at_3": 0.5,
+          "recall_at_5": 0.5,
+          "relevant_coverage_at_5": 0.5,
+          "top_1_accuracy": 0.2
+        }
+      }
+    },
+    "symbol": {
+      "all": {
+        "mrr_at_5": 0.7312,
+        "recall_at_1": 0.725,
+        "recall_at_3": 0.725,
+        "recall_at_5": 0.75,
+        "relevant_coverage_at_5": 0.725,
+        "top_1_accuracy": 0.725
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.925,
+          "recall_at_1": 0.9,
+          "recall_at_3": 0.9,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 0.9,
+          "top_1_accuracy": 0.9
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 1.0,
+          "recall_at_1": 1.0,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 1.0
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.0,
+          "recall_at_1": 0.0,
+          "recall_at_3": 0.0,
+          "recall_at_5": 0.0,
+          "relevant_coverage_at_5": 0.0,
+          "top_1_accuracy": 0.0
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 1.0,
+          "recall_at_1": 1.0,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 1.0
+        }
+      }
+    },
+    "vector_deterministic": {
+      "all": {
+        "mrr_at_5": 0.4467,
+        "recall_at_1": 0.325,
+        "recall_at_3": 0.525,
+        "recall_at_5": 0.65,
+        "relevant_coverage_at_5": 0.575,
+        "top_1_accuracy": 0.325
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.575,
+          "recall_at_1": 0.4,
+          "recall_at_3": 0.6,
+          "recall_at_5": 0.9,
+          "relevant_coverage_at_5": 0.6,
+          "top_1_accuracy": 0.4
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 0.5417,
+          "recall_at_1": 0.3,
+          "recall_at_3": 0.8,
+          "recall_at_5": 0.9,
+          "relevant_coverage_at_5": 0.9,
+          "top_1_accuracy": 0.3
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.3,
+          "recall_at_1": 0.3,
+          "recall_at_3": 0.3,
+          "recall_at_5": 0.3,
+          "relevant_coverage_at_5": 0.3,
+          "top_1_accuracy": 0.3
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.37,
+          "recall_at_1": 0.3,
+          "recall_at_3": 0.4,
+          "recall_at_5": 0.5,
+          "relevant_coverage_at_5": 0.5,
+          "top_1_accuracy": 0.3
+        }
+      }
+    }
+  },
+  "real_embedding_benchmark": {
+    "reason": "provider credential unavailable; no ignored secret configuration was read",
+    "status": "not executed"
+  },
+  "schema_version": 2
+}

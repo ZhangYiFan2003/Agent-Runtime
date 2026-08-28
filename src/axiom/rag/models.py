@@ -139,9 +139,11 @@ class CodeSearchResult:
     matched_fields: tuple[str, ...] = ()
     lexical_score: float | None = None
     vector_score: float | None = None
+    symbol_score: float | None = None
     fusion_score: float | None = None
     lexical_rank: int | None = None
     vector_rank: int | None = None
+    symbol_rank: int | None = None
     embedding_profile: str | None = None
 
 

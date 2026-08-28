@@ -35,11 +35,7 @@ def split_identifier(value: str) -> list[str]:
         normalized_part = normalize_text(part)
         tokens.append(normalized_part)
         camel_parts = CAMEL_BOUNDARY_RE.split(part)
-        if (
-            len(camel_parts) > 1
-            and len(camel_parts[0]) == 1
-            and camel_parts[1][1:].islower()
-        ):
+        if len(camel_parts) > 1 and len(camel_parts[0]) == 1 and camel_parts[1][1:].islower():
             camel_parts = [camel_parts[0] + camel_parts[1], *camel_parts[2:]]
         for camel_part in camel_parts:
             for number_part in LETTER_NUMBER_BOUNDARY_RE.split(camel_part):
@@ -66,6 +62,22 @@ def tokenize_query(value: str | None) -> list[str]:
     return tokenize_code_text(value)
 
 
+def compact_identifier(value: str | None) -> str:
+    """Normalize qualified, snake_case, and camelCase identifiers for matching."""
+    return "".join(character for character in normalize_text(value) if character.isalnum())
+
+
+def identifier_forms(value: str | None) -> set[str]:
+    """Return whole-query and component forms without repository-specific aliases."""
+    if not value:
+        return set()
+    forms = {compact_identifier(value)}
+    for part in re.split(r"[\s./\\:]+", value):
+        if part:
+            forms.add(compact_identifier(part))
+    return {form for form in forms if form}
+
+
 def build_lexical_text(chunk: CodeChunk) -> str:
     fields = [
         chunk.content,
@@ -85,6 +97,11 @@ def build_lexical_text(chunk: CodeChunk) -> str:
 def fts_match_query(tokens: Iterable[str]) -> str:
     quoted = [_quote_fts_token(token) for token in tokens if token.strip()]
     return " AND ".join(quoted)
+
+
+def fts_any_query(tokens: Iterable[str]) -> str:
+    quoted = [_quote_fts_token(token) for token in tokens if token.strip()]
+    return " OR ".join(quoted)
 
 
 def _quote_fts_token(token: str) -> str:

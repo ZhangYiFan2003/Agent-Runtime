@@ -418,6 +418,57 @@ def test_rrf_uses_ranks_not_raw_score_addition() -> None:
     assert all(result.fusion_score is not None and result.fusion_score < 1 for result in results)
 
 
+def test_three_source_rrf_fuses_symbol_candidates_without_duplicates() -> None:
+    lexical_rows = [_row("a", "Alpha", bm25_score=1.0)]
+    vector_rows = [_row("b", "Beta", vector_score=0.9)]
+    symbol_rows = [
+        {**_row("a", "Alpha"), "symbol_score": 120.0},
+        {**_row("c", "Gamma"), "symbol_score": 110.0},
+    ]
+
+    results = reciprocal_rank_fusion(
+        lexical_rows,
+        vector_rows,
+        "Alpha",
+        5,
+        weights=FusionWeights(lexical=0.3, vector=0.2, symbol=0.5),
+        symbol_rows=symbol_rows,
+    )
+
+    assert [result.symbol_name for result in results].count("Alpha") == 1
+    assert {result.symbol_name for result in results} == {"Alpha", "Beta", "Gamma"}
+    assert next(result for result in results if result.symbol_name == "Alpha").symbol_rank == 1
+
+
+def test_symbol_source_supports_exact_and_normalized_identifiers(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    index = CodeIndex(project, db_path=tmp_path / "symbols.sqlite3")
+    index.update()
+
+    exact = index.search("HttpClient", limit=3, mode="symbol")
+    snake = index.search("http_client", limit=3, mode="symbol")
+    camel = index.search("httpClient", limit=3, mode="symbol")
+
+    assert exact[0].symbol_name == "HttpClient"
+    assert snake[0].symbol_name == "HttpClient"
+    assert camel[0].symbol_name == "HttpClient"
+    assert "exact_symbol" in exact[0].matched_fields
+    fused = index.search("http_client", limit=3, mode="hybrid_v2")
+    assert fused[0].symbol_name == "HttpClient"
+    assert fused[0].backend == "hybrid-v2"
+
+
+def test_lexical_v2_keeps_exact_symbol_ahead_of_content_only_matches(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    index = CodeIndex(project, db_path=tmp_path / "field-priority.sqlite3")
+    index.update()
+
+    results = index.search("load_user_config", limit=5, mode="lexical_v2")
+
+    assert results[0].symbol_name == "load_user_config"
+    assert "exact_symbol" in results[0].matched_fields
+
+
 def test_config_env_and_public_masking() -> None:
     config = load_config(
         env={

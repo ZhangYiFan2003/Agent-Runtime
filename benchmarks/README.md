@@ -96,3 +96,8 @@ Three maintained evidence suites keep different claims separate:
 Committed artifacts are evidence snapshots, not CI performance thresholds.
 Synthetic Tool concurrency remains `ToolExecutor.execute_all` only and is not
 Agent end-to-end latency evidence.
+
+Retrieval v2 keeps that 80-query artifact immutable, adds independent 40-query
+development and 20-query holdout splits, and reports symbol-aware three-source
+RRF, candidate recall, per-category quality, graph coverage, and local latency
+in `retrieval/results/`.

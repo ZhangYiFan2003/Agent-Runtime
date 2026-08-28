@@ -37,6 +37,9 @@ class EmbeddingConfig:
     search_mode: str = "auto"
     lexical_weight: float = 0.55
     vector_weight: float = 0.45
+    v2_lexical_weight: float = 0.40
+    v2_vector_weight: float = 0.10
+    symbol_weight: float = 0.50
     candidate_limit: int = 200
     max_input_chars: int = 12000
 

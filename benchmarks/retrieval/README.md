@@ -28,3 +28,43 @@ retrieved. `MRR@5` uses the first relevant target and is truncated at rank 5.
 Graph-aware context expansion does not produce a comparable ranked retrieval
 list. Its case hit rate and relevant-target coverage are therefore reported in
 a separate context-coverage section, never as Recall.
+
+## Retrieval v2 protocol
+
+The committed 80-query `dataset.json` and `results/retrieval-offline-baseline.*`
+remain the immutable v1 analysis baseline. Retrieval v2 adds:
+
+- `development-dataset.json`: 40 queries, ten per query type, used for the
+  five-configuration fusion-weight check;
+- `holdout-dataset.json`: 20 queries, five per query type, evaluated once only
+  after weights and implementation were frozen;
+- `analysis/v1-failure-analysis.*`: complete Hybrid v1 Top-5 misses and
+  candidate-generation-versus-ranking diagnosis;
+- `results/retrieval-v2-development.*`, `retrieval-v2-holdout.*`, and
+  `retrieval-v1-v2-comparison.*`: generated evidence artifacts.
+
+Run the ordered workflow from the repository root:
+
+```powershell
+uv run python -m benchmarks.retrieval.analyze_v1_failures
+uv run python -m benchmarks.retrieval.tune_v2_weights
+uv run python -m benchmarks.retrieval.evaluate_retrieval_v2
+uv run python -m benchmarks.retrieval.evaluate_retrieval_v2 `
+  --dataset benchmarks/retrieval/holdout-dataset.json `
+  --output benchmarks/retrieval/results/retrieval-v2-holdout.json `
+  --allow-holdout
+uv run python -m benchmarks.retrieval.compare_v1_v2
+```
+
+`hybrid` remains the reproducible lexical/vector v1 mode. `hybrid_v2` is an
+explicit opt-in mode that fuses lexical-v2, deterministic vector, and symbol
+candidates with weighted RRF. `auto` retains its v1 compatibility behavior.
+Symbol matching normalizes case, camel/PascalCase,
+snake_case, qualified identifiers, and path hints without query-specific
+aliases. Lexical v2 retains field-weighted FTS5 ranking and adds a general OR
+candidate fallback when strict AND matching does not fill the pool.
+
+Candidate Recall@K means at least one relevant target occurs in any source's
+Top-K candidates. It diagnoses candidate generation and is not final ranked
+Recall@K. Deterministic vector results remain pipeline regression evidence, not
+production semantic quality.

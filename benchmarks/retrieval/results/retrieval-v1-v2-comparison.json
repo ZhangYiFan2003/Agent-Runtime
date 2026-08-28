@@ -1,0 +1,214 @@
+{
+  "candidate_recall": {
+    "v1": {
+      "candidate_recall_at_20": 0.775,
+      "candidate_recall_at_50": 0.8
+    },
+    "v2": {
+      "candidate_recall_at_20": 0.9375,
+      "candidate_recall_at_50": 0.975
+    }
+  },
+  "commits": {
+    "v1_artifact_recorded_source": "2516518260894f350aa4e3df9ed937ff2d382d0f",
+    "v1_evidence_pack_commit": "542952444ca2d9c40a865c828481a2bcf1809251",
+    "v2_worktree_dirty": true,
+    "v2_worktree_head": "542952444ca2d9c40a865c828481a2bcf1809251"
+  },
+  "comparison": "committed-v1-to-frozen-v2",
+  "dataset": {
+    "query_count": 80,
+    "v2_sha256": "2f44e4100e680cf8ae70c3ff75fb81f682d2b6e21ba63754c588bf727b0a7928",
+    "version": "1.0.0"
+  },
+  "graph_context": {
+    "v1": {
+      "case_hit_rate": 0.7,
+      "relevant_target_coverage": 0.4417,
+      "scope": "bounded context coverage; not ranked retrieval Recall"
+    },
+    "v2": {
+      "case_hit_rate": 1.0,
+      "relevant_target_coverage": 0.6583,
+      "scope": "bounded context coverage; not ranked retrieval Recall"
+    }
+  },
+  "hybrid_by_query_type": {
+    "graph/context-oriented": {
+      "mrr_at_5": {
+        "absolute_delta": 0.65,
+        "relative_delta": 3.25,
+        "v1": 0.2,
+        "v2": 0.85
+      },
+      "recall_at_1": {
+        "absolute_delta": 0.55,
+        "relative_delta": 3.6667,
+        "v1": 0.15,
+        "v2": 0.7
+      },
+      "recall_at_3": {
+        "absolute_delta": 0.75,
+        "relative_delta": 3.0,
+        "v1": 0.25,
+        "v2": 1.0
+      },
+      "recall_at_5": {
+        "absolute_delta": 0.75,
+        "relative_delta": 3.0,
+        "v1": 0.25,
+        "v2": 1.0
+      }
+    },
+    "lexical-oriented": {
+      "mrr_at_5": {
+        "absolute_delta": 0.0667,
+        "relative_delta": 0.0942,
+        "v1": 0.7083,
+        "v2": 0.775
+      },
+      "recall_at_1": {
+        "absolute_delta": 0.15,
+        "relative_delta": 0.25,
+        "v1": 0.6,
+        "v2": 0.75
+      },
+      "recall_at_3": {
+        "absolute_delta": -0.05,
+        "relative_delta": -0.0588,
+        "v1": 0.85,
+        "v2": 0.8
+      },
+      "recall_at_5": {
+        "absolute_delta": -0.05,
+        "relative_delta": -0.0588,
+        "v1": 0.85,
+        "v2": 0.8
+      }
+    },
+    "semantic/paraphrase-oriented": {
+      "mrr_at_5": {
+        "absolute_delta": 0.1183,
+        "relative_delta": null,
+        "v1": 0.0,
+        "v2": 0.1183
+      },
+      "recall_at_1": {
+        "absolute_delta": 0.05,
+        "relative_delta": null,
+        "v1": 0.0,
+        "v2": 0.05
+      },
+      "recall_at_3": {
+        "absolute_delta": 0.2,
+        "relative_delta": null,
+        "v1": 0.0,
+        "v2": 0.2
+      },
+      "recall_at_5": {
+        "absolute_delta": 0.25,
+        "relative_delta": null,
+        "v1": 0.0,
+        "v2": 0.25
+      }
+    },
+    "symbol-oriented": {
+      "mrr_at_5": {
+        "absolute_delta": 0.05,
+        "relative_delta": 0.0526,
+        "v1": 0.95,
+        "v2": 1.0
+      },
+      "recall_at_1": {
+        "absolute_delta": 0.05,
+        "relative_delta": 0.0526,
+        "v1": 0.95,
+        "v2": 1.0
+      },
+      "recall_at_3": {
+        "absolute_delta": 0.05,
+        "relative_delta": 0.0526,
+        "v1": 0.95,
+        "v2": 1.0
+      },
+      "recall_at_5": {
+        "absolute_delta": 0.05,
+        "relative_delta": 0.0526,
+        "v1": 0.95,
+        "v2": 1.0
+      }
+    }
+  },
+  "integrity": {
+    "note": "v1 values are read from the committed immutable artifact; no result values are edited",
+    "v1_source": "benchmarks/retrieval/results/retrieval-offline-baseline.json",
+    "v2_source": "benchmarks/retrieval/results/retrieval-v2-v1-analysis.json"
+  },
+  "overall": {
+    "hybrid": {
+      "mrr_at_5": {
+        "absolute_delta": 0.2212,
+        "relative_delta": 0.4761,
+        "v1": 0.4646,
+        "v2": 0.6858
+      },
+      "recall_at_1": {
+        "absolute_delta": 0.2,
+        "relative_delta": 0.4706,
+        "v1": 0.425,
+        "v2": 0.625
+      },
+      "recall_at_3": {
+        "absolute_delta": 0.2375,
+        "relative_delta": 0.4634,
+        "v1": 0.5125,
+        "v2": 0.75
+      },
+      "recall_at_5": {
+        "absolute_delta": 0.25,
+        "relative_delta": 0.4878,
+        "v1": 0.5125,
+        "v2": 0.7625
+      }
+    },
+    "lexical": {
+      "mrr_at_5": {
+        "absolute_delta": 0.1921,
+        "relative_delta": 0.4712,
+        "v1": 0.4077,
+        "v2": 0.5998
+      },
+      "recall_at_1": {
+        "absolute_delta": 0.1375,
+        "relative_delta": 0.3667,
+        "v1": 0.375,
+        "v2": 0.5125
+      },
+      "recall_at_3": {
+        "absolute_delta": 0.25,
+        "relative_delta": 0.5714,
+        "v1": 0.4375,
+        "v2": 0.6875
+      },
+      "recall_at_5": {
+        "absolute_delta": 0.2625,
+        "relative_delta": 0.5676,
+        "v1": 0.4625,
+        "v2": 0.725
+      }
+    }
+  },
+  "same_v2_corpus_latency_ms": {
+    "hybrid_v1": {
+      "p50": 158.7101,
+      "p95": 194.415,
+      "samples": 240
+    },
+    "hybrid_v2": {
+      "p50": 204.3882,
+      "p95": 242.8995,
+      "samples": 240
+    }
+  },
+  "schema_version": 1
+}

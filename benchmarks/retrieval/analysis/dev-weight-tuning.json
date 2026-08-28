@@ -1,0 +1,313 @@
+{
+  "analysis": "retrieval-v2-development-weight-selection",
+  "dataset": {
+    "case_count": 40,
+    "name": "axiom-repository-retrieval-development",
+    "version": "2.0.0-dev.1"
+  },
+  "environment": {
+    "git_commit": "542952444ca2d9c40a865c828481a2bcf1809251",
+    "python": "3.12.13",
+    "timestamp": "2026-08-28T07:01:02.437494+00:00"
+  },
+  "holdout_used": false,
+  "schema_version": 1,
+  "search_space": "five predeclared three-source RRF weight triples; no black-box search",
+  "selected": {
+    "all": {
+      "mrr_at_5": 0.725,
+      "recall_at_1": 0.675,
+      "recall_at_3": 0.775,
+      "recall_at_5": 0.775,
+      "relevant_coverage_at_5": 0.7625,
+      "top_1_accuracy": 0.675
+    },
+    "by_query_type": {
+      "graph/context-oriented": {
+        "mrr_at_5": 0.95,
+        "recall_at_1": 0.9,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "relevant_coverage_at_5": 0.95,
+        "top_1_accuracy": 0.9
+      },
+      "lexical-oriented": {
+        "mrr_at_5": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "relevant_coverage_at_5": 1.0,
+        "top_1_accuracy": 1.0
+      },
+      "semantic/paraphrase-oriented": {
+        "mrr_at_5": 0.1,
+        "recall_at_1": 0.1,
+        "recall_at_3": 0.1,
+        "recall_at_5": 0.1,
+        "relevant_coverage_at_5": 0.1,
+        "top_1_accuracy": 0.1
+      },
+      "symbol-oriented": {
+        "mrr_at_5": 0.85,
+        "recall_at_1": 0.7,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "relevant_coverage_at_5": 1.0,
+        "top_1_accuracy": 0.7
+      }
+    },
+    "weights": {
+      "lexical": 0.4,
+      "symbol": 0.5,
+      "vector": 0.1
+    }
+  },
+  "selection_rule": "maximize dev Recall@5, then MRR@5, then Recall@1",
+  "trials": [
+    {
+      "all": {
+        "mrr_at_5": 0.7125,
+        "recall_at_1": 0.65,
+        "recall_at_3": 0.775,
+        "recall_at_5": 0.775,
+        "relevant_coverage_at_5": 0.7625,
+        "top_1_accuracy": 0.65
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.95,
+          "recall_at_1": 0.9,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 0.95,
+          "top_1_accuracy": 0.9
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 1.0,
+          "recall_at_1": 1.0,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 1.0
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.1,
+          "recall_at_1": 0.1,
+          "recall_at_3": 0.1,
+          "recall_at_5": 0.1,
+          "relevant_coverage_at_5": 0.1,
+          "top_1_accuracy": 0.1
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.8,
+          "recall_at_1": 0.6,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.6
+        }
+      },
+      "weights": {
+        "lexical": 0.4,
+        "symbol": 0.4,
+        "vector": 0.2
+      }
+    },
+    {
+      "all": {
+        "mrr_at_5": 0.6875,
+        "recall_at_1": 0.6,
+        "recall_at_3": 0.775,
+        "recall_at_5": 0.775,
+        "relevant_coverage_at_5": 0.75,
+        "top_1_accuracy": 0.6
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.9,
+          "recall_at_1": 0.8,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 0.9,
+          "top_1_accuracy": 0.8
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 0.95,
+          "recall_at_1": 0.9,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.9
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.1,
+          "recall_at_1": 0.1,
+          "recall_at_3": 0.1,
+          "recall_at_5": 0.1,
+          "relevant_coverage_at_5": 0.1,
+          "top_1_accuracy": 0.1
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.8,
+          "recall_at_1": 0.6,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.6
+        }
+      },
+      "weights": {
+        "lexical": 0.3,
+        "symbol": 0.5,
+        "vector": 0.2
+      }
+    },
+    {
+      "all": {
+        "mrr_at_5": 0.725,
+        "recall_at_1": 0.675,
+        "recall_at_3": 0.775,
+        "recall_at_5": 0.775,
+        "relevant_coverage_at_5": 0.7625,
+        "top_1_accuracy": 0.675
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.95,
+          "recall_at_1": 0.9,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 0.95,
+          "top_1_accuracy": 0.9
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 1.0,
+          "recall_at_1": 1.0,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 1.0
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.1,
+          "recall_at_1": 0.1,
+          "recall_at_3": 0.1,
+          "recall_at_5": 0.1,
+          "relevant_coverage_at_5": 0.1,
+          "top_1_accuracy": 0.1
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.85,
+          "recall_at_1": 0.7,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.7
+        }
+      },
+      "weights": {
+        "lexical": 0.4,
+        "symbol": 0.5,
+        "vector": 0.1
+      }
+    },
+    {
+      "all": {
+        "mrr_at_5": 0.725,
+        "recall_at_1": 0.675,
+        "recall_at_3": 0.775,
+        "recall_at_5": 0.775,
+        "relevant_coverage_at_5": 0.7625,
+        "top_1_accuracy": 0.675
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.95,
+          "recall_at_1": 0.9,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 0.95,
+          "top_1_accuracy": 0.9
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 1.0,
+          "recall_at_1": 1.0,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 1.0
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.1,
+          "recall_at_1": 0.1,
+          "recall_at_3": 0.1,
+          "recall_at_5": 0.1,
+          "relevant_coverage_at_5": 0.1,
+          "top_1_accuracy": 0.1
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.85,
+          "recall_at_1": 0.7,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.7
+        }
+      },
+      "weights": {
+        "lexical": 0.5,
+        "symbol": 0.4,
+        "vector": 0.1
+      }
+    },
+    {
+      "all": {
+        "mrr_at_5": 0.7125,
+        "recall_at_1": 0.65,
+        "recall_at_3": 0.775,
+        "recall_at_5": 0.775,
+        "relevant_coverage_at_5": 0.7625,
+        "top_1_accuracy": 0.65
+      },
+      "by_query_type": {
+        "graph/context-oriented": {
+          "mrr_at_5": 0.95,
+          "recall_at_1": 0.9,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 0.95,
+          "top_1_accuracy": 0.9
+        },
+        "lexical-oriented": {
+          "mrr_at_5": 1.0,
+          "recall_at_1": 1.0,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 1.0
+        },
+        "semantic/paraphrase-oriented": {
+          "mrr_at_5": 0.1,
+          "recall_at_1": 0.1,
+          "recall_at_3": 0.1,
+          "recall_at_5": 0.1,
+          "relevant_coverage_at_5": 0.1,
+          "top_1_accuracy": 0.1
+        },
+        "symbol-oriented": {
+          "mrr_at_5": 0.8,
+          "recall_at_1": 0.6,
+          "recall_at_3": 1.0,
+          "recall_at_5": 1.0,
+          "relevant_coverage_at_5": 1.0,
+          "top_1_accuracy": 0.6
+        }
+      },
+      "weights": {
+        "lexical": 0.35,
+        "symbol": 0.5,
+        "vector": 0.15
+      }
+    }
+  ]
+}

@@ -26,11 +26,12 @@ from axiom.rag.embeddings import (
     infer_dimensions,
     is_embedding_eligible,
 )
-from axiom.rag.hybrid import FusionWeights, reciprocal_rank_fusion, vector_results
+from axiom.rag.hybrid import FusionWeights, reciprocal_rank_fusion, symbol_results, vector_results
 from axiom.rag.languages import SKIP_DIRS, detect_language, is_indexable
 from axiom.rag.models import (
     CallEdge,
     CallPathResult,
+    CodeChunk,
     CodeContextResult,
     CodeSearchResult,
     IndexedFile,
@@ -41,8 +42,9 @@ from axiom.rag.models import (
 )
 from axiom.rag.ranking import rank_rows
 from axiom.rag.store import CodeIndexStore
+from axiom.rag.symbol_search import rank_symbol_candidates
 from axiom.rag.symbols.resolver import resolve_import_paths, resolve_references
-from axiom.rag.tokenizer import fts_match_query, tokenize_code_text, tokenize_query
+from axiom.rag.tokenizer import fts_any_query, fts_match_query, tokenize_code_text, tokenize_query
 from axiom.rag.vectors import encode_vector, normalize_vector
 
 
@@ -64,6 +66,7 @@ class CodeIndex:
         self.embedding_provider = embedding_provider
         self.search_config = search_config or EmbeddingConfig()
         self._embedding_profile: EmbeddingProfile | None = None
+        self._symbol_candidate_data: tuple[list[SymbolDefinition], list[CodeChunk]] | None = None
 
     def rebuild(self, path: str | Path | None = None) -> int:
         self.last_stats = self.update(path, force=True)
@@ -71,6 +74,7 @@ class CodeIndex:
 
     def update(self, path: str | Path | None = None, *, force: bool = False) -> IndexStats:
         started = time.perf_counter()
+        self._symbol_candidate_data = None
         base = self._resolve(path or self.root)
         files = [base] if base.is_file() else list(self._iter_files(base))
         scanned_paths = {self._relative(file_path) for file_path in files}
@@ -194,10 +198,16 @@ class CodeIndex:
         selected_mode = self._resolve_search_mode(mode)
         if selected_mode == "lexical":
             return self._search_lexical(query, limit)
+        if selected_mode == "lexical_v2":
+            return self._search_lexical_v2(query, limit)
         if selected_mode == "vector":
             return self._search_vector(query, limit)
         if selected_mode == "hybrid":
             return self._search_hybrid(query, limit)
+        if selected_mode == "symbol":
+            return self._search_symbol(query, limit)
+        if selected_mode == "hybrid_v2":
+            return self._search_hybrid_v2(query, limit)
         return self._search_auto(query, limit)
 
     def build_code_context(
@@ -328,9 +338,19 @@ class CodeIndex:
         rows = self._lexical_rows(query, limit=self.search_config.candidate_limit)
         return rank_rows(rows, query, limit)
 
+    def _search_lexical_v2(self, query: str, limit: int) -> list[CodeSearchResult]:
+        rows = self._lexical_rows_v2(query, limit=self.search_config.candidate_limit)
+        return rank_rows(rows, query, limit)
+
     def _search_vector(self, query: str, limit: int) -> list[CodeSearchResult]:
         rows = self._vector_rows(query, limit=self.search_config.candidate_limit)
         return vector_results(rows, query, limit)
+
+    def _search_symbol(self, query: str, limit: int) -> list[CodeSearchResult]:
+        return symbol_results(
+            self._symbol_rows(query, limit=self.search_config.candidate_limit),
+            limit,
+        )
 
     def _search_hybrid(self, query: str, limit: int) -> list[CodeSearchResult]:
         try:
@@ -352,6 +372,29 @@ class CodeIndex:
             backend=backend,
         )
 
+    def _search_hybrid_v2(self, query: str, limit: int) -> list[CodeSearchResult]:
+        try:
+            vector_rows = self._vector_rows(query, limit=self.search_config.candidate_limit)
+        except EmbeddingError:
+            vector_rows = []
+        lexical_rows = self._lexical_rows_v2(query, limit=self.search_config.candidate_limit)
+        symbol_rows = self._symbol_rows(query, limit=self.search_config.candidate_limit)
+        lexical_backend = lexical_rows[0]["backend"] if lexical_rows else "fts5"
+        backend = "hybrid-v2-like-fallback" if lexical_backend == "like-fallback" else "hybrid-v2"
+        return reciprocal_rank_fusion(
+            lexical_rows,
+            vector_rows,
+            query,
+            limit,
+            weights=FusionWeights(
+                lexical=self.search_config.v2_lexical_weight,
+                vector=self.search_config.v2_vector_weight,
+                symbol=self.search_config.symbol_weight,
+            ),
+            backend=backend,
+            symbol_rows=symbol_rows,
+        )
+
     def _lexical_rows(self, query: str, *, limit: int) -> list[dict[str, object]]:
         tokens = tokenize_query(query)
         if not tokens:
@@ -367,6 +410,17 @@ class CodeIndex:
             rows = self._fallback_rows(tokens)
         return rows
 
+    def _lexical_rows_v2(self, query: str, *, limit: int) -> list[dict[str, object]]:
+        tokens = tokenize_query(query)
+        rows = self._lexical_rows(query, limit=limit)
+        if not tokens or len(rows) >= limit or len(tokens) == 1 or not self.store.has_fts5():
+            return rows
+        try:
+            relaxed = self.store.search_fts(fts_any_query(tokens), limit=limit)
+        except sqlite3.DatabaseError:
+            return rows
+        return _dedupe_rows([*rows, *relaxed])[:limit]
+
     def _vector_rows(self, query: str, *, limit: int) -> list[dict[str, object]]:
         provider = self.embedding_provider
         if provider is None:
@@ -376,6 +430,39 @@ class CodeIndex:
             raise EmbeddingError("embedding profile is not available")
         query_vector = normalize_vector(provider.embed([query])[0])
         return self.store.search_vectors(query_vector, profile=profile, limit=limit)
+
+    def _symbol_rows(self, query: str, *, limit: int) -> list[dict[str, object]]:
+        if self._symbol_candidate_data is None:
+            self._symbol_candidate_data = (
+                self.store.list_symbol_definitions(),
+                self.store.list_chunks(),
+            )
+        definitions, chunks = self._symbol_candidate_data
+        candidates = rank_symbol_candidates(
+            query,
+            definitions,
+            chunks,
+            limit=limit,
+        )
+        return [
+            {
+                "chunk_id": candidate.chunk.id,
+                "file_path": candidate.chunk.file_path,
+                "start_line": candidate.chunk.start_line,
+                "end_line": candidate.chunk.end_line,
+                "content": candidate.chunk.content,
+                "content_hash": candidate.chunk.content_hash,
+                "chunk_type": candidate.chunk.chunk_type,
+                "symbol_name": candidate.definition.name,
+                "qualified_name": candidate.definition.qualified_name,
+                "parent_symbol": candidate.chunk.parent_symbol,
+                "is_fallback": candidate.chunk.is_fallback,
+                "symbol_score": candidate.score,
+                "symbol_matched_fields": candidate.matched_fields,
+                "backend": "symbol",
+            }
+            for candidate in candidates
+        ]
 
     def _iter_files(self, base: Path):
         for path in base.rglob("*"):
@@ -485,7 +572,15 @@ class CodeIndex:
 
     def _resolve_search_mode(self, mode: str) -> str:
         configured = mode if mode != "auto" else self.search_config.search_mode
-        if configured not in {"auto", "lexical", "vector", "hybrid"}:
+        if configured not in {
+            "auto",
+            "lexical",
+            "lexical_v2",
+            "vector",
+            "hybrid",
+            "symbol",
+            "hybrid_v2",
+        }:
             return "auto"
         return configured
 
@@ -502,3 +597,14 @@ def _is_relative_to(path: Path, base: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _dedupe_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    seen: set[str] = set()
+    result: list[dict[str, object]] = []
+    for row in rows:
+        chunk_id = str(row.get("chunk_id") or "")
+        if chunk_id and chunk_id not in seen:
+            seen.add(chunk_id)
+            result.append(row)
+    return result

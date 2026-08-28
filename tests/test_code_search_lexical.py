@@ -10,7 +10,9 @@ import pytest
 from axiom.rag import CodeIndex
 from axiom.rag.store import SCHEMA_VERSION, CodeIndexStore, supports_fts5
 from axiom.rag.tokenizer import (
+    compact_identifier,
     fts_match_query,
+    identifier_forms,
     split_identifier,
     tokenize_code_text,
     tokenize_query,
@@ -63,6 +65,14 @@ def test_tokenizer_splits_identifiers_and_chinese() -> None:
 
     deduped = tokenize_query("api api db id")
     assert deduped == ["api", "db", "id"]
+
+
+def test_identifier_normalization_handles_camel_snake_qualified_and_paths() -> None:
+    expected = "sqlitecheckpointstore"
+    assert compact_identifier("SQLiteCheckpointStore") == expected
+    assert compact_identifier("sqlite_checkpoint_store") == expected
+    assert compact_identifier("sqlite/checkpoint-store") == expected
+    assert "runtimeapiserver" in identifier_forms("runtime.api.RuntimeApiServer")
 
 
 def test_fts5_capability_detection() -> None:
@@ -250,14 +260,12 @@ def test_search_ranking_identifier_splitting_chinese_and_dedup(tmp_path: Path) -
     assert len({(item.path, item.qualified_name, item.snippet) for item in limited}) == 2
 
     (project / "other.py").write_text(
-        "def greet():\n"
-        "    return 'other'\n",
+        "def greet():\n    return 'other'\n",
         encoding="utf-8",
     )
     index.update()
     greet_hits = {
-        (Path(result.path).name, result.symbol_name)
-        for result in index.search("greet", limit=10)
+        (Path(result.path).name, result.symbol_name) for result in index.search("greet", limit=10)
     }
     assert ("app.py", "greet") in greet_hits
     assert ("other.py", "greet") in greet_hits

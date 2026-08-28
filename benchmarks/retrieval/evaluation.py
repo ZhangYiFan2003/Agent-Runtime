@@ -159,6 +159,69 @@ def evaluate_rankings(
     }
 
 
+def evaluate_candidate_recall(
+    cases: Sequence[RetrievalCase],
+    candidate_sources: Sequence[dict[str, Sequence[CodeSearchResult]]],
+    *,
+    cutoffs: Sequence[int] = (20, 50),
+) -> dict[str, float]:
+    """Compute query-level candidate hit rate before final ranking."""
+    if any(cutoff <= 0 for cutoff in cutoffs):
+        raise ValueError("candidate recall cutoffs must be positive")
+    if not cases:
+        return {f"candidate_recall_at_{cutoff}": 0.0 for cutoff in cutoffs}
+    return {
+        f"candidate_recall_at_{cutoff}": round(
+            sum(
+                any(
+                    first_relevant_rank(case, source.get(case.id, ())[:cutoff]) is not None
+                    for source in candidate_sources
+                )
+                for case in cases
+            )
+            / len(cases),
+            4,
+        )
+        for cutoff in cutoffs
+    }
+
+
+def evaluate_by_query_type(
+    cases: Sequence[RetrievalCase],
+    rankings: dict[str, Sequence[CodeSearchResult]],
+) -> dict[str, dict[str, float]]:
+    return {
+        query_type: evaluate_rankings(
+            [case for case in cases if case.query_type == query_type],
+            rankings,
+        )
+        for query_type in sorted({case.query_type for case in cases})
+    }
+
+
+def first_relevant_rank(
+    case: RetrievalCase,
+    ranked: Sequence[CodeSearchResult],
+) -> int | None:
+    for rank, result in enumerate(ranked, start=1):
+        if any(result_matches_target(result, target) for target in case.relevant):
+            return rank
+    return None
+
+
+def result_matches_target(result: CodeSearchResult, target: RelevantTarget) -> bool:
+    if result.path != target.path:
+        return False
+    if target.chunk and result.chunk_id != target.chunk:
+        return False
+    if not target.symbol:
+        return True
+    names = {result.symbol_name, result.qualified_name}
+    if target.symbol in names:
+        return True
+    return bool(result.content and target.symbol in result.content)
+
+
 def evaluate_context_coverage(
     cases: Sequence[RetrievalCase],
     contexts: dict[str, Sequence[CodeContextItem]],
@@ -187,6 +250,51 @@ def dataset_distribution(dataset: RetrievalDataset) -> dict[str, dict[str, int]]
         "categories": dict(sorted(Counter(case.category for case in dataset.cases).items())),
         "query_types": dict(sorted(Counter(case.query_type for case in dataset.cases).items())),
     }
+
+
+def validate_dataset_splits(
+    datasets: Sequence[RetrievalDataset],
+    *,
+    expected_query_type_counts: dict[str, int] | None = None,
+) -> None:
+    """Reject leakage and malformed category balance across retrieval splits."""
+    seen_ids: set[str] = set()
+    seen_queries: set[str] = set()
+    for dataset in datasets:
+        for case in dataset.cases:
+            if case.id in seen_ids:
+                raise ValueError(f'retrieval case id appears in multiple splits: "{case.id}"')
+            normalized_query = normalize_query_identity(case.query)
+            if normalized_query in seen_queries:
+                raise ValueError(f'retrieval query appears in multiple splits: "{case.query}"')
+            seen_ids.add(case.id)
+            seen_queries.add(normalized_query)
+        if expected_query_type_counts is not None:
+            counts = Counter(case.query_type for case in dataset.cases)
+            if dict(counts) != expected_query_type_counts:
+                raise ValueError(
+                    f'retrieval split "{dataset.name}" has query-type counts {dict(counts)}; '
+                    f"expected {expected_query_type_counts}"
+                )
+
+
+def normalize_query_identity(query: str) -> str:
+    return " ".join(query.casefold().split())
+
+
+def percentile(values: Sequence[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be between zero and one")
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
 def serialize_report(report: dict[str, Any]) -> str:
@@ -240,23 +348,11 @@ def _parse_target(case_id: str, raw: object, *, root: Path) -> RelevantTarget:
 
 
 def _first_relevant_rank(case: RetrievalCase, ranked: Sequence[CodeSearchResult]) -> int | None:
-    for rank, result in enumerate(ranked, start=1):
-        if any(_result_matches(result, target) for target in case.relevant):
-            return rank
-    return None
+    return first_relevant_rank(case, ranked)
 
 
 def _result_matches(result: CodeSearchResult, target: RelevantTarget) -> bool:
-    if result.path != target.path:
-        return False
-    if target.chunk and result.chunk_id != target.chunk:
-        return False
-    if not target.symbol:
-        return True
-    names = {result.symbol_name, result.qualified_name}
-    if target.symbol in names:
-        return True
-    return bool(result.content and target.symbol in result.content)
+    return result_matches_target(result, target)
 
 
 def _context_matches(item: CodeContextItem, target: RelevantTarget) -> bool:

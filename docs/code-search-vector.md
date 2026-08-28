@@ -45,9 +45,11 @@ Environment variables:
 - `AXIOM_EMBEDDING_BATCH_SIZE`
 - `AXIOM_CODE_SEARCH_MODE`
 
-Search modes are `lexical`, `vector`, `hybrid`, and `auto`. `auto` uses hybrid
-search only when embeddings are enabled, a provider can be created, and the
-current profile has vectors. Otherwise it falls back to lexical search.
+Search modes include the retained `lexical`, `vector`, and `hybrid` v1 modes,
+plus `lexical_v2`, `symbol`, `hybrid_v2`, and `auto`. `hybrid_v2` is opt-in;
+`auto` retains the compatibility behavior of choosing v1 hybrid only when an
+embedding profile is available and otherwise using lexical v1. Explicit v2
+still fuses lexical and symbol candidates when vectors are unavailable.
 
 ## Embedding Input
 
@@ -108,9 +110,17 @@ Vector-only search embeds the query and scans the current profile vectors in
 SQLite using Python cosine similarity. This is an O(N x dimension) scan and is
 intentionally simple for portability.
 
-Hybrid search uses lexical candidates union vector candidates, then Reciprocal
-Rank Fusion, dedupe, and limit. Raw BM25 and cosine values are not added
-directly. RRF combines ranks with configured lexical and vector weights.
+Hybrid v1 uses lexical candidates union vector candidates, then Reciprocal Rank
+Fusion, dedupe, and limit. Hybrid v2 adds an independent symbol-definition
+candidate source and keeps rank fusion; raw BM25, cosine, and symbol scores are
+never added directly. Exact and normalized symbol matching supports case,
+camel/PascalCase, snake_case, qualified names, and module path hints.
+
+Lexical v2 preserves FTS5 field weighting and explainable post-ranking for
+exact symbols, qualified names, paths, and chunk specificity. When a strict
+all-token query does not fill the candidate pool, it adds a general any-token
+candidate pass before the same stable ranking and deduplication. It contains no
+benchmark-query synonym table.
 
 Graph-aware code context uses search results only as seed chunks. It does not
 add raw BM25, cosine, and graph distance scores together. Context ordering is
@@ -166,5 +176,7 @@ search-only seed recall against graph-aware context expansion. See
 - No NumPy or native vector extension dependency.
 - No ANN/vector acceleration.
 - No production semantic accuracy claim.
+- Symbol retrieval is local and definition-backed; dynamic symbols remain out
+  of scope.
 - Full vector scan is acceptable for the current project scale but will need an
   optional acceleration path for larger corpora.

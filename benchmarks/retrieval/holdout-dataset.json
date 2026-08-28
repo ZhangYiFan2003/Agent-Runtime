@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "name": "axiom-repository-retrieval-holdout",
+  "version": "2.0.0-holdout.1",
+  "metadata": {
+    "role": "holdout",
+    "ground_truth": "Maintainer-curated from source definitions and direct references before Retrieval v2 implementation.",
+    "tuning_boundary": "Structure and ground truth may be validated, but retrieval outcomes are evaluated only after configuration freeze."
+  },
+  "cases": [
+    {"id":"holdout_lexical_001","query":"SCHEMA_VERSION schema_metadata migrate_v5_to_v6","relevant":[{"path":"src/axiom/rag/store.py","symbol":"_migrate_v5_to_v6"}],"category":"code intelligence","query_type":"lexical-oriented","notes":"Code index schema migration vocabulary."},
+    {"id":"holdout_lexical_002","query":"QueryResult usage tool_calls content","relevant":[{"path":"src/axiom/types.py","symbol":"QueryResult"}],"category":"runtime lifecycle","query_type":"lexical-oriented","notes":"Agent query result model fields."},
+    {"id":"holdout_lexical_003","query":"SnapshotService restore manifest sha256","relevant":[{"path":"src/axiom/snapshot/service.py","symbol":"SnapshotService"}],"category":"checkpoint/recovery path","query_type":"lexical-oriented","notes":"Workspace snapshot service vocabulary."},
+    {"id":"holdout_lexical_004","query":"McpServerSpec transport command url args","relevant":[{"path":"src/axiom/mcp/config.py","symbol":"McpServerSpec"}],"category":"MCP integration","query_type":"lexical-oriented","notes":"MCP server configuration fields."},
+    {"id":"holdout_lexical_005","query":"RunMetrics latency_ms tool_calls tokens steps","relevant":[{"path":"src/axiom/runtime/observability.py","symbol":"RunMetrics"}],"category":"observability path","query_type":"lexical-oriented","notes":"Run metric schema vocabulary."},
+
+    {"id":"holdout_semantic_001","query":"identify mutually recursive functions as connected call groups","relevant":[{"path":"src/axiom/rag/call_graph.py","symbol":"find_recursive_components"}],"category":"code intelligence","query_type":"semantic/paraphrase-oriented","notes":"Recursive call component behavior."},
+    {"id":"holdout_semantic_002","query":"compose the model system message with project instructions skills and memory","relevant":[{"path":"src/axiom/prompt/assembler.py","symbol":"PromptAssembler"}],"category":"runtime lifecycle","query_type":"semantic/paraphrase-oriented","notes":"Prompt assembly behavior."},
+    {"id":"holdout_semantic_003","query":"queue and cancel durable background agent work","relevant":[{"path":"src/axiom/runtime/tasks.py","symbol":"DurableTaskManager"}],"category":"runtime lifecycle","query_type":"semantic/paraphrase-oriented","notes":"Durable task lifecycle behavior."},
+    {"id":"holdout_semantic_004","query":"discard superseded fact values before adding them to context","relevant":[{"path":"src/axiom/memory/context.py","symbol":"_collapse_fact_overrides"}],"category":"memory path","query_type":"semantic/paraphrase-oriented","notes":"Memory override collapse behavior."},
+    {"id":"holdout_semantic_005","query":"produce a display-safe settings object without provider credentials","relevant":[{"path":"src/axiom/config.py","symbol":"config_to_public_dict"}],"category":"permission/security path","query_type":"semantic/paraphrase-oriented","notes":"Public configuration projection."},
+
+    {"id":"holdout_symbol_001","query":"fusion_weights","relevant":[{"path":"src/axiom/rag/hybrid.py","symbol":"FusionWeights"}],"category":"code intelligence","query_type":"symbol-oriented","notes":"snake_case normalized fusion model."},
+    {"id":"holdout_symbol_002","query":"pathGuard","relevant":[{"path":"src/axiom/policy/path_guard.py","symbol":"PathGuard"}],"category":"permission/security path","query_type":"symbol-oriented","notes":"camelCase normalized path guard."},
+    {"id":"holdout_symbol_003","query":"durable_evaluation_executor","relevant":[{"path":"src/axiom/evaluation/runner.py","symbol":"DurableEvaluationExecutor"}],"category":"evaluation","query_type":"symbol-oriented","notes":"snake_case normalized executor."},
+    {"id":"holdout_symbol_004","query":"runtime.api.thread_event_repository","relevant":[{"path":"src/axiom/runtime/api.py","symbol":"ThreadEventRepository"}],"category":"API endpoint implementation","query_type":"symbol-oriented","notes":"Qualified normalized repository lookup."},
+    {"id":"holdout_symbol_005","query":"embeddingProfile","relevant":[{"path":"src/axiom/rag/embeddings.py","symbol":"EmbeddingProfile"}],"category":"code intelligence","query_type":"symbol-oriented","notes":"camelCase normalized profile lookup."},
+
+    {"id":"holdout_graph_001","query":"CodeContextBuilder expands callers and callees from stored call edges","relevant":[{"path":"src/axiom/rag/context.py","symbol":"CodeContextBuilder"},{"path":"src/axiom/rag/call_graph.py","symbol":"CallGraphBuildResult"}],"category":"code intelligence","query_type":"graph/context-oriented","notes":"Context builder and call graph relationship."},
+    {"id":"holdout_graph_002","query":"find_callees builtin delegates to CodeIndex graph query","relevant":[{"path":"src/axiom/tools/builtins.py","symbol":"find_callees"},{"path":"src/axiom/rag/code_index.py","symbol":"find_callees"}],"category":"callee query","query_type":"graph/context-oriented","notes":"Built-in callee lookup delegation."},
+    {"id":"holdout_graph_003","query":"eval_compare loads two result artifacts before compare_results","relevant":[{"path":"src/axiom/entrypoints/cli.py","symbol":"eval_compare"},{"path":"src/axiom/evaluation/comparison.py","symbol":"compare_results"}],"category":"evaluation","query_type":"graph/context-oriented","notes":"CLI evaluation comparison path."},
+    {"id":"holdout_graph_004","query":"build_tool_registry combines builtin tools with MCP client tools","relevant":[{"path":"src/axiom/bootstrap.py","symbol":"build_tool_registry"},{"path":"src/axiom/mcp/client.py","symbol":"McpClientManager"}],"category":"MCP integration","query_type":"graph/context-oriented","notes":"Bootstrap and external tool registration relationship."},
+    {"id":"holdout_graph_005","query":"QueryEngine routes selected tool calls through ToolExecutor","relevant":[{"path":"src/axiom/agent/query_engine.py","symbol":"QueryEngine"},{"path":"src/axiom/tools/executor.py","symbol":"ToolExecutor"}],"category":"tool execution","query_type":"graph/context-oriented","notes":"Agent query to tool execution path."}
+  ]
+}

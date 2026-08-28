@@ -17,9 +17,12 @@ from benchmarks.recovery.run_fault_injection import (
 from benchmarks.retrieval.evaluation import (
     RelevantTarget,
     RetrievalCase,
+    evaluate_by_query_type,
+    evaluate_candidate_recall,
     evaluate_rankings,
     load_retrieval_dataset,
     serialize_report,
+    validate_dataset_splits,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +79,69 @@ def test_recall_mrr_and_multi_relevant_coverage_are_correct() -> None:
         "relevant_coverage_at_5": 1.0,
     }
     assert evaluate_rankings([], {})["mrr_at_5"] == 0.0
+
+
+def test_candidate_recall_uses_each_source_top_k_and_category_metrics() -> None:
+    lexical_case = _case(RelevantTarget("a.py", "A"))
+    graph_case = RetrievalCase(
+        "graph",
+        "graph query",
+        (RelevantTarget("b.py", "B"),),
+        "test",
+        "graph/context-oriented",
+        "test",
+    )
+    lexical_source = {
+        "case": [_result("x.py"), _result("a.py", "A")],
+        "graph": [_result("x.py")],
+    }
+    vector_source = {"case": [], "graph": [_result("b.py", "B")]}
+
+    assert evaluate_candidate_recall(
+        [lexical_case, graph_case],
+        (lexical_source, vector_source),
+        cutoffs=(1, 2),
+    ) == {"candidate_recall_at_1": 0.5, "candidate_recall_at_2": 1.0}
+    categories = evaluate_by_query_type(
+        [lexical_case, graph_case],
+        {"case": lexical_source["case"], "graph": vector_source["graph"]},
+    )
+    assert categories["lexical-oriented"]["recall_at_3"] == 1.0
+    assert categories["graph/context-oriented"]["recall_at_1"] == 1.0
+    assert evaluate_candidate_recall([], (), cutoffs=(20, 50)) == {
+        "candidate_recall_at_20": 0.0,
+        "candidate_recall_at_50": 0.0,
+    }
+
+
+def test_development_and_holdout_splits_are_balanced_and_do_not_leak() -> None:
+    v1 = load_retrieval_dataset(ROOT / "benchmarks/retrieval/dataset.json", repository_root=ROOT)
+    development = load_retrieval_dataset(
+        ROOT / "benchmarks/retrieval/development-dataset.json", repository_root=ROOT
+    )
+    holdout = load_retrieval_dataset(
+        ROOT / "benchmarks/retrieval/holdout-dataset.json", repository_root=ROOT
+    )
+
+    validate_dataset_splits([v1, development, holdout])
+    validate_dataset_splits(
+        [development],
+        expected_query_type_counts={
+            "lexical-oriented": 10,
+            "semantic/paraphrase-oriented": 10,
+            "symbol-oriented": 10,
+            "graph/context-oriented": 10,
+        },
+    )
+    validate_dataset_splits(
+        [holdout],
+        expected_query_type_counts={
+            "lexical-oriented": 5,
+            "semantic/paraphrase-oriented": 5,
+            "symbol-oriented": 5,
+            "graph/context-oriented": 5,
+        },
+    )
 
 
 def test_result_serialization_is_deterministic_and_rejects_secrets() -> None:

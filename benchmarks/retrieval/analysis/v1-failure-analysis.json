@@ -1,0 +1,3853 @@
+{
+  "analysis": "v1-hybrid-top5-failure-analysis",
+  "candidate_pool_counts": {
+    "candidate_generation_miss": 3,
+    "present_but_ranked_too_low": 36
+  },
+  "candidate_recall": {
+    "candidate_recall_at_20": 0.775,
+    "candidate_recall_at_50": 0.8
+  },
+  "category_metrics": {
+    "hybrid": {
+      "graph/context-oriented": {
+        "mrr_at_5": 0.2,
+        "recall_at_1": 0.15,
+        "recall_at_3": 0.25,
+        "recall_at_5": 0.25,
+        "relevant_coverage_at_5": 0.1333,
+        "top_1_accuracy": 0.15
+      },
+      "lexical-oriented": {
+        "mrr_at_5": 0.7083,
+        "recall_at_1": 0.6,
+        "recall_at_3": 0.85,
+        "recall_at_5": 0.85,
+        "relevant_coverage_at_5": 0.85,
+        "top_1_accuracy": 0.6
+      },
+      "semantic/paraphrase-oriented": {
+        "mrr_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_3": 0.0,
+        "recall_at_5": 0.0,
+        "relevant_coverage_at_5": 0.0,
+        "top_1_accuracy": 0.0
+      },
+      "symbol-oriented": {
+        "mrr_at_5": 0.95,
+        "recall_at_1": 0.95,
+        "recall_at_3": 0.95,
+        "recall_at_5": 0.95,
+        "relevant_coverage_at_5": 0.95,
+        "top_1_accuracy": 0.95
+      }
+    },
+    "lexical": {
+      "graph/context-oriented": {
+        "mrr_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_3": 0.0,
+        "recall_at_5": 0.0,
+        "relevant_coverage_at_5": 0.0,
+        "top_1_accuracy": 0.0
+      },
+      "lexical-oriented": {
+        "mrr_at_5": 0.7333,
+        "recall_at_1": 0.65,
+        "recall_at_3": 0.85,
+        "recall_at_5": 0.85,
+        "relevant_coverage_at_5": 0.85,
+        "top_1_accuracy": 0.65
+      },
+      "semantic/paraphrase-oriented": {
+        "mrr_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_3": 0.0,
+        "recall_at_5": 0.0,
+        "relevant_coverage_at_5": 0.0,
+        "top_1_accuracy": 0.0
+      },
+      "symbol-oriented": {
+        "mrr_at_5": 0.8975,
+        "recall_at_1": 0.85,
+        "recall_at_3": 0.9,
+        "recall_at_5": 1.0,
+        "relevant_coverage_at_5": 1.0,
+        "top_1_accuracy": 0.85
+      }
+    },
+    "vector": {
+      "graph/context-oriented": {
+        "mrr_at_5": 0.4375,
+        "recall_at_1": 0.25,
+        "recall_at_3": 0.65,
+        "recall_at_5": 0.7,
+        "relevant_coverage_at_5": 0.4667,
+        "top_1_accuracy": 0.25
+      },
+      "lexical-oriented": {
+        "mrr_at_5": 0.2667,
+        "recall_at_1": 0.15,
+        "recall_at_3": 0.4,
+        "recall_at_5": 0.5,
+        "relevant_coverage_at_5": 0.475,
+        "top_1_accuracy": 0.15
+      },
+      "semantic/paraphrase-oriented": {
+        "mrr_at_5": 0.0417,
+        "recall_at_1": 0.0,
+        "recall_at_3": 0.1,
+        "recall_at_5": 0.1,
+        "relevant_coverage_at_5": 0.1,
+        "top_1_accuracy": 0.0
+      },
+      "symbol-oriented": {
+        "mrr_at_5": 0.2283,
+        "recall_at_1": 0.15,
+        "recall_at_3": 0.3,
+        "recall_at_5": 0.4,
+        "relevant_coverage_at_5": 0.4,
+        "top_1_accuracy": 0.15
+      }
+    }
+  },
+  "dataset_version": "1.0.0",
+  "definitions": {
+    "candidate_generation_miss": "no relevant target in either source's top 200",
+    "candidate_pool": "deduplicated union of each v1 source's top 200 candidates",
+    "candidate_recall_at_k": "a hit exists in any source's top K candidates",
+    "ranking_miss": "relevant target is in the pool but Hybrid RRF does not rank it top 5"
+  },
+  "environment": {
+    "git_commit": "542952444ca2d9c40a865c828481a2bcf1809251",
+    "python": "3.12.13",
+    "timestamp": "2026-08-27T13:26:24.352675+00:00"
+  },
+  "failed_query_count": 39,
+  "failure_class_counts": {
+    "correct candidate exists but ranking too low": 1,
+    "lexical mismatch": 34,
+    "semantic mismatch": 4
+  },
+  "misses": [
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/durable.py",
+          "symbol": "DurableAgentRuntime"
+        }
+      ],
+      "failure_classification": "semantic mismatch",
+      "first_relevant_rank_if_after_5": 32,
+      "hybrid_top5": [
+        {
+          "chunk": "07356c1ab3142ee9db43bef973bd39ad803e3731e0203a50eb2a1332249c7d5f",
+          "line": 1162,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._run_lock",
+          "symbol": "_run_lock"
+        },
+        {
+          "chunk": "569293c12e51797281c1636ae672be8fc403c6cabfd68b53de0f75be27a5f548",
+          "line": 278,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._advance",
+          "symbol": "_advance"
+        },
+        {
+          "chunk": "016843626d79aacb3b46fa095ace16b2916e2bf6381ea90b36a5e0724d39b657",
+          "line": 1277,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._update_run_trace",
+          "symbol": "_update_run_trace"
+        },
+        {
+          "chunk": "32a5a055fa60a663eb6e862d563e277154662accf8a12a18b08536e3bcf0a77f",
+          "line": 1221,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._finish_span",
+          "symbol": "_finish_span"
+        },
+        {
+          "chunk": "2e46ee3bbac3af907b1a356a539359d28b600faa6f2f160249f9733e20beaea8",
+          "line": 1060,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._require",
+          "symbol": "_require"
+        }
+      ],
+      "lexical_top5": [
+        {
+          "chunk": "c5ff5dd5c60058a12814bb5ed03494f633f9ba325ff6dffb7c8a9d9e05ada2a0",
+          "line": 67,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime",
+          "symbol": "DurableAgentRuntime"
+        },
+        {
+          "chunk": "07356c1ab3142ee9db43bef973bd39ad803e3731e0203a50eb2a1332249c7d5f",
+          "line": 1162,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._run_lock",
+          "symbol": "_run_lock"
+        },
+        {
+          "chunk": "016843626d79aacb3b46fa095ace16b2916e2bf6381ea90b36a5e0724d39b657",
+          "line": 1277,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._update_run_trace",
+          "symbol": "_update_run_trace"
+        },
+        {
+          "chunk": "569293c12e51797281c1636ae672be8fc403c6cabfd68b53de0f75be27a5f548",
+          "line": 278,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._advance",
+          "symbol": "_advance"
+        },
+        {
+          "chunk": "32a5a055fa60a663eb6e862d563e277154662accf8a12a18b08536e3bcf0a77f",
+          "line": 1221,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._finish_span",
+          "symbol": "_finish_span"
+        }
+      ],
+      "query": "DurableAgentRuntime",
+      "query_id": "symbol_001",
+      "query_type": "symbol-oriented",
+      "technical_explanation": "Lexical generated a target but deterministic vector did not; fusion kept it below 5; lexical=1, vector=None, hybrid=32.",
+      "vector_top5": [
+        {
+          "chunk": "6eb65464ddd6a21b58f2a30e0e52d1ed10324f51522cdb20e5579de7e2bb9773",
+          "line": 957,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy._child_runtime",
+          "symbol": "_child_runtime"
+        },
+        {
+          "chunk": "9f50745fb5ce15b7c7b52f6c1b0b077bdd4b78de9002290962d58132908cff07",
+          "line": 761,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._child_runtime",
+          "symbol": "_child_runtime"
+        },
+        {
+          "chunk": "8dc0a318c6fad6ec402ab4e2e6d028af50bdd20432dec39a034b98d42b9859ba",
+          "line": 1099,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._durable_runtime",
+          "symbol": "_durable_runtime"
+        },
+        {
+          "chunk": "4fd0d8036ff20974f5433c43d989b921388f95785c96ad46eb50c619e80992cd",
+          "line": 12,
+          "path": "src/axiom/runtime/strategies.py",
+          "qualified_name": "RuntimeExecutionStrategy",
+          "symbol": "RuntimeExecutionStrategy"
+        },
+        {
+          "chunk": "016843626d79aacb3b46fa095ace16b2916e2bf6381ea90b36a5e0724d39b657",
+          "line": 1277,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._update_run_trace",
+          "symbol": "_update_run_trace"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/models.py",
+          "symbol": "RunStatus"
+        }
+      ],
+      "failure_classification": "correct candidate exists but ranking too low",
+      "first_relevant_rank_if_after_5": 7,
+      "hybrid_top5": [
+        {
+          "chunk": "4591f7a18e3fba5c3dd34ab81c9feb2e156049fae9fa7c42c09f5bed47ecbc80",
+          "line": 398,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "waiting_reason",
+          "symbol": "waiting_reason"
+        },
+        {
+          "chunk": "5d520a86156a13b85c9db9422d1a75df47d1c34b8a1249249b83450460cba48d",
+          "line": 366,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._handle",
+          "symbol": "_handle"
+        },
+        {
+          "chunk": "eb8f9003fcd58e1a5f94ccdcd0467acbdcce32efd33c9244fe927b75c3c20cc3",
+          "line": 862,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._validate_control_operation",
+          "symbol": "_validate_control_operation"
+        },
+        {
+          "chunk": "6ed7db14691cb1e5264d818093ee6939dbc661b84b1be28f071d44f28f5b57f9",
+          "line": 991,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._wait_for_approval",
+          "symbol": "_wait_for_approval"
+        },
+        {
+          "chunk": "ed42edb2e14f4baa3c759cd7db822afd1cc49f5575030ca5f019e74e8defb846",
+          "line": 225,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer",
+          "symbol": "RuntimeApiServer"
+        }
+      ],
+      "lexical_top5": [
+        {
+          "chunk": "31c9a121ae2ca3d64e849587539f48101e88f6bc97e760ff266d978bb4e4becd",
+          "line": 14,
+          "path": "src/axiom/runtime/models.py",
+          "qualified_name": "RunStatus",
+          "symbol": "RunStatus"
+        },
+        {
+          "chunk": "4591f7a18e3fba5c3dd34ab81c9feb2e156049fae9fa7c42c09f5bed47ecbc80",
+          "line": 398,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "waiting_reason",
+          "symbol": "waiting_reason"
+        },
+        {
+          "chunk": "6ed7db14691cb1e5264d818093ee6939dbc661b84b1be28f071d44f28f5b57f9",
+          "line": 991,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._wait_for_approval",
+          "symbol": "_wait_for_approval"
+        },
+        {
+          "chunk": "2808c883fe85f6eb7b2f2c00aeee75f6e17deb7896928f40365be92f83cd9fc7",
+          "line": 279,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "allowed_operations",
+          "symbol": "allowed_operations"
+        },
+        {
+          "chunk": "8456c570833b400ea56228235b387c718923c71b4953a94fa0a705d3b81e509f",
+          "line": 274,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy.resume_waiting_child",
+          "symbol": "resume_waiting_child"
+        }
+      ],
+      "query": "WAITING_APPROVAL RunStatus",
+      "query_id": "lexical_002",
+      "query_type": "lexical-oriented",
+      "technical_explanation": "A source generated a target, but Hybrid RRF ranked it below 5; lexical=1, vector=3, hybrid=7.",
+      "vector_top5": [
+        {
+          "chunk": "4591f7a18e3fba5c3dd34ab81c9feb2e156049fae9fa7c42c09f5bed47ecbc80",
+          "line": 398,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "waiting_reason",
+          "symbol": "waiting_reason"
+        },
+        {
+          "chunk": "2c41bfe01364b3422d67e40d4945a8941960215a894328ce121a92913ccbeb5c",
+          "line": 1194,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._set_run_status",
+          "symbol": "_set_run_status"
+        },
+        {
+          "chunk": "31c9a121ae2ca3d64e849587539f48101e88f6bc97e760ff266d978bb4e4becd",
+          "line": 14,
+          "path": "src/axiom/runtime/models.py",
+          "qualified_name": "RunStatus",
+          "symbol": "RunStatus"
+        },
+        {
+          "chunk": "299b22881acd503093db66540c533724bd24ed7c19fd9df0aa80b5719e6f8dce",
+          "line": 150,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime.resume",
+          "symbol": "resume"
+        },
+        {
+          "chunk": "117f6d49bb44fd8e1177bd54bfc8784d929540adf9ed29d0902e0572fa6f7161",
+          "line": 64,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent.run",
+          "symbol": "run"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/memory/service.py",
+          "symbol": "MemoryService"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 19,
+      "hybrid_top5": [
+        {
+          "chunk": "1c0c83087b4f79584f2014ee0a43a5592dbd2f9cc7bade7f6fbc3a78235858c2",
+          "line": 26,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "MemoryContextBuilder",
+          "symbol": "MemoryContextBuilder"
+        },
+        {
+          "chunk": "c171bf8a40f9ecc94bcb1c8ff56a3d29d58d00e03ff6261acde59fa8c4bf9c28",
+          "line": 27,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "MemoryContextBuilder.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "cbeda6644f84a8e89040a83952f1a73ef1538035c7b058edeff3e7469035099d",
+          "line": 123,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "MemoryContextBuilder._candidate_records",
+          "symbol": "_candidate_records"
+        },
+        {
+          "chunk": "021dcb08dbcc6000b87d53fe71bf28725337614d2ce5908c93ce4054004c3b9d",
+          "line": 182,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "_rank_facts",
+          "symbol": "_rank_facts"
+        },
+        {
+          "chunk": "0b3989411575f5e0534e3bcc0d2d640a61e7dea2061b9ae4a09801d8db9026d6",
+          "line": 13,
+          "path": "src/axiom/memory/manager.py",
+          "qualified_name": "MemoryEntry",
+          "symbol": "MemoryEntry"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "long_term memory facts summaries",
+      "query_id": "lexical_011",
+      "query_type": "lexical-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=102, hybrid=19.",
+      "vector_top5": [
+        {
+          "chunk": "aad5e12df1033deea78b91b68fc4e16d5417aca080953d761fd98b3b72d72901",
+          "line": 531,
+          "path": "src/axiom/tools/builtins.py",
+          "qualified_name": "save_memory",
+          "symbol": "save_memory"
+        },
+        {
+          "chunk": "b3c592b39cca4779b62a6ae96e3ecfa81011dd88527f5598d46d5d3e54389251",
+          "line": 26,
+          "path": "src/axiom/rag/tokenizer.py",
+          "qualified_name": "split_identifier",
+          "symbol": "split_identifier"
+        },
+        {
+          "chunk": "c21a4b7dae77e6f60afcb70802f8a44d5d0c7517fbfd29dd40914a9da129d7cc",
+          "line": 93,
+          "path": "src/axiom/config.py",
+          "qualified_name": "MemoryConfig",
+          "symbol": "MemoryConfig"
+        },
+        {
+          "chunk": "fb0df77983a5b089c08c6025083292af56b7717dbaff2cda321f175cec4aa359",
+          "line": 51,
+          "path": "src/axiom/prompt/assembler.py",
+          "qualified_name": "PromptAssembler._project_memory",
+          "symbol": "_project_memory"
+        },
+        {
+          "chunk": "afd8a0b7019907855b5e142c662c0df235030fd81581156f9a2263a642cda78e",
+          "line": 338,
+          "path": "src/axiom/memory/store.py",
+          "qualified_name": "MemoryStore.active_summary",
+          "symbol": "active_summary"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/api.py",
+          "symbol": "ThreadEventRepository"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 14,
+      "hybrid_top5": [
+        {
+          "chunk": "312a21508903e54b1123a62346e5cdefd9d8c30537497e1507621c0578208063",
+          "line": 242,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "_render_runtime_event",
+          "symbol": "_render_runtime_event"
+        },
+        {
+          "chunk": "0bd681775e939da67bfd18c674466635c31b9f045e8b17154bf14b43ead60325",
+          "line": 106,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine._complete_from_events",
+          "symbol": "_complete_from_events"
+        },
+        {
+          "chunk": "324928162cb5e2144a4509de9f2f91f56efac94b0bd1b25bea878bc7c4e69e0f",
+          "line": 156,
+          "path": "src/axiom/entrypoints/repl.py",
+          "qualified_name": "_run_events",
+          "symbol": "_run_events"
+        },
+        {
+          "chunk": "cbeda6644f84a8e89040a83952f1a73ef1538035c7b058edeff3e7469035099d",
+          "line": 123,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "MemoryContextBuilder._candidate_records",
+          "symbol": "_candidate_records"
+        },
+        {
+          "chunk": "ae3439b0181ac23ab85e7dfbba97f1776f6d4e78d1ea0de17ad7f7894cc6f5db",
+          "line": 60,
+          "path": "src/axiom/memory/facts.py",
+          "qualified_name": "FactCandidate",
+          "symbol": "FactCandidate"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "ThreadEventRepository after_event_id replay",
+      "query_id": "lexical_014",
+      "query_type": "lexical-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=13, hybrid=14.",
+      "vector_top5": [
+        {
+          "chunk": "4dfc9fa7ee86593b4500db5a996ea8a4235a1dd2fb7fa0632356aa43852361dd",
+          "line": 1561,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "_event_envelope",
+          "symbol": "_event_envelope"
+        },
+        {
+          "chunk": "6de3151a2ba163cdd133156d0c98ec6cc508cf96076579e6f742345bcb8bfe6e",
+          "line": 307,
+          "path": "src/axiom/memory/service.py",
+          "qualified_name": "MemoryService._extract_facts_from_thread_unchecked",
+          "symbol": "_extract_facts_from_thread_unchecked"
+        },
+        {
+          "chunk": "d58a236faab821aa583a996080cc7eeb0de327af41f2bb0b2d6caba6e19822d4",
+          "line": 85,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "ThreadEventRepository.create_thread",
+          "symbol": "create_thread"
+        },
+        {
+          "chunk": "0dcc1a50065e7f8f73edeaa613870340160d837fce17fcd24d67639a26bd0d96",
+          "line": 599,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._run_legacy_turn",
+          "symbol": "_run_legacy_turn"
+        },
+        {
+          "chunk": "1e5c1fdc2b8bf7dd515ed56386c589b0a530658ebf31306657dd0cf7acfac2b3",
+          "line": 96,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "ThreadEventRepository.thread_exists",
+          "symbol": "thread_exists"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/durable.py",
+          "symbol": "DurableAgentRuntime"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 128,
+      "hybrid_top5": [
+        {
+          "chunk": "04eedbd7835359bb0862a19d4bc5592c74c4ccb38ff042069b2767fbc2dd7366",
+          "line": 18,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "8d30e0774ef58bbb85218e50e399900b42be63f1200aa3dc80ae447a4cb093b6",
+          "line": 39,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "bdd5e8a9d739a82f5b529d7a07b909b967642c462c14dd9f02357fd6321c0de1",
+          "line": 63,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.run_complete",
+          "symbol": "run_complete"
+        },
+        {
+          "chunk": "96ff8606f045f628460172aa3a9cc10d579969504bbcdd4e2f00e0f617deb916",
+          "line": 77,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.clear_history",
+          "symbol": "clear_history"
+        },
+        {
+          "chunk": "27358703bf64f6f8e6a9c25169dbe46f431dd187c86de19b3665efea68fe8636",
+          "line": 24,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentRole",
+          "symbol": "AgentRole"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "where does an interrupted agent continue after a process restart",
+      "query_id": "semantic_001",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=128, hybrid=128.",
+      "vector_top5": [
+        {
+          "chunk": "f87c5f9eb2cc77fb077882002b0f32c5ddc5a303dc691055d8be6307e9cb0a9d",
+          "line": 79,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "_SubprocessExecutionBackend",
+          "symbol": "_SubprocessExecutionBackend"
+        },
+        {
+          "chunk": "3f841fe08f06f536f6b422053918708d9aba41e525c47b1833e3abe0352c68e1",
+          "line": 159,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "_SubprocessExecutionBackend._terminate_process_tree",
+          "symbol": "_terminate_process_tree"
+        },
+        {
+          "chunk": "50a2a1095aa27cecd03c65011a6b09148d8ae7891da61f56049a19adc10a0634",
+          "line": 47,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage",
+          "symbol": "AgentMessage"
+        },
+        {
+          "chunk": "644108e2703e90968b2fb954040fea9017e69f03775fa9ecfb3818ba3b238a2c",
+          "line": 172,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._system_prompt",
+          "symbol": "_system_prompt"
+        },
+        {
+          "chunk": "c01b04ca59eed95eef93f160176c8607222817c9e5eefdc1afba0ee345b31d3a",
+          "line": 176,
+          "path": "src/axiom/rag/models.py",
+          "qualified_name": "IndexStats",
+          "symbol": "IndexStats"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "candidate_generation_miss",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "symbol": "SQLiteCheckpointStore"
+        }
+      ],
+      "failure_classification": "semantic mismatch",
+      "first_relevant_rank_if_after_5": null,
+      "hybrid_top5": [
+        {
+          "chunk": "1a83445b52cd2eedb936f976a91da0e3d486c528ca617f237804789c74b0b4d0",
+          "line": 197,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator",
+          "symbol": "AgentOrchestrator"
+        },
+        {
+          "chunk": "013982b2e203dcbb1b97abeb663c14c5ac7592942ed993bdfd812903dda329a5",
+          "line": 230,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "7d329662271d6df3e91700fccf7a0cc9bc771a549346f6efb3618d6e90739c6c",
+          "line": 428,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.parse_review_issues",
+          "symbol": "parse_review_issues"
+        },
+        {
+          "chunk": "a8efecaaf4dea039ebccc5ffc2993890e42711a60849b48e7709ce2741ac668a",
+          "line": 25,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent",
+          "symbol": "PlanExecuteAgent"
+        },
+        {
+          "chunk": "117f6d49bb44fd8e1177bd54bfc8784d929540adf9ed29d0902e0572fa6f7161",
+          "line": 64,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent.run",
+          "symbol": "run"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "save versioned recovery snapshots in a local database",
+      "query_id": "semantic_002",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "The paraphrase matched neither lexical nor deterministic-vector top 50; lexical=None, vector=None, hybrid=None.",
+      "vector_top5": [
+        {
+          "chunk": "ee2da839516814a2d00a430d56e607af3a33e5505f619e4a52a5420d4a5d6506",
+          "line": 1576,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "_ensure_sqlite_column",
+          "symbol": "_ensure_sqlite_column"
+        },
+        {
+          "chunk": "299b22881acd503093db66540c533724bd24ed7c19fd9df0aa80b5719e6f8dce",
+          "line": 150,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime.resume",
+          "symbol": "resume"
+        },
+        {
+          "chunk": "62cf3c72245ce2c292cc79ffff41bf3373d8d0f25b26d53b6dceac6685eb330a",
+          "line": 410,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "recovery_action",
+          "symbol": "recovery_action"
+        },
+        {
+          "chunk": "a0637fc8d4439f40ee2ecaf19beea63e81e074d0e386fbebe302b789863c0323",
+          "line": 812,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._clear_legacy_parent_task_state",
+          "symbol": "_clear_legacy_parent_task_state"
+        },
+        {
+          "chunk": "3071f928210d0b99825e3195bbc0460730a1fb005ddbac4ba9d435c73261b083",
+          "line": 434,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy.store_state",
+          "symbol": "store_state"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/durable.py",
+          "symbol": null
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 93,
+      "hybrid_top5": [
+        {
+          "chunk": "8d30e0774ef58bbb85218e50e399900b42be63f1200aa3dc80ae447a4cb093b6",
+          "line": 39,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "644108e2703e90968b2fb954040fea9017e69f03775fa9ecfb3818ba3b238a2c",
+          "line": 172,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._system_prompt",
+          "symbol": "_system_prompt"
+        },
+        {
+          "chunk": "a50e6db81d8504661d59cc0fcbf54ff18b96ddc38ad6b5641a7c010af81d3a5e",
+          "line": 242,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.capture",
+          "symbol": "capture"
+        },
+        {
+          "chunk": "8bba2d2cf262fff109f405bf4d727a00ad66407ee17bc468d73f4b33ac560556",
+          "line": 329,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator._approve_waiting_child",
+          "symbol": "_approve_waiting_child"
+        },
+        {
+          "chunk": "a8efecaaf4dea039ebccc5ffc2993890e42711a60849b48e7709ce2741ac668a",
+          "line": 25,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent",
+          "symbol": "PlanExecuteAgent"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "avoid repeating a successful tool side effect when the parent snapshot was lost",
+      "query_id": "semantic_003",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=12, hybrid=93.",
+      "vector_top5": [
+        {
+          "chunk": "1e5c1fdc2b8bf7dd515ed56386c589b0a530658ebf31306657dd0cf7acfac2b3",
+          "line": 96,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "ThreadEventRepository.thread_exists",
+          "symbol": "thread_exists"
+        },
+        {
+          "chunk": "0313258e36fbe1c66446c90e2f61fdd4ef168417ada094016e1f55c9ca0ac874",
+          "line": 77,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor._execute_single",
+          "symbol": "_execute_single"
+        },
+        {
+          "chunk": "2f98b03b1d3c199b1b4191754c3a8f0cea0875f648c8cc2ce347e7bc2142df4d",
+          "line": 10,
+          "path": "src/axiom/tools/registry.py",
+          "qualified_name": "ToolRegistry.register",
+          "symbol": "register"
+        },
+        {
+          "chunk": "1cd901b753105052b3b25e942a67c32af9b3e9e526204a809555b5274a0a0c46",
+          "line": 183,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "ThreadEventRepository._ensure_schema",
+          "symbol": "_ensure_schema"
+        },
+        {
+          "chunk": "27645ee88a35e4449214aebf52d76ab281e3f419338a38d75f1b45a6aa5ef9f2",
+          "line": 166,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor._approval_decision",
+          "symbol": "_approval_decision"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/policy/permissions.py",
+          "symbol": "DefaultPermissionPolicy"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 60,
+      "hybrid_top5": [
+        {
+          "chunk": "04eedbd7835359bb0862a19d4bc5592c74c4ccb38ff042069b2767fbc2dd7366",
+          "line": 18,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "1ab75c3f3011a448012bd298ebdf2d5a03b0190e020814f87c11c390def5094f",
+          "line": 86,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "ab5f2ccf687f07913554c62175d900bb5f6ef1c00d7670028431bc156559dd95",
+          "line": 122,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent.clear_history",
+          "symbol": "clear_history"
+        },
+        {
+          "chunk": "644108e2703e90968b2fb954040fea9017e69f03775fa9ecfb3818ba3b238a2c",
+          "line": 172,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._system_prompt",
+          "symbol": "_system_prompt"
+        },
+        {
+          "chunk": "e4b85e0e76d8e6518058247e590216f2c1bfeda80b8ad7e049a9dc58634335ad",
+          "line": 200,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.__init__",
+          "symbol": "__init__"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "ask a human before allowing a dangerous capability",
+      "query_id": "semantic_004",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=7, hybrid=60.",
+      "vector_top5": [
+        {
+          "chunk": "b2857b4797368a9a2468799422dc11e0d885068e73eaa80618100b14ca2f8564",
+          "line": 118,
+          "path": "src/axiom/snapshot/service.py",
+          "qualified_name": "_skip",
+          "symbol": "_skip"
+        },
+        {
+          "chunk": "766fa9f493e9b9c472b47b009e08ff04f297ec6be59f94a6961460225833de23",
+          "line": 14,
+          "path": "src/axiom/rag/symbols/extractor.py",
+          "qualified_name": "SymbolExtraction",
+          "symbol": "SymbolExtraction"
+        },
+        {
+          "chunk": "8eb398dff687a9e1791b88ddc32e846940c72d0fd8474ca7e3491bbe016fa028",
+          "line": 26,
+          "path": "src/axiom/web/search.py",
+          "qualified_name": "_parse_duckduckgo",
+          "symbol": "_parse_duckduckgo"
+        },
+        {
+          "chunk": "426b082c3cc4cd9e314ee64cf0e1d67f6a0dbca604420e594e5043addbfc65f2",
+          "line": 455,
+          "path": "src/axiom/rag/code_index.py",
+          "qualified_name": "CodeIndex._lookup_symbol",
+          "symbol": "_lookup_symbol"
+        },
+        {
+          "chunk": "667c331d9b92bb9c2c89c44e10ad8aacd169ae078a916ec95ffce5051af9959b",
+          "line": 55,
+          "path": "src/axiom/rag/vectors.py",
+          "qualified_name": "cosine_similarity",
+          "symbol": "cosine_similarity"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/execution/backends.py",
+          "symbol": "RestrictedExecutionBackend"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 31,
+      "hybrid_top5": [
+        {
+          "chunk": "8d30e0774ef58bbb85218e50e399900b42be63f1200aa3dc80ae447a4cb093b6",
+          "line": 39,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "bdd5e8a9d739a82f5b529d7a07b909b967642c462c14dd9f02357fd6321c0de1",
+          "line": 63,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.run_complete",
+          "symbol": "run_complete"
+        },
+        {
+          "chunk": "27358703bf64f6f8e6a9c25169dbe46f431dd187c86de19b3665efea68fe8636",
+          "line": 24,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentRole",
+          "symbol": "AgentRole"
+        },
+        {
+          "chunk": "56b1c847085603f03b54bfed619da9a14476264f41b2e5abc8b7de065e4f50c7",
+          "line": 78,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "ExecutionStep.with_failed",
+          "symbol": "with_failed"
+        },
+        {
+          "chunk": "ab5f2ccf687f07913554c62175d900bb5f6ef1c00d7670028431bc156559dd95",
+          "line": 122,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent.clear_history",
+          "symbol": "clear_history"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "run a subprocess with a bounded workspace and filtered host environment",
+      "query_id": "semantic_005",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=2, hybrid=31.",
+      "vector_top5": [
+        {
+          "chunk": "f28f52af4452f3561cd29dddc0fbdaa03785c85044c721d420953230f638c25c",
+          "line": 267,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "RestrictedExecutionBackend._environment",
+          "symbol": "_environment"
+        },
+        {
+          "chunk": "03e6348df4dc1d985405fc704b8cf1bbb69074ef4d9175025430a9f267f3517c",
+          "line": 242,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "RestrictedExecutionBackend",
+          "symbol": "RestrictedExecutionBackend"
+        },
+        {
+          "chunk": "156135eb605202ba821380230d2c90228280db668350990dd4984c771ecbb380",
+          "line": 295,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "filtered_host_environment",
+          "symbol": "filtered_host_environment"
+        },
+        {
+          "chunk": "9fc565d1a3f27b29b1faf626b53dd239c88dcff75dea74884ce6a5e145382252",
+          "line": 154,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "_SubprocessExecutionBackend._environment",
+          "symbol": "_environment"
+        },
+        {
+          "chunk": "9458276d8ef486b2e10d83033a98a5f6a5bc1a7b8b84fb1542a7b4ebed022155",
+          "line": 258,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "RestrictedExecutionBackend._resolve_cwd",
+          "symbol": "_resolve_cwd"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/rag/hybrid.py",
+          "symbol": "reciprocal_rank_fusion"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 96,
+      "hybrid_top5": [
+        {
+          "chunk": "b0bf5d18927a09452fe415f5860440114e8286bc4d6546ca2142f4e89ff5a173",
+          "line": 12,
+          "path": "src/axiom/web/search.py",
+          "qualified_name": "SearchResult",
+          "symbol": "SearchResult"
+        },
+        {
+          "chunk": "b379ed28ab7aa9292143d4c7cd364f33b9bbdf3d499bf61f29aa11b694f72449",
+          "line": 18,
+          "path": "src/axiom/web/search.py",
+          "qualified_name": "search_web",
+          "symbol": "search_web"
+        },
+        {
+          "chunk": "261f2dfeebd88d7448e8ba950409355745d171603fb2a6a5571a0657e5fe5a56",
+          "line": 154,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._execute_without_tools",
+          "symbol": "_execute_without_tools"
+        },
+        {
+          "chunk": "5f2dbd7154a7c1c99147b1858a5e2046a7af904922c9e512ecbe5df3e8bca2b4",
+          "line": 120,
+          "path": "src/axiom/agent/query.py",
+          "qualified_name": "_merge_tool_delta",
+          "symbol": "_merge_tool_delta"
+        },
+        {
+          "chunk": "e078d3afc2925a4448d8c00f03e9a405b479260391ee9f988995224721ed5157",
+          "line": 351,
+          "path": "src/axiom/config.py",
+          "qualified_name": "_deep_merge",
+          "symbol": "_deep_merge"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "merge keyword and dense search rankings without adding unlike raw scores",
+      "query_id": "semantic_006",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=81, hybrid=96.",
+      "vector_top5": [
+        {
+          "chunk": "b0bf5d18927a09452fe415f5860440114e8286bc4d6546ca2142f4e89ff5a173",
+          "line": 12,
+          "path": "src/axiom/web/search.py",
+          "qualified_name": "SearchResult",
+          "symbol": "SearchResult"
+        },
+        {
+          "chunk": "dd786ca92a94e6e3cac91b334660ed282b65734216323cbdabc4e261ea06b203",
+          "line": 1175,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "supports_fts5",
+          "symbol": "supports_fts5"
+        },
+        {
+          "chunk": "26ed3082f7ec3f614a662ed70a3ee8a60f3ac6006e099ecfebcb6bac94d2b680",
+          "line": 84,
+          "path": "src/axiom/mcp/config.py",
+          "qualified_name": "_spec_from_raw",
+          "symbol": "_spec_from_raw"
+        },
+        {
+          "chunk": "4a38d3ab039f8be2a83d50ae781645a662b4c07b59ad0021b9608b0d2ca3ce0e",
+          "line": 60,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore.has_fts5",
+          "symbol": "has_fts5"
+        },
+        {
+          "chunk": "0bf7a133a58979cb43637e06a6ef66b8589ef8255bfb32c7b6bd84cfb044b454",
+          "line": 170,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "qualified_name": "SQLiteCheckpointStore._save_tool_execution",
+          "symbol": "_save_tool_execution"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/rag/context.py",
+          "symbol": "CodeContextBuilder"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 173,
+      "hybrid_top5": [
+        {
+          "chunk": "7d3d68472d901081a79118602af612d355bf45c5cb6bf77244d013b7c491be93",
+          "line": 441,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.build_step_context",
+          "symbol": "build_step_context"
+        },
+        {
+          "chunk": "cdecfcbe12211f7e41271492c114a03d74af7e515a79ffd6ada712b83f350711",
+          "line": 94,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine.team_complete_async",
+          "symbol": "team_complete_async"
+        },
+        {
+          "chunk": "45ccef93c571dbe440ec6b9300f9188aaee40762c17b37b5a45977dcef5b2767",
+          "line": 97,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine.ask_complete",
+          "symbol": "ask_complete"
+        },
+        {
+          "chunk": "d16ac126128c3f9b57bb775e5256f29c53c771d5c07a467d4766989b20897335",
+          "line": 103,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine.team_complete",
+          "symbol": "team_complete"
+        },
+        {
+          "chunk": "9459b97de6c6c3102494254fe3172b80d9a93a20b0e5fb55ba72b828eb38ed44",
+          "line": 148,
+          "path": "src/axiom/config.py",
+          "qualified_name": "AxiomConfig",
+          "symbol": "AxiomConfig"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "turn search seeds into a bounded bundle of callers callees and definitions",
+      "query_id": "semantic_007",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=10, hybrid=173.",
+      "vector_top5": [
+        {
+          "chunk": "8eb398dff687a9e1791b88ddc32e846940c72d0fd8474ca7e3491bbe016fa028",
+          "line": 26,
+          "path": "src/axiom/web/search.py",
+          "qualified_name": "_parse_duckduckgo",
+          "symbol": "_parse_duckduckgo"
+        },
+        {
+          "chunk": "24cd317e5db6b9f27af99d77fc8fb4b6a1571fcbde85952dd6dc19e27b8f8030",
+          "line": 91,
+          "path": "src/axiom/rag/context.py",
+          "qualified_name": "CodeContextBuilder.build",
+          "symbol": "build"
+        },
+        {
+          "chunk": "8b2e5a0f16d898312614d986f9baf47a0ecef85cf2608af2d82594634008d5fd",
+          "line": 316,
+          "path": "src/axiom/rag/code_index.py",
+          "qualified_name": "CodeIndex._search_auto",
+          "symbol": "_search_auto"
+        },
+        {
+          "chunk": "b0bf5d18927a09452fe415f5860440114e8286bc4d6546ca2142f4e89ff5a173",
+          "line": 12,
+          "path": "src/axiom/web/search.py",
+          "qualified_name": "SearchResult",
+          "symbol": "SearchResult"
+        },
+        {
+          "chunk": "ac991146ea84aa277f915966df213376f781c18b464414c4232735241f8409c3",
+          "line": 1168,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore._has_call_graph_tables",
+          "symbol": "_has_call_graph_tables"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/mcp/client.py",
+          "symbol": "McpClientManager"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 109,
+      "hybrid_top5": [
+        {
+          "chunk": "4962574b740738e0fa0e3d4c00fca134bd21be660aac13bfbfe5d68986c36f74",
+          "line": 20,
+          "path": "src/axiom/tools/base.py",
+          "qualified_name": "ToolResult",
+          "symbol": "ToolResult"
+        },
+        {
+          "chunk": "3e5384a88a223a52837348599832edebc7ecd4a391a32529989731053e821592",
+          "line": 83,
+          "path": "src/axiom/tools/base.py",
+          "qualified_name": "Tool.execute",
+          "symbol": "execute"
+        },
+        {
+          "chunk": "5e06445211f65b4ecbd6a363584ae896af76219ffedee3fa7a49b91e82259f22",
+          "line": 18,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor",
+          "symbol": "ToolExecutor"
+        },
+        {
+          "chunk": "c512c74a85edf4db466f5c2e64be6e1f4572bd8648db3850c9f0ff21b6e897ea",
+          "line": 27,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor.execute_all",
+          "symbol": "execute_all"
+        },
+        {
+          "chunk": "7fc1a6e7882a3523bea569a14dc472355ac49242a7becc8bc783678188c8d0b4",
+          "line": 48,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor.run_read",
+          "symbol": "run_read"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "connect external tool servers and expose their namespaced tools",
+      "query_id": "semantic_008",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=70, hybrid=109.",
+      "vector_top5": [
+        {
+          "chunk": "c512c74a85edf4db466f5c2e64be6e1f4572bd8648db3850c9f0ff21b6e897ea",
+          "line": 27,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor.execute_all",
+          "symbol": "execute_all"
+        },
+        {
+          "chunk": "e6c3141917cf84fa32ed52557a8de5b2420826728110f149d758ae608172ce67",
+          "line": 27,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "qualified_name": "ToolExecutionStore",
+          "symbol": "ToolExecutionStore"
+        },
+        {
+          "chunk": "479d4f73a647363b7cb420eff331d77eb18a0609cce5f8529078f21dd1a01234",
+          "line": 215,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "qualified_name": "SQLiteCheckpointStore._load_tool_execution",
+          "symbol": "_load_tool_execution"
+        },
+        {
+          "chunk": "29d08cefa3095347fd56232ed3382782fb745d7e52fc1b61c05da872829adfcd",
+          "line": 30,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "qualified_name": "ToolExecutionStore.load_tool_execution",
+          "symbol": "load_tool_execution"
+        },
+        {
+          "chunk": "fe641af2d32e4894f5609ab197d290a72affbb0f29e680041890a52a95be3429",
+          "line": 28,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "qualified_name": "ToolExecutionStore.save_tool_execution",
+          "symbol": "save_tool_execution"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/api.py",
+          "symbol": "ThreadEventRepository"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 121,
+      "hybrid_top5": [
+        {
+          "chunk": "4d2a1e2b87b57756553855250f77f5722bdda3e385fd8b1c0b4d9f4e5f162325",
+          "line": 17,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent",
+          "symbol": "Agent"
+        },
+        {
+          "chunk": "04eedbd7835359bb0862a19d4bc5592c74c4ccb38ff042069b2767fbc2dd7366",
+          "line": 18,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "bdd5e8a9d739a82f5b529d7a07b909b967642c462c14dd9f02357fd6321c0de1",
+          "line": 63,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.run_complete",
+          "symbol": "run_complete"
+        },
+        {
+          "chunk": "dbf398b7f53bace6748e26e0f7b6bb3af6ad163fbc7a75913f55c44cdfe543cf",
+          "line": 30,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessageType",
+          "symbol": "AgentMessageType"
+        },
+        {
+          "chunk": "50a2a1095aa27cecd03c65011a6b09148d8ae7891da61f56049a19adc10a0634",
+          "line": 47,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage",
+          "symbol": "AgentMessage"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "replay missed conversation events after a client reconnects",
+      "query_id": "semantic_009",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=103, hybrid=121.",
+      "vector_top5": [
+        {
+          "chunk": "934d7c612e6bd18366fef48d55990f29ef21a933133040009ad50bb4b2957cf3",
+          "line": 215,
+          "path": "src/axiom/mcp/client.py",
+          "qualified_name": "McpClientManager._session",
+          "symbol": "_session"
+        },
+        {
+          "chunk": "1122caed99146f29ff12b4f6e7beea271397d0ad75012cee5ac2b2b8f585cc53",
+          "line": 11,
+          "path": "src/axiom/sdk.py",
+          "qualified_name": "create_default_engine",
+          "symbol": "create_default_engine"
+        },
+        {
+          "chunk": "0a1ada11fa07a6586f63f78b98fe89cc629fd3f7352b60795e7bba366525d743",
+          "line": 284,
+          "path": "src/axiom/runtime/models.py",
+          "qualified_name": "_message_to_dict",
+          "symbol": "_message_to_dict"
+        },
+        {
+          "chunk": "b91bc07eac398e5e791ed40608b50fb610cff441dc4dd022d69210278c2d80b4",
+          "line": 164,
+          "path": "src/axiom/evaluation/scorers.py",
+          "qualified_name": "scorer_from_spec",
+          "symbol": "scorer_from_spec"
+        },
+        {
+          "chunk": "90851de7a32e0698beea9c2fdb48efc9c685f2fa010be619ac1135a54918365b",
+          "line": 15,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine",
+          "symbol": "QueryEngine"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/observability_store.py",
+          "symbol": "ObservabilityService"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 194,
+      "hybrid_top5": [
+        {
+          "chunk": "a46c8db29e26a4f9988d241cb016ec80a7ff054555f4043fa4717dee20fe2926",
+          "line": 90,
+          "path": "src/axiom/rag/tokenizer.py",
+          "qualified_name": "_quote_fts_token",
+          "symbol": "_quote_fts_token"
+        },
+        {
+          "chunk": "3e5384a88a223a52837348599832edebc7ecd4a391a32529989731053e821592",
+          "line": 83,
+          "path": "src/axiom/tools/base.py",
+          "qualified_name": "Tool.execute",
+          "symbol": "execute"
+        },
+        {
+          "chunk": "0609cb93b4dadee14a77a41e05f2ec7d70bbfbad8009527bdee9f2cccbc7bbb5",
+          "line": 87,
+          "path": "src/axiom/tools/base.py",
+          "qualified_name": "Tool.permission_request",
+          "symbol": "permission_request"
+        },
+        {
+          "chunk": "5e06445211f65b4ecbd6a363584ae896af76219ffedee3fa7a49b91e82259f22",
+          "line": 18,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor",
+          "symbol": "ToolExecutor"
+        },
+        {
+          "chunk": "c512c74a85edf4db466f5c2e64be6e1f4572bd8648db3850c9f0ff21b6e897ea",
+          "line": 27,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor.execute_all",
+          "symbol": "execute_all"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "derive token latency step and tool statistics from spans",
+      "query_id": "semantic_010",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=123, hybrid=194.",
+      "vector_top5": [
+        {
+          "chunk": "479d4f73a647363b7cb420eff331d77eb18a0609cce5f8529078f21dd1a01234",
+          "line": 215,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "qualified_name": "SQLiteCheckpointStore._load_tool_execution",
+          "symbol": "_load_tool_execution"
+        },
+        {
+          "chunk": "0313258e36fbe1c66446c90e2f61fdd4ef168417ada094016e1f55c9ca0ac874",
+          "line": 77,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor._execute_single",
+          "symbol": "_execute_single"
+        },
+        {
+          "chunk": "1b5e9b6458269f25145a0026af4984538684e08c78fd44b0a733468ca71a289f",
+          "line": 623,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._execute_pending_tool_inner",
+          "symbol": "_execute_pending_tool_inner"
+        },
+        {
+          "chunk": "0bf7a133a58979cb43637e06a6ef66b8589ef8255bfb32c7b6bd84cfb044b454",
+          "line": 170,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "qualified_name": "SQLiteCheckpointStore._save_tool_execution",
+          "symbol": "_save_tool_execution"
+        },
+        {
+          "chunk": "8add52074c67d2d2cde1df364cf0c85942eec5eb5035b23652d20bb07b67e4d3",
+          "line": 70,
+          "path": "src/axiom/runtime/checkpoints.py",
+          "qualified_name": "MemoryCheckpointStore.save_tool_execution",
+          "symbol": "save_tool_execution"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/evaluation/comparison.py",
+          "symbol": "compare_results"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 16,
+      "hybrid_top5": [
+        {
+          "chunk": "62c6523dbaff87bea71ef99d0007645813a334f7ac2dad770e0661e07cf8beed",
+          "line": 10,
+          "path": "src/axiom/policy/command_guard.py",
+          "qualified_name": "CommandGuard",
+          "symbol": "CommandGuard"
+        },
+        {
+          "chunk": "b2caec8834880cb979274e70493a29c7f40c71d84da92ce8097cc8ec33a27630",
+          "line": 13,
+          "path": "src/axiom/policy/command_guard.py",
+          "qualified_name": "CommandGuard.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "aae49547bd158c6ee76fd6cc0f7daf8286c82371ef6e7a812e074a23e83aadaf",
+          "line": 11,
+          "path": "src/axiom/runtime/tasks.py",
+          "qualified_name": "TaskRecord",
+          "symbol": "TaskRecord"
+        },
+        {
+          "chunk": "082551c9fa98638f6079a293e71fac2e24cc2e668bc224ddce663d9558660455",
+          "line": 21,
+          "path": "src/axiom/runtime/tasks.py",
+          "qualified_name": "DurableTaskManager",
+          "symbol": "DurableTaskManager"
+        },
+        {
+          "chunk": "14d7daa97a1cd45dcc28e796a6d40328799c477d4fa2e5ddb575831cf6a2c643",
+          "line": 27,
+          "path": "src/axiom/runtime/tasks.py",
+          "qualified_name": "DurableTaskManager.add",
+          "symbol": "add"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "compare two fixed task reports and flag regressions",
+      "query_id": "semantic_011",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=59, hybrid=16.",
+      "vector_top5": [
+        {
+          "chunk": "b5be84d1c4f22f188324b79a1e3730fbcd8db5db1fd98d87ead78f51cbc9c9ba",
+          "line": 583,
+          "path": "src/axiom/entrypoints/repl.py",
+          "qualified_name": "_task_command",
+          "symbol": "_task_command"
+        },
+        {
+          "chunk": "d2b9b4634ce699bf304254124079b774b256a0e5364b078afb1d3e244890329b",
+          "line": 42,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "LocalPlanTaskScheduler",
+          "symbol": "LocalPlanTaskScheduler"
+        },
+        {
+          "chunk": "63c76dbe505f661865a01f7de6cd883ae0368bd65f8dcacf1fb6f47e30001014",
+          "line": 78,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "LocalPlanTaskScheduler.execute",
+          "symbol": "execute"
+        },
+        {
+          "chunk": "6317aebb672721686c26fc743699ee20ad6c1754e77778b1da03239e6dc0c458",
+          "line": 45,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "LocalPlanTaskScheduler.snapshot",
+          "symbol": "snapshot"
+        },
+        {
+          "chunk": "a43dc8c37022df55e06f2757b40edf7f5a5ffbda4530f816f7aa8215da50897d",
+          "line": 259,
+          "path": "src/axiom/evaluation/models.py",
+          "qualified_name": "EvaluationSuiteResult.create",
+          "symbol": "create"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/plan/planner.py",
+          "symbol": "Planner"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 59,
+      "hybrid_top5": [
+        {
+          "chunk": "4ed6a4fbbae1b0556c5908be94efbf48472bb602ba3aa31ced90ec36d7eeabba",
+          "line": 85,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent",
+          "symbol": "SubAgent"
+        },
+        {
+          "chunk": "644108e2703e90968b2fb954040fea9017e69f03775fa9ecfb3818ba3b238a2c",
+          "line": 172,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._system_prompt",
+          "symbol": "_system_prompt"
+        },
+        {
+          "chunk": "e4b85e0e76d8e6518058247e590216f2c1bfeda80b8ad7e049a9dc58634335ad",
+          "line": 200,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "7d3d68472d901081a79118602af612d355bf45c5cb6bf77244d013b7c491be93",
+          "line": 441,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.build_step_context",
+          "symbol": "build_step_context"
+        },
+        {
+          "chunk": "19e83965e9fdad07efb2e0f6b98e41d51cd4235b1a1b495bfafe03685f3ff91c",
+          "line": 457,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.build_final_result",
+          "symbol": "build_final_result"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "break a complex goal into dependency ordered work items",
+      "query_id": "semantic_012",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=36, hybrid=59.",
+      "vector_top5": [
+        {
+          "chunk": "a9553af587508a887185ef50f45663c6768b93ca8f34d3e3c6e2ec126c61e680",
+          "line": 62,
+          "path": "src/axiom/image/processor.py",
+          "qualified_name": "_encode_image",
+          "symbol": "_encode_image"
+        },
+        {
+          "chunk": "8eb398dff687a9e1791b88ddc32e846940c72d0fd8474ca7e3491bbe016fa028",
+          "line": 26,
+          "path": "src/axiom/web/search.py",
+          "qualified_name": "_parse_duckduckgo",
+          "symbol": "_parse_duckduckgo"
+        },
+        {
+          "chunk": "e61450f61b56ae408ae0893fc18170bd6c782b80377d7de3b88ea13ed7bee091",
+          "line": 507,
+          "path": "src/axiom/tools/builtins.py",
+          "qualified_name": "web_search",
+          "symbol": "web_search"
+        },
+        {
+          "chunk": "7e80e618d62c549689e2617c821bb9b1a25e32eb3553196bf6932d8d3d1ac330",
+          "line": 575,
+          "path": "src/axiom/tools/builtins.py",
+          "qualified_name": "get_code_context",
+          "symbol": "get_code_context"
+        },
+        {
+          "chunk": "d440c43073a90197963480df1b4ceac3bc6c47fdbe4135fe5ce1a6df473adcf7",
+          "line": 1097,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "_worker_input",
+          "symbol": "_worker_input"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "symbol": "LocalPlanTaskScheduler"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 128,
+      "hybrid_top5": [
+        {
+          "chunk": "a67d97670a0bfba1c8c38808eb2c661f80c86880f7c96d5fc60f5acc83d084f0",
+          "line": 368,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.parse_plan",
+          "symbol": "parse_plan"
+        },
+        {
+          "chunk": "47527d3aa0f5f9814502a1c0ed160177675bad850964fbe4cd0b2324dcc7a163",
+          "line": 403,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.get_executable_steps",
+          "symbol": "get_executable_steps"
+        },
+        {
+          "chunk": "a8efecaaf4dea039ebccc5ffc2993890e42711a60849b48e7709ce2741ac668a",
+          "line": 25,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent",
+          "symbol": "PlanExecuteAgent"
+        },
+        {
+          "chunk": "117f6d49bb44fd8e1177bd54bfc8784d929540adf9ed29d0902e0572fa6f7161",
+          "line": 64,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "6791167d964ef2d3b41ec4e893214ca0adc7e7c49dbb3b660a358a3c6d7c15bf",
+          "line": 199,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent._waiting_plan_child",
+          "symbol": "_waiting_plan_child"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "launch independent plan steps up to a local concurrency limit",
+      "query_id": "semantic_013",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=7, hybrid=128.",
+      "vector_top5": [
+        {
+          "chunk": "2f7f521dc97fdd421e7946e2af8da863e8e8b5684de21c2dcbd1a2560431e55f",
+          "line": 718,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._complete_plan",
+          "symbol": "_complete_plan"
+        },
+        {
+          "chunk": "ac87fbbf618aebb0fa3e766f3925e6e3cd3b2a4d23c2db657e9923ae29feedf2",
+          "line": 867,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "_tasks_in_plan_order",
+          "symbol": "_tasks_in_plan_order"
+        },
+        {
+          "chunk": "361c4f34e68bb5dab5c3d616e0a4266b0d6c99df11291bccd5b1b3f737da8356",
+          "line": 809,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._store_plan",
+          "symbol": "_store_plan"
+        },
+        {
+          "chunk": "b4d532eb167c46cbee34dc365d95342b6eec5e86c910df5c4ee81bba9198d38b",
+          "line": 819,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._plan_event",
+          "symbol": "_plan_event"
+        },
+        {
+          "chunk": "53b7ffe7286ac27e844278a86403667adce70d4b0adfb18e825686ce1377d0c3",
+          "line": 300,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._create_plan",
+          "symbol": "_create_plan"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "candidate_generation_miss",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "symbol": "MultiAgentExecutionStrategy"
+        }
+      ],
+      "failure_classification": "semantic mismatch",
+      "first_relevant_rank_if_after_5": null,
+      "hybrid_top5": [
+        {
+          "chunk": "df5e340dedc002ed0cf19d5d8c5c2ac5a277a25e4d66058396fdca7060feb7f4",
+          "line": 339,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._start_workers",
+          "symbol": "_start_workers"
+        },
+        {
+          "chunk": "bb9eb1c074f7c25b3f83e9b212999af3679a0ab56235f25fbcfbf54144e68126",
+          "line": 805,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy._synthesize",
+          "symbol": "_synthesize"
+        },
+        {
+          "chunk": "db5eeee8620095f7f88d033600ce0bf6aad4cad87e8044a12362a0e29d23c9c7",
+          "line": 75,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "ExecutionStep.with_result",
+          "symbol": "with_result"
+        },
+        {
+          "chunk": "63407c7aac9dfa15cb534e5712394c769ba2b1524f77b77d21c7cb7b5e061817",
+          "line": 114,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent.review",
+          "symbol": "review"
+        },
+        {
+          "chunk": "ab5f2ccf687f07913554c62175d900bb5f6ef1c00d7670028431bc156559dd95",
+          "line": 122,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent.clear_history",
+          "symbol": "clear_history"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "coordinate specialist workers then synthesize their outputs",
+      "query_id": "semantic_014",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "The paraphrase matched neither lexical nor deterministic-vector top 50; lexical=None, vector=None, hybrid=None.",
+      "vector_top5": [
+        {
+          "chunk": "70d829c94a3b1e6ecc42122e7f55e201e0039dea920f27635c216e26a764e29e",
+          "line": 264,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy.after_cancel",
+          "symbol": "after_cancel"
+        },
+        {
+          "chunk": "361c4f34e68bb5dab5c3d616e0a4266b0d6c99df11291bccd5b1b3f737da8356",
+          "line": 809,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._store_plan",
+          "symbol": "_store_plan"
+        },
+        {
+          "chunk": "53b7ffe7286ac27e844278a86403667adce70d4b0adfb18e825686ce1377d0c3",
+          "line": 300,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._create_plan",
+          "symbol": "_create_plan"
+        },
+        {
+          "chunk": "94a444d2103f5b7d61757662d5ec1c7cb69f2a7797161e4cf96d100cc2e444f8",
+          "line": 327,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._replan",
+          "symbol": "_replan"
+        },
+        {
+          "chunk": "b4d532eb167c46cbee34dc365d95342b6eec5e86c910df5c4ee81bba9198d38b",
+          "line": 819,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._plan_event",
+          "symbol": "_plan_event"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "candidate_generation_miss",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/memory/context.py",
+          "symbol": "MemoryContextBuilder"
+        }
+      ],
+      "failure_classification": "semantic mismatch",
+      "first_relevant_rank_if_after_5": null,
+      "hybrid_top5": [
+        {
+          "chunk": "4d2a1e2b87b57756553855250f77f5722bdda3e385fd8b1c0b4d9f4e5f162325",
+          "line": 17,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent",
+          "symbol": "Agent"
+        },
+        {
+          "chunk": "04eedbd7835359bb0862a19d4bc5592c74c4ccb38ff042069b2767fbc2dd7366",
+          "line": 18,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "56b1c847085603f03b54bfed619da9a14476264f41b2e5abc8b7de065e4f50c7",
+          "line": 78,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "ExecutionStep.with_failed",
+          "symbol": "with_failed"
+        },
+        {
+          "chunk": "4ed6a4fbbae1b0556c5908be94efbf48472bb602ba3aa31ced90ec36d7eeabba",
+          "line": 85,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent",
+          "symbol": "SubAgent"
+        },
+        {
+          "chunk": "644108e2703e90968b2fb954040fea9017e69f03775fa9ecfb3818ba3b238a2c",
+          "line": 172,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._system_prompt",
+          "symbol": "_system_prompt"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "select useful long term facts while staying inside a prompt budget",
+      "query_id": "semantic_015",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "The paraphrase matched neither lexical nor deterministic-vector top 50; lexical=None, vector=None, hybrid=None.",
+      "vector_top5": [
+        {
+          "chunk": "3f7aeabd78a0ab7b6feca502626e8bd8912f1d46fed190cab5b82e3c2f90e9c1",
+          "line": 25,
+          "path": "src/axiom/rag/call_graph.py",
+          "qualified_name": "CallGraphBuildResult",
+          "symbol": "CallGraphBuildResult"
+        },
+        {
+          "chunk": "e9dfc082e9a507a60886781312ebb689f8d2a3b5208d5d98b45c178dd4e3742a",
+          "line": 1109,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "_role_system_prompt",
+          "symbol": "_role_system_prompt"
+        },
+        {
+          "chunk": "eb5337796937b015bda5e7fa0e4bfc434ce8467f956ee76666596693c05b0076",
+          "line": 27,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentStatus",
+          "symbol": "MultiAgentStatus"
+        },
+        {
+          "chunk": "18a35248340efc80428730226b62683b5029386026c5989c2b7587af166baa32",
+          "line": 1123,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "_worker_system_prompt",
+          "symbol": "_worker_system_prompt"
+        },
+        {
+          "chunk": "644108e2703e90968b2fb954040fea9017e69f03775fa9ecfb3818ba3b238a2c",
+          "line": 172,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._system_prompt",
+          "symbol": "_system_prompt"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/memory/facts.py",
+          "symbol": "DeterministicFactExtractor"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 29,
+      "hybrid_top5": [
+        {
+          "chunk": "50a2a1095aa27cecd03c65011a6b09148d8ae7891da61f56049a19adc10a0634",
+          "line": 47,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage",
+          "symbol": "AgentMessage"
+        },
+        {
+          "chunk": "6a9249462527da46f20ae1c31aca50fa44679d81e01d6e332528f458143db5c5",
+          "line": 54,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.task",
+          "symbol": "task"
+        },
+        {
+          "chunk": "d4c5f1deeac71afb22607cda2a2784dfe169af243ff85982b08a2143ddfe6914",
+          "line": 58,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.result",
+          "symbol": "result"
+        },
+        {
+          "chunk": "fb36b5aa85e23e143ead53258714d56fb9558c281e1d02c6ff47eadcfc802c29",
+          "line": 62,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.error",
+          "symbol": "error"
+        },
+        {
+          "chunk": "cdb585acc427efd0d54b696f22b0ca58c38d32503a501e434825b1c23898712f",
+          "line": 108,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent.execute",
+          "symbol": "execute"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "extract stable user preferences from conversation messages without a model",
+      "query_id": "semantic_016",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=99, hybrid=29.",
+      "vector_top5": [
+        {
+          "chunk": "8bc7380ede047b3ee7b91562ab7eb9b39416a1171111a105be4a2829295f0cd7",
+          "line": 486,
+          "path": "src/axiom/rag/code_index.py",
+          "qualified_name": "CodeIndex._resolve_search_mode",
+          "symbol": "_resolve_search_mode"
+        },
+        {
+          "chunk": "be62e9ac707dfc56e3d1f9a5df0a2e9ed20c58c12403c81e411df1bc67b530df",
+          "line": 21,
+          "path": "src/axiom/runtime/strategies.py",
+          "qualified_name": "RuntimeExecutionStrategy.on_cancel",
+          "symbol": "on_cancel"
+        },
+        {
+          "chunk": "5574317346e5ee2ef67ee1724345172c936491e2198e78ec59d52025ed71ac10",
+          "line": 85,
+          "path": "src/axiom/memory/facts.py",
+          "qualified_name": "FactExtractor.extract",
+          "symbol": "extract"
+        },
+        {
+          "chunk": "0a0a7a9bf83c7c5ed3c4b68022b568c358a7be0c2e8551ff4b7671ff3dc896a4",
+          "line": 15,
+          "path": "src/axiom/runtime/strategies.py",
+          "qualified_name": "RuntimeExecutionStrategy.advance",
+          "symbol": "advance"
+        },
+        {
+          "chunk": "4cd0df87e42cd3dc72269f735355cdc3d98b627baa52da8709624982ba7e4221",
+          "line": 20,
+          "path": "src/axiom/memory/summarizer.py",
+          "qualified_name": "ConversationSummarizer.summarize_map",
+          "symbol": "summarize_map"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/policy/command_guard.py",
+          "symbol": "CommandGuard"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 14,
+      "hybrid_top5": [
+        {
+          "chunk": "a8efecaaf4dea039ebccc5ffc2993890e42711a60849b48e7709ce2741ac668a",
+          "line": 25,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent",
+          "symbol": "PlanExecuteAgent"
+        },
+        {
+          "chunk": "117f6d49bb44fd8e1177bd54bfc8784d929540adf9ed29d0902e0572fa6f7161",
+          "line": 64,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "6791167d964ef2d3b41ec4e893214ca0adc7e7c49dbb3b660a358a3c6d7c15bf",
+          "line": 199,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent._waiting_plan_child",
+          "symbol": "_waiting_plan_child"
+        },
+        {
+          "chunk": "2733228621633799c53cb25ee8a7142dda214421a5f068c223e187778c37447b",
+          "line": 213,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent._total_plan_turns",
+          "symbol": "_total_plan_turns"
+        },
+        {
+          "chunk": "0d3e4a13821c9e4d9ee5f92a1fefab9ee1e5c894bb0b96419a765f843a1fd8a1",
+          "line": 29,
+          "path": "src/axiom/plan/models.py",
+          "qualified_name": "PlanStatus",
+          "symbol": "PlanStatus"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "reject an unsafe shell command before starting the process",
+      "query_id": "semantic_017",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=44, hybrid=14.",
+      "vector_top5": [
+        {
+          "chunk": "2576ddb8935dd10219a8b50877e155e1e4f21e14bdb818da2b8db1b95c259fbf",
+          "line": 178,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "_SubprocessExecutionBackend._terminate_posix_group",
+          "symbol": "_terminate_posix_group"
+        },
+        {
+          "chunk": "af79491bfd774ffa39be2851962e1a625b5f11a21c9b34eb44bbc9dfa9426442",
+          "line": 27,
+          "path": "src/axiom/policy/command_guard.py",
+          "qualified_name": "CommandGuard.validate",
+          "symbol": "validate"
+        },
+        {
+          "chunk": "f87c5f9eb2cc77fb077882002b0f32c5ddc5a303dc691055d8be6307e9cb0a9d",
+          "line": 79,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "_SubprocessExecutionBackend",
+          "symbol": "_SubprocessExecutionBackend"
+        },
+        {
+          "chunk": "1f816605acda191d827215202e253d3fb109463ee9dd15059722418b6446e190",
+          "line": 15,
+          "path": "src/axiom/image/processor.py",
+          "qualified_name": "parse_image_references",
+          "symbol": "parse_image_references"
+        },
+        {
+          "chunk": "107aa808bacf462b24645b7ddf6179a5b3164ac5d88a17efc7f21f1fb71acb1f",
+          "line": 41,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "ApiError.__str__",
+          "symbol": "__str__"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/policy/path_guard.py",
+          "symbol": "PathGuard"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 110,
+      "hybrid_top5": [
+        {
+          "chunk": "ac3b79a35784aaffdea536f2ecf39ec7f0f2973d4370939fabd25195dfd646a8",
+          "line": 22,
+          "path": "src/axiom/tools/builtins.py",
+          "qualified_name": "get_builtin_tools",
+          "symbol": "get_builtin_tools"
+        },
+        {
+          "chunk": "2a73960bd686d866f40c903618a374e3c8a1851f30d30dddf2f5ba569005b225",
+          "line": 45,
+          "path": "src/axiom/config.py",
+          "qualified_name": "ToolsConfig",
+          "symbol": "ToolsConfig"
+        },
+        {
+          "chunk": "b91bc07eac398e5e791ed40608b50fb610cff441dc4dd022d69210278c2d80b4",
+          "line": 164,
+          "path": "src/axiom/evaluation/scorers.py",
+          "qualified_name": "scorer_from_spec",
+          "symbol": "scorer_from_spec"
+        },
+        {
+          "chunk": "72ffc100067d6aa79c8f689d69817f864c13e8bc16b2ac9f90ee911c0d0411e4",
+          "line": 7,
+          "path": "src/axiom/lsp/diagnostics.py",
+          "qualified_name": "diagnose_file",
+          "symbol": "diagnose_file"
+        },
+        {
+          "chunk": "f10f625436fc73a92030f16e840ce442b0e362245cadeb2006d6c859e1dd91bd",
+          "line": 35,
+          "path": "src/axiom/mcp/client.py",
+          "qualified_name": "McpClientManager.load_tools",
+          "symbol": "load_tools"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "prevent file tools from escaping the repository workspace",
+      "query_id": "semantic_018",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=63, hybrid=110.",
+      "vector_top5": [
+        {
+          "chunk": "878ba016a37bf5de5beaeff5b9b5ed63a56b12a67e796c42656bb26a2bef45dc",
+          "line": 24,
+          "path": "src/axiom/runtime/models.py",
+          "qualified_name": "ToolExecutionStatus",
+          "symbol": "ToolExecutionStatus"
+        },
+        {
+          "chunk": "3c056009de90720d7afac21e7d6c933458503924d7f71c55f2dd7022fbb9f4d5",
+          "line": 67,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "ExecutionStep",
+          "symbol": "ExecutionStep"
+        },
+        {
+          "chunk": "e4f3ee32a9f76c157ebd59e0dbf25e7d77e5fbcd6409ee64e53398406fc6073f",
+          "line": 86,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore.replace_file",
+          "symbol": "replace_file"
+        },
+        {
+          "chunk": "f388707ae673a5a58a66e160cdd92326561c6c207084bd925a8b9ebb16c84f4c",
+          "line": 59,
+          "path": "src/axiom/runtime/strategies.py",
+          "qualified_name": "execution_strategy_from_name",
+          "symbol": "execution_strategy_from_name"
+        },
+        {
+          "chunk": "553b9868143a1e94a3ef033c2b763005c803c26c0a37af146756c4542753e7cf",
+          "line": 188,
+          "path": "src/axiom/rag/chunker.py",
+          "qualified_name": "_file_chunk",
+          "symbol": "_file_chunk"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/tools/builtins.py",
+          "symbol": "search_code"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/tools/builtins.py",
+          "symbol": "find_symbol"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 33,
+      "hybrid_top5": [
+        {
+          "chunk": "96ff8606f045f628460172aa3a9cc10d579969504bbcdd4e2f00e0f617deb916",
+          "line": 77,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.clear_history",
+          "symbol": "clear_history"
+        },
+        {
+          "chunk": "27358703bf64f6f8e6a9c25169dbe46f431dd187c86de19b3665efea68fe8636",
+          "line": 24,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentRole",
+          "symbol": "AgentRole"
+        },
+        {
+          "chunk": "dbf398b7f53bace6748e26e0f7b6bb3af6ad163fbc7a75913f55c44cdfe543cf",
+          "line": 30,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessageType",
+          "symbol": "AgentMessageType"
+        },
+        {
+          "chunk": "50a2a1095aa27cecd03c65011a6b09148d8ae7891da61f56049a19adc10a0634",
+          "line": 47,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage",
+          "symbol": "AgentMessage"
+        },
+        {
+          "chunk": "6a9249462527da46f20ae1c31aca50fa44679d81e01d6e332528f458143db5c5",
+          "line": 54,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.task",
+          "symbol": "task"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "offer repository search and symbol navigation as agent tools",
+      "query_id": "semantic_019",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=15, hybrid=33.",
+      "vector_top5": [
+        {
+          "chunk": "2a73960bd686d866f40c903618a374e3c8a1851f30d30dddf2f5ba569005b225",
+          "line": 45,
+          "path": "src/axiom/config.py",
+          "qualified_name": "ToolsConfig",
+          "symbol": "ToolsConfig"
+        },
+        {
+          "chunk": "6a9249462527da46f20ae1c31aca50fa44679d81e01d6e332528f458143db5c5",
+          "line": 54,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.task",
+          "symbol": "task"
+        },
+        {
+          "chunk": "fb36b5aa85e23e143ead53258714d56fb9558c281e1d02c6ff47eadcfc802c29",
+          "line": 62,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.error",
+          "symbol": "error"
+        },
+        {
+          "chunk": "50a2a1095aa27cecd03c65011a6b09148d8ae7891da61f56049a19adc10a0634",
+          "line": 47,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage",
+          "symbol": "AgentMessage"
+        },
+        {
+          "chunk": "d4c5f1deeac71afb22607cda2a2784dfe169af243ff85982b08a2143ddfe6914",
+          "line": 58,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.result",
+          "symbol": "result"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/llm/factory.py",
+          "symbol": "create_llm_client"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 13,
+      "hybrid_top5": [
+        {
+          "chunk": "3d1672783a9e5c371d4e363027352ede9c942be9432645adc1226d20a09d5e36",
+          "line": 23,
+          "path": "src/axiom/mcp/client.py",
+          "qualified_name": "McpClientManager",
+          "symbol": "McpClientManager"
+        },
+        {
+          "chunk": "0a05d1143385a98536e221d684e84af54e18baf108a35d232e5aaf243dd1b537",
+          "line": 24,
+          "path": "src/axiom/mcp/client.py",
+          "qualified_name": "McpClientManager.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "b0532df8af6247fd0a70e4ac9d597215acb2c2fbdbb4d436bf8be106cfcdac97",
+          "line": 49,
+          "path": "src/axiom/mcp/client.py",
+          "qualified_name": "McpClientManager.list_server_tools",
+          "symbol": "list_server_tools"
+        },
+        {
+          "chunk": "736c6ff8cb5f170b54e7a4fa1d6a16aeb2e7e304aa0f1c331ce43891ec17cdcb",
+          "line": 54,
+          "path": "src/axiom/mcp/client.py",
+          "qualified_name": "McpClientManager.call_server_tool",
+          "symbol": "call_server_tool"
+        },
+        {
+          "chunk": "daec45c0618078631e2e4603db3df3f005b6a29e7bc019e224387b83fa4badc6",
+          "line": 108,
+          "path": "src/axiom/mcp/client.py",
+          "qualified_name": "McpClientManager.handler",
+          "symbol": "handler"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "construct the chat client selected by provider configuration",
+      "query_id": "semantic_020",
+      "query_type": "semantic/paraphrase-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=3, hybrid=13.",
+      "vector_top5": [
+        {
+          "chunk": "5bfe147798fa83f0f4aba7f00e1bed4b707e5f02e08cdb8943e365a09639d129",
+          "line": 11,
+          "path": "src/axiom/rag/provider_factory.py",
+          "qualified_name": "create_embedding_provider",
+          "symbol": "create_embedding_provider"
+        },
+        {
+          "chunk": "644108e2703e90968b2fb954040fea9017e69f03775fa9ecfb3818ba3b238a2c",
+          "line": 172,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._system_prompt",
+          "symbol": "_system_prompt"
+        },
+        {
+          "chunk": "874ea0416ca85f9047926791149d9f877062069a9b9533b812d2a87851711b0e",
+          "line": 25,
+          "path": "src/axiom/llm/factory.py",
+          "qualified_name": "create_llm_client",
+          "symbol": "create_llm_client"
+        },
+        {
+          "chunk": "eecca6f1a9f927b837a38b17c10eb88f1a231c81f2673e67bffe7fede87ae5ba",
+          "line": 180,
+          "path": "src/axiom/rag/embeddings.py",
+          "qualified_name": "infer_dimensions",
+          "symbol": "infer_dimensions"
+        },
+        {
+          "chunk": "97d8fd01ff0cba1a5342771086e6ec937e8d2b638790fa3c1eedfc0c24170264",
+          "line": 26,
+          "path": "src/axiom/prompt/assembler.py",
+          "qualified_name": "PromptAssembler.build",
+          "symbol": "build"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/execution/backends.py",
+          "symbol": "create_execution_backend"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/durable.py",
+          "symbol": "DurableAgentRuntime"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/tools/executor.py",
+          "symbol": "ToolExecutor"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 20,
+      "hybrid_top5": [
+        {
+          "chunk": "1b7bfc2346f6bcb257e31245fecad18e200142f7a3b4389f20fc7653f563236d",
+          "line": 19,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "ExecutionRequest",
+          "symbol": "ExecutionRequest"
+        },
+        {
+          "chunk": "0dae7d20c87a2064c71de0f46d85d862d754f07fc90a76b22f13cd4647bf0c12",
+          "line": 32,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "ExecutionResult",
+          "symbol": "ExecutionResult"
+        },
+        {
+          "chunk": "aa75ab20d7919b575f12bcc8919f65d2129d4060223b9d7b41b9456668dfeca3",
+          "line": 48,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "ExecutionResult.metadata",
+          "symbol": "metadata"
+        },
+        {
+          "chunk": "e6603c3af290003ac7dfa1f6fef29bb955ea8aff9ca31bd768d4e64a15ecacdf",
+          "line": 66,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "ExecutionBackend",
+          "symbol": "ExecutionBackend"
+        },
+        {
+          "chunk": "cc9b00909525e949325f25ab3069c3ce3970df2314dd2479df5dee262fe3ff4e",
+          "line": 69,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "ExecutionBackend.execute",
+          "symbol": "execute"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "who calls create_execution_backend",
+      "query_id": "graph_001",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=1, hybrid=20.",
+      "vector_top5": [
+        {
+          "chunk": "3964100a48d8a22dc66697d6365318049a02eb7c69835f6a722352119b8937bc",
+          "line": 277,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "create_execution_backend",
+          "symbol": "create_execution_backend"
+        },
+        {
+          "chunk": "9342f94489a207efcecbdb862baf864ed93de2e1cd17a818a9722d637bfe24bc",
+          "line": 70,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor._ensure_execution_backend",
+          "symbol": "_ensure_execution_backend"
+        },
+        {
+          "chunk": "ec6118e79c97d2c30e8a6687bec8ebdb54f17949650bf0e1d3a9a2aaf4185052",
+          "line": 19,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "d40eba1f24d956f4551d69d8e9a20538f3cec51fec2be17c952c582dab657ae0",
+          "line": 236,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "LocalExecutionBackend",
+          "symbol": "LocalExecutionBackend"
+        },
+        {
+          "chunk": "e6603c3af290003ac7dfa1f6fef29bb955ea8aff9ca31bd768d4e64a15ecacdf",
+          "line": 66,
+          "path": "src/axiom/execution/backends.py",
+          "qualified_name": "ExecutionBackend",
+          "symbol": "ExecutionBackend"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/rag/code_index_factory.py",
+          "symbol": "create_code_index"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/rag/provider_factory.py",
+          "symbol": "create_embedding_provider_or_none"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 31,
+      "hybrid_top5": [
+        {
+          "chunk": "1a83445b52cd2eedb936f976a91da0e3d486c528ca617f237804789c74b0b4d0",
+          "line": 197,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator",
+          "symbol": "AgentOrchestrator"
+        },
+        {
+          "chunk": "013982b2e203dcbb1b97abeb663c14c5ac7592942ed993bdfd812903dda329a5",
+          "line": 230,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "8bba2d2cf262fff109f405bf4d727a00ad66407ee17bc468d73f4b33ac560556",
+          "line": 329,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator._approve_waiting_child",
+          "symbol": "_approve_waiting_child"
+        },
+        {
+          "chunk": "0eee97df77318b2c095ce17c72d24b54b4a00a526dd782355def6d74b04de57f",
+          "line": 201,
+          "path": "src/axiom/memory/store.py",
+          "qualified_name": "MemoryStore.retract_fact",
+          "symbol": "retract_fact"
+        },
+        {
+          "chunk": "b476febd1bb27a5d13cf776a9bf154f4b931f993ec7e983cafb422d80ef4f64c",
+          "line": 536,
+          "path": "src/axiom/memory/store.py",
+          "qualified_name": "MemoryStore._migrate_old_rows",
+          "symbol": "_migrate_old_rows"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "what does create_code_index use to construct embeddings",
+      "query_id": "graph_002",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=1, hybrid=31.",
+      "vector_top5": [
+        {
+          "chunk": "b12ae3aad3e3d8405c911f956ddbf74b382862091f103387c5ff57168d71f6fa",
+          "line": 10,
+          "path": "src/axiom/rag/code_index_factory.py",
+          "qualified_name": "create_code_index",
+          "symbol": "create_code_index"
+        },
+        {
+          "chunk": "50cd78ff5be55986698a166c6dea774ca268019380bf2e401c3fae65d30b2137",
+          "line": 492,
+          "path": "src/axiom/rag/code_index.py",
+          "qualified_name": "CodeIndex._merge_embedding_stats",
+          "symbol": "_merge_embedding_stats"
+        },
+        {
+          "chunk": "397566ef6db8ed7058283b92564aba48cbbec28d194fa385000d35590a01bede",
+          "line": 782,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore._migrate_v2_to_v3",
+          "symbol": "_migrate_v2_to_v3"
+        },
+        {
+          "chunk": "f0f2aef66305132ae067edb20a0ef7a043e4b013fe3cd98c429520df49c48fc5",
+          "line": 514,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore.count_embeddings",
+          "symbol": "count_embeddings"
+        },
+        {
+          "chunk": "95af2cb957547e6f74df2d51a715b94776eaaf13fbad31825f245788b719c598",
+          "line": 734,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore._create_fts_table",
+          "symbol": "_create_fts_table"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/evaluation/scorers.py",
+          "symbol": "score_case"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/evaluation/runner.py",
+          "symbol": "EvaluationRunner"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 24,
+      "hybrid_top5": [
+        {
+          "chunk": "138bf2fe61428c7409797ea8e6867d467e869a16782cf698c7fafb2111c82eed",
+          "line": 44,
+          "path": "src/axiom/evaluation/comparison.py",
+          "qualified_name": "EvaluationComparison",
+          "symbol": "EvaluationComparison"
+        },
+        {
+          "chunk": "502bbd912a7ca1ba0d88200f49dac64680014bd2dc7c694748332c9918e9a45b",
+          "line": 52,
+          "path": "src/axiom/evaluation/comparison.py",
+          "qualified_name": "EvaluationComparison.to_dict",
+          "symbol": "to_dict"
+        },
+        {
+          "chunk": "bc9d6bb777d48d4b51e0009f812e1c4047769193e89eda8cd462f3fce80b62e7",
+          "line": 36,
+          "path": "src/axiom/evaluation/models.py",
+          "qualified_name": "EvaluationCase",
+          "symbol": "EvaluationCase"
+        },
+        {
+          "chunk": "8e8fb682505e87a6ed8b513f522030db5d0c6c8d9f4c84a8dfc3eeb065ba44fb",
+          "line": 48,
+          "path": "src/axiom/evaluation/models.py",
+          "qualified_name": "EvaluationCase.from_dict",
+          "symbol": "from_dict"
+        },
+        {
+          "chunk": "0d8c7204f32cd56bc4ff1b11edac91b9b4cf6333cb92a84714c75c1b1b7ccde7",
+          "line": 78,
+          "path": "src/axiom/evaluation/models.py",
+          "qualified_name": "EvaluationCase.to_dict",
+          "symbol": "to_dict"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "where is score_case invoked by the evaluation suite",
+      "query_id": "graph_003",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=1, hybrid=24.",
+      "vector_top5": [
+        {
+          "chunk": "ee7727c87ab27b6825e0ef903143fa290de785dac50924a3245153180933861f",
+          "line": 218,
+          "path": "src/axiom/evaluation/scorers.py",
+          "qualified_name": "score_case",
+          "symbol": "score_case"
+        },
+        {
+          "chunk": "59ba6f3dbe2d738c7558eec9104eeb9fc6c975f4039d83407a51daffdda44491",
+          "line": 19,
+          "path": "src/axiom/evaluation/scorers.py",
+          "qualified_name": "Scorer.score",
+          "symbol": "score"
+        },
+        {
+          "chunk": "dd5f14e332692cfab5dc34b980176772242e42174136ef801a3d3f745bdfc0e6",
+          "line": 35,
+          "path": "src/axiom/evaluation/runner.py",
+          "qualified_name": "EvaluationExecutor",
+          "symbol": "EvaluationExecutor"
+        },
+        {
+          "chunk": "c90cb316ee38c29fb4fc476f01fa0b550a417fd3ebb4cf8978f6983bf691ebe7",
+          "line": 176,
+          "path": "src/axiom/evaluation/runner.py",
+          "qualified_name": "EvaluationRunner",
+          "symbol": "EvaluationRunner"
+        },
+        {
+          "chunk": "0170b93272fe32b563d24f622de599a4f2b76356b759ca00a4f88757729ccdf1",
+          "line": 414,
+          "path": "src/axiom/entrypoints/cli.py",
+          "qualified_name": "_format_evaluation_suite",
+          "symbol": "_format_evaluation_suite"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/evaluation/dataset.py",
+          "symbol": "save_result"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/entrypoints/cli.py",
+          "symbol": "eval_run"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 8,
+      "hybrid_top5": [
+        {
+          "chunk": "d4f030c90f41b90a3ad22905daa4f5231c67ff22c0a002c4403f9c6f5e0490da",
+          "line": 75,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent.capture",
+          "symbol": "capture"
+        },
+        {
+          "chunk": "eb2ee16e936b8569bb328f68c00451df8f2d31a1a2b24d57b6ec9d930e642d5f",
+          "line": 185,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent._approval_decision",
+          "symbol": "_approval_decision"
+        },
+        {
+          "chunk": "92be8700b21bd25a5e9da85c3efc2a803f1c53ba7193b81604bd0de126e8b97c",
+          "line": 17,
+          "path": "src/axiom/evaluation/comparison.py",
+          "qualified_name": "MetricChange.to_dict",
+          "symbol": "to_dict"
+        },
+        {
+          "chunk": "54d94d589b5a525c39eddba03e0d3467d52faac1883372ad6f028e9ed031f52d",
+          "line": 34,
+          "path": "src/axiom/evaluation/comparison.py",
+          "qualified_name": "PerformanceWarning.to_dict",
+          "symbol": "to_dict"
+        },
+        {
+          "chunk": "138bf2fe61428c7409797ea8e6867d467e869a16782cf698c7fafb2111c82eed",
+          "line": 44,
+          "path": "src/axiom/evaluation/comparison.py",
+          "qualified_name": "EvaluationComparison",
+          "symbol": "EvaluationComparison"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "callers that persist an EvaluationSuiteResult with save_result",
+      "query_id": "graph_004",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=2, hybrid=8.",
+      "vector_top5": [
+        {
+          "chunk": "516e2b5e5faa2e03878b565ea125dee1eb4d6756395f4da8cac8a5f5f20fd6d6",
+          "line": 28,
+          "path": "src/axiom/evaluation/dataset.py",
+          "qualified_name": "load_result",
+          "symbol": "load_result"
+        },
+        {
+          "chunk": "6c38ca4c83bae3a897f2735a70f4320ca89bf85ccd1f011a04655a8cf01591f2",
+          "line": 18,
+          "path": "src/axiom/evaluation/dataset.py",
+          "qualified_name": "save_result",
+          "symbol": "save_result"
+        },
+        {
+          "chunk": "a43dc8c37022df55e06f2757b40edf7f5a5ffbda4530f816f7aa8215da50897d",
+          "line": 259,
+          "path": "src/axiom/evaluation/models.py",
+          "qualified_name": "EvaluationSuiteResult.create",
+          "symbol": "create"
+        },
+        {
+          "chunk": "99ce71a0aa078aa414b2f99673807a108ece16be59ac5f1069c8f85b7b8aca5c",
+          "line": 186,
+          "path": "src/axiom/evaluation/runner.py",
+          "qualified_name": "EvaluationRunner.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "0170b93272fe32b563d24f622de599a4f2b76356b759ca00a4f88757729ccdf1",
+          "line": 414,
+          "path": "src/axiom/entrypoints/cli.py",
+          "qualified_name": "_format_evaluation_suite",
+          "symbol": "_format_evaluation_suite"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/evaluation/runner.py",
+          "symbol": "DurableEvaluationExecutor"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/durable.py",
+          "symbol": "DurableAgentRuntime"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 16,
+      "hybrid_top5": [
+        {
+          "chunk": "96ff8606f045f628460172aa3a9cc10d579969504bbcdd4e2f00e0f617deb916",
+          "line": 77,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.clear_history",
+          "symbol": "clear_history"
+        },
+        {
+          "chunk": "50a2a1095aa27cecd03c65011a6b09148d8ae7891da61f56049a19adc10a0634",
+          "line": 47,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage",
+          "symbol": "AgentMessage"
+        },
+        {
+          "chunk": "6a9249462527da46f20ae1c31aca50fa44679d81e01d6e332528f458143db5c5",
+          "line": 54,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.task",
+          "symbol": "task"
+        },
+        {
+          "chunk": "d4c5f1deeac71afb22607cda2a2784dfe169af243ff85982b08a2143ddfe6914",
+          "line": 58,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.result",
+          "symbol": "result"
+        },
+        {
+          "chunk": "fb36b5aa85e23e143ead53258714d56fb9558c281e1d02c6ff47eadcfc802c29",
+          "line": 62,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentMessage.error",
+          "symbol": "error"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "DurableEvaluationExecutor path to DurableAgentRuntime",
+      "query_id": "graph_005",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=143, hybrid=16.",
+      "vector_top5": [
+        {
+          "chunk": "6eb65464ddd6a21b58f2a30e0e52d1ed10324f51522cdb20e5579de7e2bb9773",
+          "line": 957,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy._child_runtime",
+          "symbol": "_child_runtime"
+        },
+        {
+          "chunk": "9f50745fb5ce15b7c7b52f6c1b0b077bdd4b78de9002290962d58132908cff07",
+          "line": 761,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._child_runtime",
+          "symbol": "_child_runtime"
+        },
+        {
+          "chunk": "4fd0d8036ff20974f5433c43d989b921388f95785c96ad46eb50c619e80992cd",
+          "line": 12,
+          "path": "src/axiom/runtime/strategies.py",
+          "qualified_name": "RuntimeExecutionStrategy",
+          "symbol": "RuntimeExecutionStrategy"
+        },
+        {
+          "chunk": "8dc0a318c6fad6ec402ab4e2e6d028af50bdd20432dec39a034b98d42b9859ba",
+          "line": 1099,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._durable_runtime",
+          "symbol": "_durable_runtime"
+        },
+        {
+          "chunk": "07356c1ab3142ee9db43bef973bd39ad803e3731e0203a50eb2a1332249c7d5f",
+          "line": 1162,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._run_lock",
+          "symbol": "_run_lock"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/api.py",
+          "symbol": "RuntimeApiServer"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/control_plane.py",
+          "symbol": "run_view"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 9,
+      "hybrid_top5": [
+        {
+          "chunk": "39b479fe35b095c4d4604eae3a7ead2bb0b53de110c9ef3a320ed975cf8c551b",
+          "line": 39,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "StepStatus",
+          "symbol": "StepStatus"
+        },
+        {
+          "chunk": "1a83445b52cd2eedb936f976a91da0e3d486c528ca617f237804789c74b0b4d0",
+          "line": 197,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator",
+          "symbol": "AgentOrchestrator"
+        },
+        {
+          "chunk": "013982b2e203dcbb1b97abeb663c14c5ac7592942ed993bdfd812903dda329a5",
+          "line": 230,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "8bba2d2cf262fff109f405bf4d727a00ad66407ee17bc468d73f4b33ac560556",
+          "line": 329,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator._approve_waiting_child",
+          "symbol": "_approve_waiting_child"
+        },
+        {
+          "chunk": "47527d3aa0f5f9814502a1c0ed160177675bad850964fbe4cd0b2324dcc7a163",
+          "line": 403,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.get_executable_steps",
+          "symbol": "get_executable_steps"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "RuntimeApiServer delegates run status views to control plane",
+      "query_id": "graph_007",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=60, hybrid=9.",
+      "vector_top5": [
+        {
+          "chunk": "016843626d79aacb3b46fa095ace16b2916e2bf6381ea90b36a5e0724d39b657",
+          "line": 1277,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._update_run_trace",
+          "symbol": "_update_run_trace"
+        },
+        {
+          "chunk": "2c41bfe01364b3422d67e40d4945a8941960215a894328ce121a92913ccbeb5c",
+          "line": 1194,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._set_run_status",
+          "symbol": "_set_run_status"
+        },
+        {
+          "chunk": "1341a1669c961f0f41d73efa3584b5ff86f74be6219200974ef81ddbec84722f",
+          "line": 388,
+          "path": "src/axiom/runtime/observability_store.py",
+          "qualified_name": "RunTracer.update_run",
+          "symbol": "update_run"
+        },
+        {
+          "chunk": "9f1fa33e93f7f55db70142e8efb7fa6aaf6c691230dfe70c2a7a9cb4ba1ac391",
+          "line": 1281,
+          "path": "src/axiom/runtime/durable.py",
+          "qualified_name": "DurableAgentRuntime._finish_run_trace",
+          "symbol": "_finish_run_trace"
+        },
+        {
+          "chunk": "a41d9a0e05e31c9cf9311781fe6db2b11a95e080615e7323a546eb14052f7cb5",
+          "line": 1673,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "runtime_api_key",
+          "symbol": "runtime_api_key"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "symbol": "plan_task_child_run_id"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "symbol": "LocalPlanTaskScheduler"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 49,
+      "hybrid_top5": [
+        {
+          "chunk": "a8efecaaf4dea039ebccc5ffc2993890e42711a60849b48e7709ce2741ac668a",
+          "line": 25,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent",
+          "symbol": "PlanExecuteAgent"
+        },
+        {
+          "chunk": "a109e03c847e819009b10634112cd22d71775a18d6a27b15ecaa4ded5a9c5da5",
+          "line": 32,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "117f6d49bb44fd8e1177bd54bfc8784d929540adf9ed29d0902e0572fa6f7161",
+          "line": 64,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "6791167d964ef2d3b41ec4e893214ca0adc7e7c49dbb3b660a358a3c6d7c15bf",
+          "line": 199,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent._waiting_plan_child",
+          "symbol": "_waiting_plan_child"
+        },
+        {
+          "chunk": "2733228621633799c53cb25ee8a7142dda214421a5f068c223e187778c37447b",
+          "line": 213,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent._total_plan_turns",
+          "symbol": "_total_plan_turns"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "plan child identity persisted before task spawn",
+      "query_id": "graph_008",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=1, hybrid=49.",
+      "vector_top5": [
+        {
+          "chunk": "3fae89229fe96b5273a38395a687a7cf155adb78fc720901ab9cd3df4c2fc00f",
+          "line": 471,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._persist_ready_tasks",
+          "symbol": "_persist_ready_tasks"
+        },
+        {
+          "chunk": "841d919a3f78d47b568e42de79660ebc0d704ced592ccdcac5cfb65a1382283d",
+          "line": 780,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._plan_step_span",
+          "symbol": "_plan_step_span"
+        },
+        {
+          "chunk": "48ba13e7d02bfa8eb418fba78a64a6f4d7615f5d5ef47390414b7827dd2fc0c2",
+          "line": 457,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._child_states",
+          "symbol": "_child_states"
+        },
+        {
+          "chunk": "6791167d964ef2d3b41ec4e893214ca0adc7e7c49dbb3b660a358a3c6d7c15bf",
+          "line": 199,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent._waiting_plan_child",
+          "symbol": "_waiting_plan_child"
+        },
+        {
+          "chunk": "0e6b49758497e06c39ca1fc6c94625a47f6d8b1a05e560e863462bc26f492abb",
+          "line": 128,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy",
+          "symbol": "PlanExecuteStrategy"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "symbol": "WorkerAssignment"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "symbol": "child_run_id"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 45,
+      "hybrid_top5": [
+        {
+          "chunk": "ed42edb2e14f4baa3c759cd7db822afd1cc49f5575030ca5f019e74e8defb846",
+          "line": 225,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer",
+          "symbol": "RuntimeApiServer"
+        },
+        {
+          "chunk": "76a314f87f4227b9d139294e2a6d9a00d0d19779d29b088bf08240b594f334f5",
+          "line": 226,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "42c2bb724bffa1afe8701e4f7b75950c67b92f46d6039f0cbc159f208c8c8301",
+          "line": 286,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer.start",
+          "symbol": "start"
+        },
+        {
+          "chunk": "189cb36a6d1450e2c795e80653cd8c11724d71cf611ce8bad0140b3c28e2bd88",
+          "line": 301,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer.serve_forever",
+          "symbol": "serve_forever"
+        },
+        {
+          "chunk": "f9a4dc5dfab964203e28c05d89f15d481c7858c7dee8d78bb13b3f24234a7a31",
+          "line": 320,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer.shutdown",
+          "symbol": "shutdown"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "worker assignment child run identity relationship",
+      "query_id": "graph_009",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=1, hybrid=45.",
+      "vector_top5": [
+        {
+          "chunk": "c502e95d643a84ddc21f5d6d96c4f9fac8a3ea137c2c915ef90c2178acb3b38b",
+          "line": 400,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy.resume_waiting_child",
+          "symbol": "resume_waiting_child"
+        },
+        {
+          "chunk": "8b05352d0ebab20c1ff585de898c2b97bb4dc0985460a748bf85379e18c06b0f",
+          "line": 531,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy._start_child",
+          "symbol": "_start_child"
+        },
+        {
+          "chunk": "a9ec9acd83eb37637d8498320289b9363f926d6bd46fce5b1c010dff76263371",
+          "line": 1009,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy._assignment_event",
+          "symbol": "_assignment_event"
+        },
+        {
+          "chunk": "826525adbea53afd5d584fa1d2df276b74879a86e1ea22db2623de4650863dd3",
+          "line": 595,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy._observe_child",
+          "symbol": "_observe_child"
+        },
+        {
+          "chunk": "2ea98aa87de6d1630ba7fa10ad7528e2c963d407bd371a2f3c5fa1cb316935f5",
+          "line": 64,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "WorkerAssignment.to_dict",
+          "symbol": "to_dict"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/observability_store.py",
+          "symbol": "RunTracer"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/observability.py",
+          "symbol": "Trace"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/observability.py",
+          "symbol": "Span"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 40,
+      "hybrid_top5": [
+        {
+          "chunk": "c90cb316ee38c29fb4fc476f01fa0b550a417fd3ebb4cf8978f6983bf691ebe7",
+          "line": 176,
+          "path": "src/axiom/evaluation/runner.py",
+          "qualified_name": "EvaluationRunner",
+          "symbol": "EvaluationRunner"
+        },
+        {
+          "chunk": "99ce71a0aa078aa414b2f99673807a108ece16be59ac5f1069c8f85b7b8aca5c",
+          "line": 186,
+          "path": "src/axiom/evaluation/runner.py",
+          "qualified_name": "EvaluationRunner.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "ed42edb2e14f4baa3c759cd7db822afd1cc49f5575030ca5f019e74e8defb846",
+          "line": 225,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer",
+          "symbol": "RuntimeApiServer"
+        },
+        {
+          "chunk": "76a314f87f4227b9d139294e2a6d9a00d0d19779d29b088bf08240b594f334f5",
+          "line": 226,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "5d520a86156a13b85c9db9422d1a75df47d1c34b8a1249249b83450460cba48d",
+          "line": 366,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "RuntimeApiServer._handle",
+          "symbol": "_handle"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "RunTracer writes Trace and Span records",
+      "query_id": "graph_010",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=2, hybrid=40.",
+      "vector_top5": [
+        {
+          "chunk": "4f7fc32c748f37ade86807ff39e805c5eaadee0cae69a1b5dcefb8447640800b",
+          "line": 483,
+          "path": "src/axiom/entrypoints/cli.py",
+          "qualified_name": "_format_run_trace",
+          "symbol": "_format_run_trace"
+        },
+        {
+          "chunk": "a026d6904a5028fe61ba1175c966928907592c6a2f01419b66526b688cbb2862",
+          "line": 274,
+          "path": "src/axiom/runtime/observability_store.py",
+          "qualified_name": "RunTracer",
+          "symbol": "RunTracer"
+        },
+        {
+          "chunk": "53c551ede4ba0a9cf38b962239422cea4001d0ac78247c022cd91b0d7c556644",
+          "line": 165,
+          "path": "src/axiom/runtime/observability.py",
+          "qualified_name": "RunMetrics.from_trace",
+          "symbol": "from_trace"
+        },
+        {
+          "chunk": "68cf1e972b2e2de76796c666e2ab21098d80934864613a5a7406828cbb48f035",
+          "line": 412,
+          "path": "src/axiom/runtime/observability_store.py",
+          "qualified_name": "RunTracer._close_stale_spans",
+          "symbol": "_close_stale_spans"
+        },
+        {
+          "chunk": "d0c5f17214b5917e7554f27f4ccfc631848e2a1615038164626f926f4a6c13c9",
+          "line": 364,
+          "path": "src/axiom/runtime/observability_store.py",
+          "qualified_name": "RunTracer.finish_span",
+          "symbol": "finish_span"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/memory/service.py",
+          "symbol": "MemoryService"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/memory/store.py",
+          "symbol": "MemoryStore"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 16,
+      "hybrid_top5": [
+        {
+          "chunk": "1c0c83087b4f79584f2014ee0a43a5592dbd2f9cc7bade7f6fbc3a78235858c2",
+          "line": 26,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "MemoryContextBuilder",
+          "symbol": "MemoryContextBuilder"
+        },
+        {
+          "chunk": "c171bf8a40f9ecc94bcb1c8ff56a3d29d58d00e03ff6261acde59fa8c4bf9c28",
+          "line": 27,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "MemoryContextBuilder.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "cbeda6644f84a8e89040a83952f1a73ef1538035c7b058edeff3e7469035099d",
+          "line": 123,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "MemoryContextBuilder._candidate_records",
+          "symbol": "_candidate_records"
+        },
+        {
+          "chunk": "0b3989411575f5e0534e3bcc0d2d640a61e7dea2061b9ae4a09801d8db9026d6",
+          "line": 13,
+          "path": "src/axiom/memory/manager.py",
+          "qualified_name": "MemoryEntry",
+          "symbol": "MemoryEntry"
+        },
+        {
+          "chunk": "ac95ef9883b44fc729e0170f237e46b711838b436e26ffe35e1c09d79d7b9367",
+          "line": 20,
+          "path": "src/axiom/memory/manager.py",
+          "qualified_name": "MemoryManager",
+          "symbol": "MemoryManager"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "MemoryService persistence calls into MemoryStore",
+      "query_id": "graph_011",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=78, hybrid=16.",
+      "vector_top5": [
+        {
+          "chunk": "a50652ea52dd51a8d22238f06aa7c2155d9d869724a44f10baf0034e8fc64d93",
+          "line": 258,
+          "path": "src/axiom/runtime/observability_store.py",
+          "qualified_name": "ObservabilityService.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "3af90e272ec64cb39cf55bf6578acd25dbe834d361f00cb24d2b3452ad0b8b10",
+          "line": 262,
+          "path": "src/axiom/memory/service.py",
+          "qualified_name": "MemoryService.search_records",
+          "symbol": "search_records"
+        },
+        {
+          "chunk": "d951d9349cb8fabdca6d66664bbda5e6d6311e7082bf1e2bf99b1e8915d141b8",
+          "line": 590,
+          "path": "src/axiom/memory/store.py",
+          "qualified_name": "MemoryStore.set_meta",
+          "symbol": "set_meta"
+        },
+        {
+          "chunk": "c171bf8a40f9ecc94bcb1c8ff56a3d29d58d00e03ff6261acde59fa8c4bf9c28",
+          "line": 27,
+          "path": "src/axiom/memory/context.py",
+          "qualified_name": "MemoryContextBuilder.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "f44ef2ab54fa83c057f4f6e055ab6c73cdb85de9e1754e8e3047427c3c634539",
+          "line": 42,
+          "path": "src/axiom/evaluation/runner.py",
+          "qualified_name": "DurableEvaluationExecutor.__init__",
+          "symbol": "__init__"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/agent/query_engine.py",
+          "symbol": "QueryEngine"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/bootstrap.py",
+          "symbol": "build_tool_registry"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/entrypoints/cli.py",
+          "symbol": "_run_prompt"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 104,
+      "hybrid_top5": [
+        {
+          "chunk": "25e0e0605cec584c67cfe478b807c02a616b1cd8817ecf81bc03ec0a29946753",
+          "line": 16,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "bcd5b7dd443974d6e5ae556d25be8ed2ebb4da093a1739e0e823479e1d915265",
+          "line": 38,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine.ask",
+          "symbol": "ask"
+        },
+        {
+          "chunk": "606681ae9d1f45cce3a42fec682d0c367b5a98eca76ba824983b3dfbb5d13599",
+          "line": 51,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine.plan",
+          "symbol": "plan"
+        },
+        {
+          "chunk": "af92ed0e5f53a4e14319ce8689536385f152be766c95b708b0eeeb4cb0def562",
+          "line": 62,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine.team",
+          "symbol": "team"
+        },
+        {
+          "chunk": "4079d5e478285a53a6f3aad7b199fba74964d50dd81685e81c36ee7170be5113",
+          "line": 73,
+          "path": "src/axiom/agent/query_engine.py",
+          "qualified_name": "QueryEngine.ask_complete_async",
+          "symbol": "ask_complete_async"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "QueryEngine receives repository code tools from CLI bootstrap",
+      "query_id": "graph_013",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=70, hybrid=104.",
+      "vector_top5": [
+        {
+          "chunk": "f10f625436fc73a92030f16e840ce442b0e362245cadeb2006d6c859e1dd91bd",
+          "line": 35,
+          "path": "src/axiom/mcp/client.py",
+          "qualified_name": "McpClientManager.load_tools",
+          "symbol": "load_tools"
+        },
+        {
+          "chunk": "8a3580843f3299df2ff054c4d22a3e6bca7101d09084fdd2fb3a67316c69415c",
+          "line": 351,
+          "path": "src/axiom/entrypoints/cli.py",
+          "qualified_name": "engine_factory",
+          "symbol": "engine_factory"
+        },
+        {
+          "chunk": "cd4ca0668c5269cd65ceb6e1db5da8b5e19092b6a6dc2af3cd43973d2b5b5302",
+          "line": 331,
+          "path": "src/axiom/rag/code_index.py",
+          "qualified_name": "CodeIndex._search_vector",
+          "symbol": "_search_vector"
+        },
+        {
+          "chunk": "8c41fa1d3554e6ee0902bd451079507becfebb2386f1dd0d24ccea640567182f",
+          "line": 355,
+          "path": "src/axiom/rag/code_index.py",
+          "qualified_name": "CodeIndex._lexical_rows",
+          "symbol": "_lexical_rows"
+        },
+        {
+          "chunk": "888cc683f69f116d3e0d139b6abfc30a61d2197afd5aaa0a6244a7d5c668986c",
+          "line": 327,
+          "path": "src/axiom/rag/code_index.py",
+          "qualified_name": "CodeIndex._search_lexical",
+          "symbol": "_search_lexical"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/tools/builtins.py",
+          "symbol": "find_callers"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/rag/code_index.py",
+          "symbol": "find_callers"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 61,
+      "hybrid_top5": [
+        {
+          "chunk": "6a46cef831152f5e72e1538d5a173d829b537fdab1ac2a8e6698c4574bd8e6e2",
+          "line": 16,
+          "path": "src/axiom/memory/store.py",
+          "qualified_name": "MemoryStore.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "d951d9349cb8fabdca6d66664bbda5e6d6311e7082bf1e2bf99b1e8915d141b8",
+          "line": 590,
+          "path": "src/axiom/memory/store.py",
+          "qualified_name": "MemoryStore.set_meta",
+          "symbol": "set_meta"
+        },
+        {
+          "chunk": "233635f78928a6a5558cc9fe3a834c996611afe9c723036c440d5a50bcb96031",
+          "line": 600,
+          "path": "src/axiom/memory/store.py",
+          "qualified_name": "MemoryStore._connect",
+          "symbol": "_connect"
+        },
+        {
+          "chunk": "3f7aeabd78a0ab7b6feca502626e8bd8912f1d46fed190cab5b82e3c2f90e9c1",
+          "line": 25,
+          "path": "src/axiom/rag/call_graph.py",
+          "qualified_name": "CallGraphBuildResult",
+          "symbol": "CallGraphBuildResult"
+        },
+        {
+          "chunk": "f06ef80204368196c732818cc3818f61f6ef444e255bcc5b031c4b502cacfb1a",
+          "line": 40,
+          "path": "src/axiom/rag/call_graph.py",
+          "qualified_name": "stable_call_edge_id",
+          "symbol": "stable_call_edge_id"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "find_callers tool reaches static call graph store",
+      "query_id": "graph_015",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=3, hybrid=61.",
+      "vector_top5": [
+        {
+          "chunk": "c472000a212e907cb0c3add6da9fa9b675752d75e86922b6c089a350fce0ed31",
+          "line": 426,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore.find_callers",
+          "symbol": "find_callers"
+        },
+        {
+          "chunk": "c512c74a85edf4db466f5c2e64be6e1f4572bd8648db3850c9f0ff21b6e897ea",
+          "line": 27,
+          "path": "src/axiom/tools/executor.py",
+          "qualified_name": "ToolExecutor.execute_all",
+          "symbol": "execute_all"
+        },
+        {
+          "chunk": "f9709125a41b4d215425fc081add80ebe690f419bc99b02bb3e15fe7ecdac7e6",
+          "line": 642,
+          "path": "src/axiom/tools/builtins.py",
+          "qualified_name": "find_callers",
+          "symbol": "find_callers"
+        },
+        {
+          "chunk": "ac991146ea84aa277f915966df213376f781c18b464414c4232735241f8409c3",
+          "line": 1168,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore._has_call_graph_tables",
+          "symbol": "_has_call_graph_tables"
+        },
+        {
+          "chunk": "b6e425ab2972be6df95095876eed72a57b3c673ae94df5f913e7a6b1cfb4122b",
+          "line": 447,
+          "path": "src/axiom/rag/store.py",
+          "qualified_name": "CodeIndexStore.find_callees",
+          "symbol": "find_callees"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/api.py",
+          "symbol": "_resume_operation"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/control_plane.py",
+          "symbol": "ControlOperationName"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 15,
+      "hybrid_top5": [
+        {
+          "chunk": "e4b85e0e76d8e6518058247e590216f2c1bfeda80b8ad7e049a9dc58634335ad",
+          "line": 200,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "8bba2d2cf262fff109f405bf4d727a00ad66407ee17bc468d73f4b33ac560556",
+          "line": 329,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator._approve_waiting_child",
+          "symbol": "_approve_waiting_child"
+        },
+        {
+          "chunk": "b6379d177e4444a44cab13bee3ed7f5b8e98da3b3978b3812606eb0b96d26f27",
+          "line": 428,
+          "path": "src/axiom/memory/store.py",
+          "qualified_name": "MemoryStore.supersede_fact",
+          "symbol": "supersede_fact"
+        },
+        {
+          "chunk": "581b223490bdae2d3f77ed2f3a0b252078ad2c2983389e8c04702c796f05131a",
+          "line": 6,
+          "path": "src/axiom/policy/command_guard.py",
+          "qualified_name": "CommandPolicyError",
+          "symbol": "CommandPolicyError"
+        },
+        {
+          "chunk": "af79491bfd774ffa39be2851962e1a625b5f11a21c9b34eb44bbc9dfa9426442",
+          "line": 27,
+          "path": "src/axiom/policy/command_guard.py",
+          "qualified_name": "CommandGuard.validate",
+          "symbol": "validate"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "resume API operation maps to control plane command",
+      "query_id": "graph_016",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=3, hybrid=15.",
+      "vector_top5": [
+        {
+          "chunk": "86ce4f1d41b9b97d71cce879d017ee44e9779f035ea17a70bdf2575eda0b3694",
+          "line": 229,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "SQLiteControlOperationStore._require_operation",
+          "symbol": "_require_operation"
+        },
+        {
+          "chunk": "69fe37c231805a380358533152ba4489a0cc1b568c5a9d0d4f651c45dcac1ac7",
+          "line": 187,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "SQLiteControlOperationStore.fail",
+          "symbol": "fail"
+        },
+        {
+          "chunk": "c7656328002a85875b056001aee766a16738d3552972b3e60fda66b8022c910f",
+          "line": 1528,
+          "path": "src/axiom/runtime/api.py",
+          "qualified_name": "_resume_operation",
+          "symbol": "_resume_operation"
+        },
+        {
+          "chunk": "a583747e9f1a625ace6e9a702327c5c54c0f92a55d68f3c0bf0a3277ab5edeca",
+          "line": 169,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "SQLiteControlOperationStore.complete",
+          "symbol": "complete"
+        },
+        {
+          "chunk": "ae536bc658aeb9aa0311702181ae0d6c8d4e3e1e6871ca5489a98f8652279208",
+          "line": 18,
+          "path": "src/axiom/runtime/control_plane.py",
+          "qualified_name": "ControlOperationName",
+          "symbol": "ControlOperationName"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "symbol": "PlanExecuteStrategy"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/plan/models.py",
+          "symbol": "Task"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 22,
+      "hybrid_top5": [
+        {
+          "chunk": "1a83445b52cd2eedb936f976a91da0e3d486c528ca617f237804789c74b0b4d0",
+          "line": 197,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator",
+          "symbol": "AgentOrchestrator"
+        },
+        {
+          "chunk": "8bba2d2cf262fff109f405bf4d727a00ad66407ee17bc468d73f4b33ac560556",
+          "line": 329,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator._approve_waiting_child",
+          "symbol": "_approve_waiting_child"
+        },
+        {
+          "chunk": "19e83965e9fdad07efb2e0f6b98e41d51cd4235b1a1b495bfafe03685f3ff91c",
+          "line": 457,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "AgentOrchestrator.build_final_result",
+          "symbol": "build_final_result"
+        },
+        {
+          "chunk": "a8efecaaf4dea039ebccc5ffc2993890e42711a60849b48e7709ce2741ac668a",
+          "line": 25,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent",
+          "symbol": "PlanExecuteAgent"
+        },
+        {
+          "chunk": "a109e03c847e819009b10634112cd22d71775a18d6a27b15ecaa4ded5a9c5da5",
+          "line": 32,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent.__init__",
+          "symbol": "__init__"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "plan parent observes a completed task child",
+      "query_id": "graph_017",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=10, hybrid=22.",
+      "vector_top5": [
+        {
+          "chunk": "6791167d964ef2d3b41ec4e893214ca0adc7e7c49dbb3b660a358a3c6d7c15bf",
+          "line": 199,
+          "path": "src/axiom/agent/plan_execute.py",
+          "qualified_name": "PlanExecuteAgent._waiting_plan_child",
+          "symbol": "_waiting_plan_child"
+        },
+        {
+          "chunk": "53e0479014ab70c0a3fb4b1dffd2675a1a2b6f2146fd0c4a7cce98f8ebc7ec3e",
+          "line": 243,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy.on_cancel",
+          "symbol": "on_cancel"
+        },
+        {
+          "chunk": "8456c570833b400ea56228235b387c718923c71b4953a94fa0a705d3b81e509f",
+          "line": 274,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy.resume_waiting_child",
+          "symbol": "resume_waiting_child"
+        },
+        {
+          "chunk": "ecad0843dd91b39a374132c53cfeb2c3e25aaa83cbe88c71621836f311568f46",
+          "line": 576,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._observe_child",
+          "symbol": "_observe_child"
+        },
+        {
+          "chunk": "95cbda7fd83860ee5c8353d4604228e973398df952fdd85cda07ce85bd53f29d",
+          "line": 562,
+          "path": "src/axiom/runtime/plan_strategy.py",
+          "qualified_name": "PlanExecuteStrategy._observe_scheduled_child",
+          "symbol": "_observe_scheduled_child"
+        }
+      ]
+    },
+    {
+      "candidate_pool_status": "present_but_ranked_too_low",
+      "expected_targets": [
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "symbol": "MultiAgentExecutionStrategy"
+        },
+        {
+          "chunk": null,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "symbol": "WorkerAssignment"
+        }
+      ],
+      "failure_classification": "lexical mismatch",
+      "first_relevant_rank_if_after_5": 97,
+      "hybrid_top5": [
+        {
+          "chunk": "4d2a1e2b87b57756553855250f77f5722bdda3e385fd8b1c0b4d9f4e5f162325",
+          "line": 17,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent",
+          "symbol": "Agent"
+        },
+        {
+          "chunk": "04eedbd7835359bb0862a19d4bc5592c74c4ccb38ff042069b2767fbc2dd7366",
+          "line": 18,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.__init__",
+          "symbol": "__init__"
+        },
+        {
+          "chunk": "8d30e0774ef58bbb85218e50e399900b42be63f1200aa3dc80ae447a4cb093b6",
+          "line": 39,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.run",
+          "symbol": "run"
+        },
+        {
+          "chunk": "bdd5e8a9d739a82f5b529d7a07b909b967642c462c14dd9f02357fd6321c0de1",
+          "line": 63,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.run_complete",
+          "symbol": "run_complete"
+        },
+        {
+          "chunk": "96ff8606f045f628460172aa3a9cc10d579969504bbcdd4e2f00e0f617deb916",
+          "line": 77,
+          "path": "src/axiom/agent/agent.py",
+          "qualified_name": "Agent.clear_history",
+          "symbol": "clear_history"
+        }
+      ],
+      "lexical_top5": [],
+      "query": "multi agent parent observes a terminal worker child",
+      "query_id": "graph_018",
+      "query_type": "graph/context-oriented",
+      "technical_explanation": "Vector generated a target but lexical retrieval did not; fusion kept it below 5; lexical=None, vector=2, hybrid=97.",
+      "vector_top5": [
+        {
+          "chunk": "eb5337796937b015bda5e7fa0e4bfc434ce8467f956ee76666596693c05b0076",
+          "line": 27,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentStatus",
+          "symbol": "MultiAgentStatus"
+        },
+        {
+          "chunk": "c502e95d643a84ddc21f5d6d96c4f9fac8a3ea137c2c915ef90c2178acb3b38b",
+          "line": 400,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy.resume_waiting_child",
+          "symbol": "resume_waiting_child"
+        },
+        {
+          "chunk": "8605014c20e088fe8638b22f7fcf91fdf7cf2529555a8cd6bcf5b7197d6c2d7c",
+          "line": 483,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy._child_states",
+          "symbol": "_child_states"
+        },
+        {
+          "chunk": "77c9a9e771081d24324ea443354785048266e406b27a022fedd016d325368050",
+          "line": 980,
+          "path": "src/axiom/runtime/multi_agent_strategy.py",
+          "qualified_name": "MultiAgentExecutionStrategy._worker_span",
+          "symbol": "_worker_span"
+        },
+        {
+          "chunk": "644108e2703e90968b2fb954040fea9017e69f03775fa9ecfb3818ba3b238a2c",
+          "line": 172,
+          "path": "src/axiom/agent/orchestrator.py",
+          "qualified_name": "SubAgent._system_prompt",
+          "symbol": "_system_prompt"
+        }
+      ]
+    }
+  ],
+  "query_count": 80,
+  "schema_version": 1
+}
