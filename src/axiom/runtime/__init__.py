@@ -69,6 +69,20 @@ from axiom.runtime.plan_strategy import (
     PlanSchedulerSnapshot,
     plan_task_child_run_id,
 )
+from axiom.runtime.progress import (
+    NO_PROGRESS,
+    NoProgressError,
+    ProgressDecision,
+    ProgressDecisionType,
+    ProgressDetector,
+    ProgressDetectorType,
+    ProgressObservation,
+    ProgressPolicy,
+    ProgressState,
+    action_fingerprint,
+    error_fingerprint,
+    state_fingerprint,
+)
 from axiom.runtime.strategies import ReactExecutionStrategy, RuntimeExecutionStrategy
 from axiom.runtime.supervisor import (
     ActiveRunRegistrationError,
@@ -143,4 +157,16 @@ __all__ = [
     "CancellationRequestResult",
     "CancelManyResult",
     "ExecutionHandle",
+    "NO_PROGRESS",
+    "NoProgressError",
+    "ProgressDecision",
+    "ProgressDecisionType",
+    "ProgressDetector",
+    "ProgressDetectorType",
+    "ProgressObservation",
+    "ProgressPolicy",
+    "ProgressState",
+    "action_fingerprint",
+    "error_fingerprint",
+    "state_fingerprint",
 ]

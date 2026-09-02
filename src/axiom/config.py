@@ -138,6 +138,19 @@ class RunBudgetConfig:
 
 
 @dataclass(slots=True)
+class ProgressConfig:
+    """Deterministic, bounded no-progress detection for durable Runs."""
+
+    enabled: bool = True
+    max_identical_actions: int = 4
+    max_identical_errors: int = 3
+    max_cycle_repetitions: int = 3
+    max_stagnant_steps: int = 8
+    max_recovery_attempts: int = 1
+    history_limit: int = 32
+
+
+@dataclass(slots=True)
 class PolicyConfig:
     hitl_mode: str = "auto"
     path_guard_enabled: bool = True
@@ -189,6 +202,7 @@ class AxiomConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     run_budget: RunBudgetConfig = field(default_factory=RunBudgetConfig)
+    progress: ProgressConfig = field(default_factory=ProgressConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
@@ -285,6 +299,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     plan = result.setdefault("plan", {})
     context = result.setdefault("context", {})
     run_budget = result.setdefault("run_budget", {})
+    progress = result.setdefault("progress", {})
 
     mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_API_KEY", "api_key", str),
@@ -331,6 +346,23 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 run_budget[config_key] = caster(raw)
+
+    progress_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_PROGRESS_MAX_IDENTICAL_ACTIONS", "max_identical_actions", int),
+        ("AXIOM_PROGRESS_MAX_IDENTICAL_ERRORS", "max_identical_errors", int),
+        ("AXIOM_PROGRESS_MAX_CYCLE_REPETITIONS", "max_cycle_repetitions", int),
+        ("AXIOM_PROGRESS_MAX_STAGNANT_STEPS", "max_stagnant_steps", int),
+        ("AXIOM_PROGRESS_MAX_RECOVERY_ATTEMPTS", "max_recovery_attempts", int),
+        ("AXIOM_PROGRESS_HISTORY_LIMIT", "history_limit", int),
+    ]
+    enabled = env.get("AXIOM_PROGRESS_ENABLED")
+    if enabled in {"true", "false"}:
+        progress["enabled"] = enabled == "true"
+    for env_key, config_key, caster in progress_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                progress[config_key] = caster(raw)
 
     embedding_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_EMBEDDING_PROVIDER", "provider", str),
@@ -446,6 +478,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         memory=MemoryConfig(**data.get("memory", {})),
         context=ContextConfig(**data.get("context", {})),
         run_budget=RunBudgetConfig(**data.get("run_budget", {})),
+        progress=ProgressConfig(**data.get("progress", {})),
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),
         features=FeatureConfig(**data.get("features", {})),

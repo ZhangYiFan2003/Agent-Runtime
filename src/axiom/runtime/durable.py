@@ -49,6 +49,19 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.observability import Span, SpanStatus, SpanType, now, tool_span_id
 from axiom.runtime.observability_store import RunTracer
+from axiom.runtime.progress import (
+    NoProgressError,
+    ProgressDecision,
+    ProgressDecisionType,
+    ProgressDetector,
+    ProgressObservation,
+    ProgressPolicy,
+    ProgressState,
+    action_fingerprint,
+    error_fingerprint,
+    evidence_fingerprint,
+    recovery_message,
+)
 from axiom.runtime.strategies import RuntimeExecutionStrategy, execution_strategy_from_name
 from axiom.runtime.supervisor import ActiveRunSupervisor, ExecutionHandle
 from axiom.tools.base import Tool, ToolContext, ToolResult
@@ -127,6 +140,7 @@ class DurableAgentRuntime:
         active_run_supervisor: ActiveRunSupervisor | None = None,
         context_manager: ContextManager | None = None,
         budget_manager: BudgetManager | None = None,
+        progress_detector: ProgressDetector | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -159,6 +173,9 @@ class DurableAgentRuntime:
             model=llm_client.model_name,
             pricing_registry=ModelPricingRegistry.from_config(config.run_budget.model_pricing),
             observability_store=tracer.store if tracer is not None else None,
+        )
+        self.progress_detector = progress_detector or ProgressDetector(
+            ProgressPolicy.from_config(config.progress)
         )
         self.max_turns = max_turns
         self._locks: dict[str, asyncio.Lock] = {}
@@ -196,6 +213,8 @@ class DurableAgentRuntime:
             run_kind=run_kind,
             budget_owner_run_id=resolved_budget_owner,
             budget_policy=self.budget_manager.policy.to_dict(),
+            progress_policy=self.progress_detector.policy.to_dict(),
+            progress_state=ProgressState().to_dict(),
         )
 
         async with self._run_lock(state.run_id):
@@ -506,8 +525,14 @@ class DurableAgentRuntime:
             partial_usage = (0, 0, 0, 0)
             try:
                 effective_system_prompt = system_prompt or self.system_prompt
+                progress_state = ProgressState.from_dict(state.progress_state)
+                model_messages = list(state.messages)
+                if progress_state.recovery_signal_pending:
+                    model_messages.append(
+                        Message(role="user", content=recovery_message(progress_state))
+                    )
                 projection = await self.context_manager.prepare(
-                    state.messages,
+                    model_messages,
                     system_prompt=effective_system_prompt,
                     tools=self.tool_registry.definitions(),
                     objective=state.input,
@@ -575,6 +600,9 @@ class DurableAgentRuntime:
                     reasoning_tokens=llm_result.reasoning_tokens,
                 )
                 model_accounted = True
+                if progress_state.recovery_signal_pending:
+                    self.progress_detector.mark_recovery_delivered(progress_state)
+                    state.progress_state = progress_state.to_dict()
             except Exception as exc:
                 if model_operation_id is not None and model_reserved and not model_accounted:
                     with suppress(BudgetExceededError):
@@ -1257,6 +1285,8 @@ class DurableAgentRuntime:
         reused: bool = False,
         parent_span_id: str | None = None,
     ) -> Checkpoint:
+        call = state.pending_tool_calls[state.next_tool_index]
+        arguments = _tool_call_arguments(call)
         state.messages.append(
             Message(
                 role="tool",
@@ -1269,6 +1299,32 @@ class DurableAgentRuntime:
         state.step_index += 1
         state.interrupt = None
         state.decisions.pop(invocation_id, None)
+        if not reused:
+            progress_fingerprint = (
+                evidence_fingerprint(result.content) if not result.is_error else None
+            )
+            decision = await self.observe_progress(
+                state,
+                ProgressObservation(
+                    operation_id=f"tool:{invocation_id}",
+                    step=state.step_index,
+                    action_fingerprint=action_fingerprint(tool_name, arguments),
+                    error_fingerprint=(
+                        error_fingerprint(
+                            str(result.metadata.get("error_type") or "tool_error"),
+                            result.content,
+                            tool_name=tool_name,
+                            category=str(result.metadata.get("category") or ""),
+                        )
+                        if result.is_error
+                        else None
+                    ),
+                    state_fingerprint=progress_fingerprint,
+                ),
+                parent_span_id=parent_span_id,
+            )
+            if decision.decision == ProgressDecisionType.TERMINATE:
+                return state
         await self._save_checkpoint(
             state,
             operation="tool.completed",
@@ -1288,6 +1344,73 @@ class DurableAgentRuntime:
             },
         )
         return state
+
+    async def observe_progress(
+        self,
+        state: Checkpoint,
+        observation: ProgressObservation,
+        *,
+        parent_span_id: str | None = None,
+    ) -> ProgressDecision:
+        """Apply one restart-safe observation and persist its bounded projection."""
+
+        detector = ProgressDetector(
+            ProgressPolicy.from_dict(state.progress_policy)
+            if state.progress_policy
+            else self.progress_detector.policy
+        )
+        progress_state = ProgressState.from_dict(state.progress_state)
+        decision = detector.observe(progress_state, observation)
+        state.progress_state = progress_state.to_dict()
+        attributes = progress_state.observability_attributes()
+        if self.tracer is not None:
+            await self.tracer.annotate_span(self.tracer.root_span_id, **attributes)
+        if decision.detected:
+            span = await self._start_span(
+                SpanType.AGENT,
+                "progress.detect",
+                parent_span_id=parent_span_id,
+                attributes={
+                    **attributes,
+                    "progress.repetition_count": decision.repetition_count,
+                },
+            )
+            await self._finish_span(
+                span,
+                SpanStatus.FAILED
+                if decision.decision == ProgressDecisionType.TERMINATE
+                else SpanStatus.INTERRUPTED,
+            )
+            await self._emit(
+                "progress.detected",
+                {
+                    "run_id": state.run_id,
+                    "step": observation.step,
+                    "decision": decision.decision.value,
+                    **attributes,
+                },
+            )
+        if decision.decision == ProgressDecisionType.RECOVER:
+            await self._emit(
+                "progress.recovery",
+                {
+                    "run_id": state.run_id,
+                    "step": observation.step,
+                    "recovery_attempts": progress_state.recovery_attempts,
+                    "detector_type": progress_state.detector_type,
+                },
+            )
+        elif decision.decision == ProgressDecisionType.TERMINATE:
+            await self._fail(
+                state,
+                NoProgressError(
+                    run_id=state.run_id,
+                    step=observation.step,
+                    state=progress_state,
+                ),
+                step="progress",
+            )
+        return decision
 
     async def _wait_for_approval(
         self,
@@ -1342,10 +1465,14 @@ class DurableAgentRuntime:
     async def _fail(self, state: Checkpoint, exc: Exception, *, step: str) -> Checkpoint:
         state.status = RunStatus.FAILED
         state.error = RunError(
-            type=exc.code if isinstance(exc, BudgetExceededError) else type(exc).__name__,
+            type=exc.code
+            if isinstance(exc, (BudgetExceededError, NoProgressError))
+            else type(exc).__name__,
             message=_safe_error(exc),
             step=step,
-            metadata=exc.metadata() if isinstance(exc, BudgetExceededError) else {},
+            metadata=exc.metadata()
+            if isinstance(exc, (BudgetExceededError, NoProgressError))
+            else {},
         )
         if isinstance(exc, BudgetExceededError):
             await self.budget_manager.record_hard_limit(state, exc)

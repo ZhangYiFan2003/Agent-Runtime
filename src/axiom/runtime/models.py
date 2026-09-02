@@ -104,6 +104,8 @@ class Checkpoint:
     parent_step_id: str | None = None
     budget_owner_run_id: str | None = None
     budget_policy: dict[str, Any] = field(default_factory=dict)
+    progress_policy: dict[str, Any] = field(default_factory=dict)
+    progress_state: dict[str, Any] = field(default_factory=dict)
     run_kind: str = "agent"
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     next_tool_index: int = 0
@@ -128,6 +130,8 @@ class Checkpoint:
         run_kind: str = "agent",
         budget_owner_run_id: str | None = None,
         budget_policy: dict[str, Any] | None = None,
+        progress_policy: dict[str, Any] | None = None,
+        progress_state: dict[str, Any] | None = None,
     ) -> Checkpoint:
         return cls(
             run_id=run_id or _new_id("run"),
@@ -141,6 +145,8 @@ class Checkpoint:
             run_kind=run_kind,
             budget_owner_run_id=budget_owner_run_id,
             budget_policy=dict(budget_policy or {}),
+            progress_policy=dict(progress_policy or {}),
+            progress_state=dict(progress_state or {}),
         )
 
     @property
@@ -171,6 +177,8 @@ class Checkpoint:
             "parent_step_id": self.parent_step_id,
             "budget_owner_run_id": self.budget_owner_run_id,
             "budget_policy": _json_value(self.budget_policy),
+            "progress_policy": _json_value(self.progress_policy),
+            "progress_state": _json_value(self.progress_state),
             "run_kind": self.run_kind,
             "pending_tool_calls": _json_value(self.pending_tool_calls),
             "next_tool_index": self.next_tool_index,
@@ -209,6 +217,8 @@ class Checkpoint:
             parent_step_id=_optional_str(data.get("parent_step_id")),
             budget_owner_run_id=_optional_str(data.get("budget_owner_run_id")),
             budget_policy=_dict(data.get("budget_policy")),
+            progress_policy=_dict(data.get("progress_policy")),
+            progress_state=_dict(data.get("progress_state")),
             run_kind=str(data.get("run_kind") or "agent"),
             pending_tool_calls=[item for item in raw_calls if isinstance(item, dict)]
             if isinstance(raw_calls, list)
@@ -240,6 +250,8 @@ class Checkpoint:
             "parent_step_id": self.parent_step_id,
             "budget_owner_run_id": self.budget_owner_run_id,
             "budget_policy": _json_value(self.budget_policy),
+            "progress_policy": _json_value(self.progress_policy),
+            "progress_state": _json_value(self.progress_state),
             "run_kind": self.run_kind,
             "interrupt": self.interrupt.to_dict() if self.interrupt else None,
             "error": self.error.to_dict() if self.error else None,
