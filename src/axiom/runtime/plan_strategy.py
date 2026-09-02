@@ -15,6 +15,14 @@ from axiom.runtime.checkpoints import CheckpointConflictError
 from axiom.runtime.models import Checkpoint, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType
 from axiom.runtime.observability_store import RunTracer
+from axiom.runtime.progress import (
+    ProgressDecisionType,
+    ProgressObservation,
+    ProgressState,
+    recovery_message,
+    stable_fingerprint,
+    state_fingerprint,
+)
 from axiom.types import Message
 
 if TYPE_CHECKING:
@@ -345,6 +353,9 @@ class PlanExecuteStrategy:
             None,
         )
         reason = failed.error if failed and failed.error else "plan step failed"
+        progress_state = ProgressState.from_dict(state.progress_state)
+        if progress_state.recovery_signal_pending:
+            reason = f"{reason}\n\n{recovery_message(progress_state)}"
         result, replan_span = await self._call_planner(
             runtime,
             state,
@@ -354,6 +365,9 @@ class PlanExecuteStrategy:
         )
         if result is None:
             return state
+        if progress_state.recovery_signal_pending:
+            runtime.progress_detector.mark_recovery_delivered(progress_state)
+            state.progress_state = progress_state.to_dict()
         replacement = result.plan
         replacement.version = failed_plan.version + 1
         replacement.replan_count = failed_plan.replan_count + 1
@@ -361,6 +375,31 @@ class PlanExecuteStrategy:
         _reuse_completed_tasks(failed_plan, replacement)
         state.error = None
         self._store_plan(state, replacement)
+        decision = await runtime.observe_progress(
+            state,
+            ProgressObservation(
+                operation_id=f"plan:replan:{replacement.version}",
+                step=state.step_index,
+                action_fingerprint=_plan_fingerprint(replacement),
+                state_fingerprint=state_fingerprint(
+                    {
+                        "completed": sorted(
+                            task.description
+                            for task in replacement.all_tasks()
+                            if task.status == TaskStatus.COMPLETED
+                        ),
+                        "pending": sorted(
+                            task.description
+                            for task in replacement.all_tasks()
+                            if task.status == TaskStatus.PENDING
+                        ),
+                    }
+                ),
+            ),
+            parent_span_id=_span_id(replan_span),
+        )
+        if decision.decision == ProgressDecisionType.TERMINATE:
+            return state
         await runtime._save_checkpoint(
             state,
             operation="plan.replanned",
@@ -678,6 +717,29 @@ class PlanExecuteStrategy:
 
             self._store_plan(parent, plan)
             span = await self._plan_step_span(runtime, parent, plan, task, reopen=True)
+            if child.status == RunStatus.COMPLETED:
+                decision = await runtime.observe_progress(
+                    parent,
+                    ProgressObservation(
+                        operation_id=f"plan:task:{task.id}:completed",
+                        step=parent.step_index,
+                        action_fingerprint=stable_fingerprint(
+                            {"kind": "plan_task_completed", "task": task.id}
+                        ),
+                        state_fingerprint=state_fingerprint(
+                            {
+                                "completed": sorted(
+                                    item.id
+                                    for item in plan.all_tasks()
+                                    if item.status == TaskStatus.COMPLETED
+                                )
+                            }
+                        ),
+                    ),
+                    parent_span_id=_span_id(span),
+                )
+                if decision.decision == ProgressDecisionType.TERMINATE:
+                    return
             try:
                 await runtime._save_checkpoint(
                     parent,
@@ -1005,6 +1067,25 @@ def _legacy_plan_state(state: Checkpoint, raw_plan: object) -> bool:
 
 def _normalized_description(value: str) -> str:
     return " ".join(value.casefold().split())
+
+
+def _plan_fingerprint(plan: ExecutionPlan) -> str:
+    descriptions = {task.id: _normalized_description(task.description) for task in plan.all_tasks()}
+    return stable_fingerprint(
+        {
+            "kind": "replan",
+            "tasks": [
+                {
+                    "description": descriptions[task.id],
+                    "type": task.type.value,
+                    "dependencies": sorted(
+                        descriptions.get(dependency, dependency) for dependency in task.dependencies
+                    ),
+                }
+                for task in _tasks_in_plan_order(plan)
+            ],
+        }
+    )
 
 
 async def _none_checkpoint() -> Checkpoint | None:

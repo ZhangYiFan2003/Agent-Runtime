@@ -154,6 +154,14 @@ class RunMetrics:
     budget_soft_limit_reached: bool = False
     budget_hard_limit_reached: bool = False
     budget_exceeded_dimension: str | None = None
+    progress_action_repeat_count: int = 0
+    progress_error_repeat_count: int = 0
+    progress_stagnant_steps: int = 0
+    progress_detected: bool = False
+    progress_detector_type: str | None = None
+    progress_cycle_length: int | None = None
+    progress_recovery_attempts: int = 0
+    progress_last_progress_step: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -189,6 +197,14 @@ class RunMetrics:
             "budget_soft_limit_reached": self.budget_soft_limit_reached,
             "budget_hard_limit_reached": self.budget_hard_limit_reached,
             "budget_exceeded_dimension": self.budget_exceeded_dimension,
+            "progress_action_repeat_count": self.progress_action_repeat_count,
+            "progress_error_repeat_count": self.progress_error_repeat_count,
+            "progress_stagnant_steps": self.progress_stagnant_steps,
+            "progress_detected": self.progress_detected,
+            "progress_detector_type": self.progress_detector_type,
+            "progress_cycle_length": self.progress_cycle_length,
+            "progress_recovery_attempts": self.progress_recovery_attempts,
+            "progress_last_progress_step": self.progress_last_progress_step,
         }
 
     @classmethod
@@ -270,6 +286,18 @@ class RunMetrics:
             budget_soft_limit_reached=bool(budget.get("budget.soft_limit_reached")),
             budget_hard_limit_reached=bool(budget.get("budget.hard_limit_reached")),
             budget_exceeded_dimension=_optional_string(budget.get("budget.exceeded_dimension")),
+            progress_action_repeat_count=int(budget.get("progress.action_repeat_count") or 0),
+            progress_error_repeat_count=int(budget.get("progress.error_repeat_count") or 0),
+            progress_stagnant_steps=int(budget.get("progress.stagnant_steps") or 0),
+            progress_detected=bool(budget.get("progress.detected")),
+            progress_detector_type=_optional_string(budget.get("progress.detector_type")),
+            progress_cycle_length=(
+                int(budget["progress.cycle_length"])
+                if budget.get("progress.cycle_length") is not None
+                else None
+            ),
+            progress_recovery_attempts=int(budget.get("progress.recovery_attempts") or 0),
+            progress_last_progress_step=int(budget.get("progress.last_progress_step") or 0),
         )
 
 

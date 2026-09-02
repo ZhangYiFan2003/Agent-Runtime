@@ -51,6 +51,7 @@ class FailureType(StrEnum):
     CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded"
     POLICY_DENIED = "policy_denied"
     RECOVERY_FAILURE = "recovery_failure"
+    NO_PROGRESS = "no_progress"
     UNKNOWN_FAILURE = "unknown_failure"
 
 
@@ -484,6 +485,7 @@ def classify_failure(
         [result.error or "", *[str(value) for value in result.error_metadata.values()]]
     ).casefold()
     error_code = str(result.error_metadata.get("type") or "").upper()
+    runtime_metadata = _dict(result.error_metadata.get("metadata"))
     if "timeout" in error_text or "timed out" in error_text:
         add(FailureType.TIMEOUT, "runtime error indicated a timeout")
     if "context_budget_exceeded" in error_text or "hard input" in error_text:
@@ -506,6 +508,13 @@ def classify_failure(
         add(FailureType.POLICY_DENIED, "runtime error indicated policy denial")
     if "recover" in error_text and ("fail" in error_text or "error" in error_text):
         add(FailureType.RECOVERY_FAILURE, "runtime recovery failed")
+    if error_code == "NO_PROGRESS" or "no_progress" in error_text:
+        detector = str(
+            runtime_metadata.get("detector_type")
+            or result.error_metadata.get("detector_type")
+            or "unknown"
+        )
+        add(FailureType.NO_PROGRESS, f"runtime detected no progress: {detector}")
     if "tool" in error_text and any(
         marker in error_text for marker in ("fail", "error", "invalid")
     ):
@@ -551,6 +560,9 @@ def classify_failure(
             reason = str(span.attributes.get("context.trigger_reason") or "")
             if reason == "hard_input_limit":
                 add(FailureType.CONTEXT_BUDGET_EXCEEDED, "context trace hit hard input limit")
+            if span.attributes.get("progress.detected"):
+                detector = str(span.attributes.get("progress.detector_type") or "unknown")
+                add(FailureType.NO_PROGRESS, f"progress detector triggered: {detector}")
 
     if not found:
         add(FailureType.UNKNOWN_FAILURE, "no deterministic taxonomy rule matched")

@@ -17,6 +17,14 @@ from axiom.runtime.checkpoints import CheckpointConflictError
 from axiom.runtime.models import Checkpoint, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType, now
 from axiom.runtime.observability_store import RunTracer
+from axiom.runtime.progress import (
+    ProgressDecisionType,
+    ProgressObservation,
+    ProgressState,
+    recovery_message,
+    stable_fingerprint,
+    state_fingerprint,
+)
 from axiom.types import Message
 
 if TYPE_CHECKING:
@@ -663,6 +671,33 @@ class MultiAgentExecutionStrategy:
             orchestration.status = MultiAgentStatus.RUNNING
             self.store_state(parent, orchestration)
             span = await self._worker_span(runtime, parent, assignment, reopen=True)
+            if child.status == RunStatus.COMPLETED:
+                decision = await runtime.observe_progress(
+                    parent,
+                    ProgressObservation(
+                        operation_id=f"worker:{assignment.assignment_id}:completed",
+                        step=parent.step_index,
+                        action_fingerprint=stable_fingerprint(
+                            {
+                                "kind": "worker_completed",
+                                "assignment": assignment.assignment_id,
+                            }
+                        ),
+                        state_fingerprint=state_fingerprint(
+                            {
+                                "completed": sorted(
+                                    item.assignment_id
+                                    for item in orchestration.assignments
+                                    if item.status
+                                    in {AssignmentStatus.COMPLETED, AssignmentStatus.REVIEWING}
+                                )
+                            }
+                        ),
+                    ),
+                    parent_span_id=_span_id(span),
+                )
+                if decision.decision == ProgressDecisionType.TERMINATE:
+                    return
             try:
                 await runtime._save_checkpoint(
                     parent,
@@ -778,6 +813,36 @@ class MultiAgentExecutionStrategy:
             assignment.review_issues = _parse_review_issues(text)
             orchestration.review_rounds += 1
             self.store_state(state, orchestration)
+            decision = await runtime.observe_progress(
+                state,
+                ProgressObservation(
+                    operation_id=(
+                        f"review:{assignment.assignment_id}:{assignment.attempt}:"
+                        f"{orchestration.review_rounds}"
+                    ),
+                    step=state.step_index,
+                    action_fingerprint=stable_fingerprint(
+                        {
+                            "kind": "review",
+                            "assignment": assignment.assignment_id,
+                            "approved": assignment.review_approved,
+                            "issues": assignment.review_issues,
+                        }
+                    ),
+                    state_fingerprint=(
+                        state_fingerprint(
+                            {
+                                "assignment": assignment.assignment_id,
+                                "approved": True,
+                            }
+                        )
+                        if assignment.review_approved
+                        else None
+                    ),
+                ),
+            )
+            if decision.decision == ProgressDecisionType.TERMINATE:
+                return state
             await runtime._save_checkpoint(state, operation="review.completed")
             await runtime._emit(
                 "review.completed",
@@ -908,8 +973,12 @@ class MultiAgentExecutionStrategy:
         model_accounted = False
         try:
             role_system_prompt = _role_system_prompt(runtime, role)
+            progress_state = ProgressState.from_dict(state.progress_state)
+            role_messages = [Message(role="user", content=content)]
+            if progress_state.recovery_signal_pending:
+                role_messages.append(Message(role="user", content=recovery_message(progress_state)))
             projection = await runtime.context_manager.prepare(
-                [Message(role="user", content=content)],
+                role_messages,
                 system_prompt=role_system_prompt,
                 tools=[],
                 objective=state.input,
@@ -952,6 +1021,9 @@ class MultiAgentExecutionStrategy:
                 output_tokens=completion_tokens,
             )
             model_accounted = True
+            if progress_state.recovery_signal_pending:
+                runtime.progress_detector.mark_recovery_delivered(progress_state)
+                state.progress_state = progress_state.to_dict()
         except Exception as exc:  # noqa: BLE001 - durable strategy failure boundary
             if model_operation_id is not None and model_reserved and not model_accounted:
                 with suppress(BudgetExceededError):
