@@ -30,6 +30,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Built-in Tools | Includes file, shell, search, memory, skill, web, AST lexical/vector code search, static symbol/reference lookup, high-confidence static call graph queries, and snapshot tools. | Partially tested |
 | Graph-Aware Code Context | Assembles search seeds, symbol definitions, references, callers, callees, and bounded call paths into budgeted agent context with reasons. | Tested |
 | Memory | Stores typed conversation, summary, fact/preference, and tool-result digest records with scoped SQLite persistence, Runtime thread history recovery, Map-Reduce summary checkpoints, conservative fact/preference extraction, conflict supersession, and budgeted context assembly. | Tested |
+| Live Context Management | Estimates every model request, preserves pinned task/tool state, incrementally compacts eligible old context with the existing map/reduce summarizer, projects oversized historical tool results, and fails locally at a hard input limit without deleting durable history. | Tested |
 | Snapshots | Creates, restores, lists, and cleans workspace snapshots under an isolated home in tests. | Tested |
 | Skills | Loads built-in, user, and project `SKILL.md` files and supports skill context injection. | Tested |
 | Plan-Execute | Runs versioned DAGs as bounded parallel durable React Child Runs, with stable identity, dependency joins, CAS-safe observation, approval, isolation, recovery, and replan barriers. | Sequential/parallel compatibility and SQLite recovery tested |
@@ -37,6 +38,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | MCP Client | Discovers and calls tools from local stdio MCP servers in tests. | Tested |
 | MCP Server | Exposes built-in tools through handler-level JSON-RPC requests. | Handler tested |
 | Runtime API | Provides threads, turns, resumable Runs, Memory/SQLite checkpoints, interrupt/resume/cancel, durable tool records, task CRUD, and stored SSE event replay. | Live localhost and crash recovery tested |
+| Active Run Supervisor | Tracks the current process's durable Run Tasks across HTTP and production background-worker threads/event loops, supports durable-first cross-thread cancellation, Child propagation, safe inspection, and bounded shutdown drain. | Threaded multi-loop, worker, race, Child, subprocess, and shutdown paths tested |
 | Observability | Persists Run traces and Agent/LLM/Tool/checkpoint/interrupt spans, including tokens, TTFT, latency, retries, and Run summaries. | SQLite reload, API, CLI, and crash continuity tested |
 | Agent Evaluation | Runs JSON task datasets through the durable Runtime, applies deterministic scorers, writes JSON reports, and compares functional/performance regressions. | Runner, scorer, report, comparison, and CLI tested |
 | Permission Policy | Evaluates capability, arguments, workspace scope, and Run context before Tool execution; supports durable per-invocation approval and policy audit spans. | Policy, restart approval, denial, audit, and Evaluation compatibility tested |
@@ -74,6 +76,7 @@ Key modules:
 - `src/axiom/memory/`: scoped typed memory persistence, Runtime history recovery, and budgeted memory context assembly.
 - `src/axiom/snapshot/`: workspace snapshot service.
 - `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, shared ReAct/Plan/Multi-Agent execution strategies, tool execution records, and durable task store.
+- `src/axiom/runtime/supervisor.py`: process-local ExecutionHandle registry and cross-thread cancellation bridge; it is not a recovery database.
 
 ### Durable execution
 
@@ -97,6 +100,12 @@ crash-window behavior, serialization boundaries, and current limitations.
 The `/v1` control plane exposes stable Run representations, parent/child discovery, aggregated
 pending interrupts, restart-safe idempotent resume/approval/cancel operations, structured conflict
 errors, and hierarchical SSE replay. See [`docs/runtime-api.md`](docs/runtime-api.md).
+
+Active durable executions in the current process are registered by Run ID with their owner
+thread, event loop, and `asyncio.Task`. Cancel commits durable state before signalling the owner
+loop, and shutdown performs bounded cancellation/drain. Waiting Runs and abandoned `RUNNING`
+checkpoints may have no active handle. See
+[`docs/active-run-supervisor.md`](docs/active-run-supervisor.md).
 
 ### Run observability
 
@@ -262,6 +271,8 @@ Verified in the current baseline:
 - Runtime task store, live localhost Runtime API lifecycle, and stored SSE event replay
 - Durable default ReAct Runs with versioned Memory/SQLite checkpoints, interrupt/resume/cancel,
   optimistic sequence checks, persisted tool attempts, and crash recovery tests
+- Process-local active Run supervision with cross-thread/multiple-loop cancellation, Parent/Child
+  signal propagation, safe active inspection, subprocess cleanup, and bounded shutdown drain
 - SQLite Run traces with LLM token/TTFT/latency metrics, Tool retry/reuse spans, checkpoint and
   interrupt/resume counts, CLI inspection, and HTTP query endpoints
 - Runtime thread history recovery from persisted event IDs, explicit fact/preference storage, summary storage interfaces, and bounded tool-result digests
@@ -272,8 +283,9 @@ Partially verified or intentionally bounded:
 
 - MCP server long-running stdio/http transport lifecycle remains partially verified.
 - Runtime API public deployment, load testing, distributed queues, real-provider CI, and unlimited live streaming are not verified.
-- Distributed execution/locking, checkpoint compaction, automatic recovery scanning, and
-  exactly-once semantics for arbitrary external tool side effects are not implemented.
+- Distributed execution/locking, checkpoint compaction, automatic recovery scanning,
+  cross-process cancellation, leases/heartbeats, automatic abandoned-Run ownership takeover,
+  and exactly-once semantics for arbitrary external tool side effects are not implemented.
 - Semantic memory retrieval, production LLM extraction quality evaluation, remote summarization/extraction CI, and cross-project preference sharing are not implemented yet.
 - Interactive REPL behavior is less extensively covered than non-interactive paths.
 - Real provider streaming has manual smoke coverage plus unit-level streaming/rendering paths, but not exhaustive provider matrix coverage.

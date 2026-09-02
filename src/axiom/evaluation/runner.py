@@ -7,6 +7,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from axiom.agent import QueryEngine
+from axiom.evaluation.attribution import build_evaluation_attribution
 from axiom.evaluation.models import (
     EvaluationCase,
     EvaluationDataset,
@@ -148,9 +149,14 @@ class DurableEvaluationExecutor:
             else []
         )
         state_error = state.error.message if state is not None and state.error else None
+        error_metadata = state.error.to_dict() if state is not None and state.error else {}
+        if execution_error and not error_metadata:
+            error_metadata = {"type": "EvaluationExecutionError", "message": execution_error}
         actual_status = state.status.value if state is not None else "ERROR"
         if execution_error and actual_status == RunStatus.RUNNING.value:
             actual_status = "ERROR"
+        budget = await runtime.budget_snapshot(state) if state is not None else None
+        aggregate_usage = budget.aggregate_usage if budget is not None else None
         return EvaluationRunResult(
             case_id=case.id,
             run_id=run_id,
@@ -160,16 +166,40 @@ class DurableEvaluationExecutor:
             status=actual_status,
             assistant_output=state.output_text if state is not None else "",
             duration_ms=metrics.duration_ms if metrics is not None else None,
-            prompt_tokens=(metrics.prompt_tokens if metrics is not None else 0)
-            + sum(item.prompt_tokens for item in child_metrics),
-            completion_tokens=(metrics.completion_tokens if metrics is not None else 0)
-            + sum(item.completion_tokens for item in child_metrics),
-            total_tokens=(metrics.total_tokens if metrics is not None else 0)
-            + sum(item.total_tokens for item in child_metrics),
+            prompt_tokens=(
+                aggregate_usage.input_tokens
+                if aggregate_usage is not None
+                else (metrics.prompt_tokens if metrics is not None else 0)
+                + sum(item.prompt_tokens for item in child_metrics)
+            ),
+            completion_tokens=(
+                aggregate_usage.output_tokens
+                if aggregate_usage is not None
+                else (metrics.completion_tokens if metrics is not None else 0)
+                + sum(item.completion_tokens for item in child_metrics)
+            ),
+            total_tokens=(
+                aggregate_usage.total_tokens
+                if aggregate_usage is not None
+                else (metrics.total_tokens if metrics is not None else 0)
+                + sum(item.total_tokens for item in child_metrics)
+            ),
             tool_calls=tool_calls,
-            step_count=(metrics.step_count if metrics is not None else 0)
-            + sum(item.step_count for item in child_metrics),
+            step_count=(
+                aggregate_usage.steps
+                if aggregate_usage is not None
+                else (metrics.step_count if metrics is not None else 0)
+                + sum(item.step_count for item in child_metrics)
+            ),
             error=execution_error or state_error,
+            error_metadata=error_metadata,
+            attribution=build_evaluation_attribution(engine),
+            cost_usd=(
+                str(aggregate_usage.cost_usd)
+                if aggregate_usage is not None and aggregate_usage.cost_known
+                else None
+            ),
+            cost_known=bool(aggregate_usage and aggregate_usage.cost_known),
         )
 
 
@@ -183,37 +213,59 @@ class EvaluationRunner:
         self.executor = executor
         self.scorer_factory = scorer_factory
 
-    async def run(self, dataset: EvaluationDataset) -> EvaluationSuiteResult:
+    async def run(
+        self,
+        dataset: EvaluationDataset,
+        *,
+        trials: int = 1,
+    ) -> EvaluationSuiteResult:
+        if trials < 1:
+            raise ValueError("trials must be at least 1")
         configured = {case.id: self._scorers_for(case) for case in dataset.cases}
         started_at = now()
         results: list[EvaluationRunResult] = []
         for case in dataset.cases:
-            try:
-                result = await self.executor.execute(case)
-            except Exception as exc:  # noqa: BLE001 - custom executor isolation
-                result = EvaluationRunResult(
-                    case_id=case.id,
-                    run_id="",
-                    thread_id="",
-                    turn_id="",
-                    trace_id=None,
-                    status="ERROR",
-                    assistant_output="",
-                    duration_ms=None,
-                    prompt_tokens=0,
-                    completion_tokens=0,
-                    total_tokens=0,
-                    tool_calls=[],
-                    step_count=0,
-                    error=_safe_error(exc),
-                )
-            result.scores = await score_case(case, result, configured[case.id])
-            result.passed = required_scores_passed(result.scores)
-            results.append(result)
+            for trial_index in range(1, trials + 1):
+                try:
+                    result = await self.executor.execute(case)
+                except Exception as exc:  # noqa: BLE001 - custom executor isolation
+                    error = _safe_error(exc)
+                    result = EvaluationRunResult(
+                        case_id=case.id,
+                        run_id="",
+                        thread_id="",
+                        turn_id="",
+                        trace_id=None,
+                        status="ERROR",
+                        assistant_output="",
+                        duration_ms=None,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        tool_calls=[],
+                        step_count=0,
+                        error=error,
+                        error_metadata={
+                            "type": type(exc).__name__,
+                            "message": error,
+                        },
+                    )
+                result.trial_index = trial_index
+                result.case_definition = case.to_dict()
+                result.attribution = {
+                    **result.attribution,
+                    "dataset_version": dataset.version,
+                }
+                result.scores = await score_case(case, result, configured[case.id])
+                result.passed = required_scores_passed(result.scores)
+                results.append(result)
+        suite_attribution = dict(results[0].attribution) if results else {}
         return EvaluationSuiteResult.create(
             dataset,
             results,
             started_at=started_at,
+            trials_per_case=trials,
+            attribution=suite_attribution,
         )
 
     def _scorers_for(self, case: EvaluationCase) -> list[Scorer]:

@@ -64,9 +64,15 @@ class RunError:
     type: str
     message: str
     step: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": self.type, "message": self.message, "step": self.step}
+        return {
+            "type": self.type,
+            "message": self.message,
+            "step": self.step,
+            "metadata": _json_value(self.metadata),
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunError:
@@ -74,6 +80,7 @@ class RunError:
             type=str(data.get("type") or "RuntimeError"),
             message=str(data.get("message") or "run failed"),
             step=_optional_str(data.get("step")),
+            metadata=_dict(data.get("metadata")),
         )
 
 
@@ -95,6 +102,8 @@ class Checkpoint:
     strategy_state: dict[str, Any] = field(default_factory=dict)
     parent_run_id: str | None = None
     parent_step_id: str | None = None
+    budget_owner_run_id: str | None = None
+    budget_policy: dict[str, Any] = field(default_factory=dict)
     run_kind: str = "agent"
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     next_tool_index: int = 0
@@ -117,6 +126,8 @@ class Checkpoint:
         parent_run_id: str | None = None,
         parent_step_id: str | None = None,
         run_kind: str = "agent",
+        budget_owner_run_id: str | None = None,
+        budget_policy: dict[str, Any] | None = None,
     ) -> Checkpoint:
         return cls(
             run_id=run_id or _new_id("run"),
@@ -128,6 +139,8 @@ class Checkpoint:
             parent_run_id=parent_run_id,
             parent_step_id=parent_step_id,
             run_kind=run_kind,
+            budget_owner_run_id=budget_owner_run_id,
+            budget_policy=dict(budget_policy or {}),
         )
 
     @property
@@ -156,6 +169,8 @@ class Checkpoint:
             "strategy_state": _json_value(self.strategy_state),
             "parent_run_id": self.parent_run_id,
             "parent_step_id": self.parent_step_id,
+            "budget_owner_run_id": self.budget_owner_run_id,
+            "budget_policy": _json_value(self.budget_policy),
             "run_kind": self.run_kind,
             "pending_tool_calls": _json_value(self.pending_tool_calls),
             "next_tool_index": self.next_tool_index,
@@ -192,6 +207,8 @@ class Checkpoint:
             strategy_state=_dict(data.get("strategy_state")),
             parent_run_id=_optional_str(data.get("parent_run_id")),
             parent_step_id=_optional_str(data.get("parent_step_id")),
+            budget_owner_run_id=_optional_str(data.get("budget_owner_run_id")),
+            budget_policy=_dict(data.get("budget_policy")),
             run_kind=str(data.get("run_kind") or "agent"),
             pending_tool_calls=[item for item in raw_calls if isinstance(item, dict)]
             if isinstance(raw_calls, list)
@@ -221,6 +238,8 @@ class Checkpoint:
             "execution_strategy": self.execution_strategy,
             "parent_run_id": self.parent_run_id,
             "parent_step_id": self.parent_step_id,
+            "budget_owner_run_id": self.budget_owner_run_id,
+            "budget_policy": _json_value(self.budget_policy),
             "run_kind": self.run_kind,
             "interrupt": self.interrupt.to_dict() if self.interrupt else None,
             "error": self.error.to_dict() if self.error else None,
@@ -279,6 +298,20 @@ class ToolExecutionRecord:
             completed_at=_optional_str(data.get("completed_at")),
             updated_at=str(data.get("updated_at") or datetime.now(UTC).isoformat()),
         )
+
+
+@dataclass(slots=True)
+class BudgetLedgerRecord:
+    owner_run_id: str
+    version: int
+    state: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "owner_run_id": self.owner_run_id,
+            "version": self.version,
+            "state": _json_value(self.state),
+        }
 
 
 def _message_to_dict(message: Message) -> dict[str, Any]:

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 EVALUATION_SCHEMA_VERSION = 1
+EVALUATION_RESULT_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +188,12 @@ class EvaluationRunResult:
     error: str | None = None
     scores: list[ScoreResult] = field(default_factory=list)
     passed: bool = False
+    trial_index: int = 1
+    case_definition: dict[str, Any] = field(default_factory=dict)
+    error_metadata: dict[str, Any] = field(default_factory=dict)
+    attribution: dict[str, Any] = field(default_factory=dict)
+    cost_usd: str | None = None
+    cost_known: bool = False
 
     @property
     def tool_call_count(self) -> int:
@@ -194,6 +202,7 @@ class EvaluationRunResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "case_id": self.case_id,
+            "trial_index": self.trial_index,
             "run_id": self.run_id,
             "thread_id": self.thread_id,
             "turn_id": self.turn_id,
@@ -210,8 +219,13 @@ class EvaluationRunResult:
                 "tool_calls": list(self.tool_calls),
                 "tool_call_count": self.tool_call_count,
                 "step_count": self.step_count,
+                "cost_usd": self.cost_usd,
+                "cost_known": self.cost_known,
             },
             "error": self.error,
+            "error_metadata": _json_dict(self.error_metadata),
+            "case_definition": _json_dict(self.case_definition),
+            "attribution": _json_dict(self.attribution),
         }
 
     @classmethod
@@ -236,6 +250,126 @@ class EvaluationRunResult:
             error=_optional_str(data.get("error")),
             scores=[ScoreResult.from_dict(item) for item in raw_scores if isinstance(item, dict)],
             passed=bool(data.get("passed")),
+            trial_index=max(1, int(data.get("trial_index") or 1)),
+            case_definition=_json_dict(data.get("case_definition")),
+            error_metadata=_json_dict(data.get("error_metadata")),
+            attribution=_json_dict(data.get("attribution")),
+            cost_usd=_optional_str(metrics.get("cost_usd")),
+            cost_known=bool(metrics.get("cost_known")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationCaseAggregate:
+    case_id: str
+    trial_count: int
+    success_count: int
+    failure_count: int
+    trial_success_rate: float
+    avg_tokens: float
+    min_tokens: int
+    max_tokens: int
+    avg_steps: float
+    min_steps: int
+    max_steps: int
+    avg_latency_ms: float
+    min_latency_ms: float | None
+    max_latency_ms: float | None
+    total_cost_usd: str | None = None
+    avg_cost_usd: str | None = None
+    successful_trial_cost_usd: str | None = None
+    cost_per_success: str | None = None
+    cost_known_trial_count: int = 0
+    cost_fully_known: bool = False
+
+    @classmethod
+    def create(cls, case_id: str, results: list[EvaluationRunResult]) -> EvaluationCaseAggregate:
+        successes = sum(result.passed for result in results)
+        tokens = [result.total_tokens for result in results]
+        steps = [result.step_count for result in results]
+        latencies = [result.duration_ms for result in results if result.duration_ms is not None]
+        costs = [_cost(result) for result in results if result.cost_known]
+        successful_costs = [
+            _cost(result) for result in results if result.passed and result.cost_known
+        ]
+        total_cost = sum(costs, Decimal(0))
+        cost_fully_known = bool(results) and len(costs) == len(results)
+        return cls(
+            case_id=case_id,
+            trial_count=len(results),
+            success_count=successes,
+            failure_count=len(results) - successes,
+            trial_success_rate=round(successes / len(results), 4) if results else 0.0,
+            avg_tokens=_average(tokens),
+            min_tokens=min(tokens, default=0),
+            max_tokens=max(tokens, default=0),
+            avg_steps=_average(steps),
+            min_steps=min(steps, default=0),
+            max_steps=max(steps, default=0),
+            avg_latency_ms=_average(latencies),
+            min_latency_ms=min(latencies, default=None),
+            max_latency_ms=max(latencies, default=None),
+            total_cost_usd=_decimal_text(total_cost) if costs else None,
+            avg_cost_usd=(_decimal_text(total_cost / Decimal(len(costs))) if costs else None),
+            successful_trial_cost_usd=(
+                _decimal_text(sum(successful_costs, Decimal(0))) if successful_costs else None
+            ),
+            cost_per_success=(
+                _decimal_text(total_cost / Decimal(successes))
+                if cost_fully_known and successes
+                else None
+            ),
+            cost_known_trial_count=len(costs),
+            cost_fully_known=cost_fully_known,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "trial_count": self.trial_count,
+            "success_count": self.success_count,
+            "failure_count": self.failure_count,
+            "trial_success_rate": self.trial_success_rate,
+            "avg_tokens": self.avg_tokens,
+            "min_tokens": self.min_tokens,
+            "max_tokens": self.max_tokens,
+            "avg_steps": self.avg_steps,
+            "min_steps": self.min_steps,
+            "max_steps": self.max_steps,
+            "avg_latency_ms": self.avg_latency_ms,
+            "min_latency_ms": self.min_latency_ms,
+            "max_latency_ms": self.max_latency_ms,
+            "total_cost_usd": self.total_cost_usd,
+            "avg_cost_usd": self.avg_cost_usd,
+            "successful_trial_cost_usd": self.successful_trial_cost_usd,
+            "cost_per_success": self.cost_per_success,
+            "cost_known_trial_count": self.cost_known_trial_count,
+            "cost_fully_known": self.cost_fully_known,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> EvaluationCaseAggregate:
+        return cls(
+            case_id=str(data.get("case_id") or ""),
+            trial_count=int(data.get("trial_count") or 0),
+            success_count=int(data.get("success_count") or 0),
+            failure_count=int(data.get("failure_count") or 0),
+            trial_success_rate=float(data.get("trial_success_rate") or 0.0),
+            avg_tokens=float(data.get("avg_tokens") or 0.0),
+            min_tokens=int(data.get("min_tokens") or 0),
+            max_tokens=int(data.get("max_tokens") or 0),
+            avg_steps=float(data.get("avg_steps") or 0.0),
+            min_steps=int(data.get("min_steps") or 0),
+            max_steps=int(data.get("max_steps") or 0),
+            avg_latency_ms=float(data.get("avg_latency_ms") or 0.0),
+            min_latency_ms=_optional_float(data.get("min_latency_ms")),
+            max_latency_ms=_optional_float(data.get("max_latency_ms")),
+            total_cost_usd=_optional_str(data.get("total_cost_usd")),
+            avg_cost_usd=_optional_str(data.get("avg_cost_usd")),
+            successful_trial_cost_usd=_optional_str(data.get("successful_trial_cost_usd")),
+            cost_per_success=_optional_str(data.get("cost_per_success")),
+            cost_known_trial_count=int(data.get("cost_known_trial_count") or 0),
+            cost_fully_known=bool(data.get("cost_fully_known")),
         )
 
 
@@ -253,7 +387,18 @@ class EvaluationSuiteResult:
     avg_tokens: float
     avg_steps: float
     results: tuple[EvaluationRunResult, ...]
-    schema_version: int = EVALUATION_SCHEMA_VERSION
+    trials_per_case: int = 1
+    trial_count: int = 0
+    trial_success_rate: float = 0.0
+    case_aggregates: tuple[EvaluationCaseAggregate, ...] = ()
+    attribution: dict[str, Any] = field(default_factory=dict)
+    schema_version: int = EVALUATION_RESULT_SCHEMA_VERSION
+    total_cost_usd: str | None = None
+    avg_cost_usd: str | None = None
+    successful_trial_cost_usd: str | None = None
+    cost_per_success: str | None = None
+    cost_known_trial_count: int = 0
+    cost_fully_known: bool = False
 
     @classmethod
     def create(
@@ -263,24 +408,60 @@ class EvaluationSuiteResult:
         *,
         started_at: str,
         ended_at: str | None = None,
+        trials_per_case: int = 1,
+        attribution: dict[str, Any] | None = None,
     ) -> EvaluationSuiteResult:
-        total = len(results)
-        passed = sum(result.passed for result in results)
+        grouped = {
+            case.id: [result for result in results if result.case_id == case.id]
+            for case in dataset.cases
+        }
+        aggregates = tuple(
+            EvaluationCaseAggregate.create(case.id, grouped[case.id]) for case in dataset.cases
+        )
+        cases_total = len(dataset.cases)
+        cases_passed = sum(
+            aggregate.trial_count > 0 and aggregate.failure_count == 0 for aggregate in aggregates
+        )
+        trial_count = len(results)
+        trial_successes = sum(result.passed for result in results)
+        costs = [_cost(result) for result in results if result.cost_known]
+        successful_costs = [
+            _cost(result) for result in results if result.passed and result.cost_known
+        ]
+        total_cost = sum(costs, Decimal(0))
+        cost_fully_known = bool(results) and len(costs) == len(results)
         return cls(
             dataset=dataset.name,
             dataset_version=dataset.version,
             started_at=started_at,
             ended_at=ended_at or now(),
-            cases_total=total,
-            cases_passed=passed,
-            cases_failed=total - passed,
-            pass_rate=round(passed / total, 4) if total else 0.0,
+            cases_total=cases_total,
+            cases_passed=cases_passed,
+            cases_failed=cases_total - cases_passed,
+            pass_rate=round(cases_passed / cases_total, 4) if cases_total else 0.0,
             avg_latency_ms=_average(
                 result.duration_ms for result in results if result.duration_ms is not None
             ),
             avg_tokens=_average(result.total_tokens for result in results),
             avg_steps=_average(result.step_count for result in results),
             results=tuple(results),
+            trials_per_case=trials_per_case,
+            trial_count=trial_count,
+            trial_success_rate=(round(trial_successes / trial_count, 4) if trial_count else 0.0),
+            case_aggregates=aggregates,
+            attribution=_json_dict(attribution),
+            total_cost_usd=_decimal_text(total_cost) if costs else None,
+            avg_cost_usd=(_decimal_text(total_cost / Decimal(len(costs))) if costs else None),
+            successful_trial_cost_usd=(
+                _decimal_text(sum(successful_costs, Decimal(0))) if successful_costs else None
+            ),
+            cost_per_success=(
+                _decimal_text(total_cost / Decimal(trial_successes))
+                if cost_fully_known and trial_successes
+                else None
+            ),
+            cost_known_trial_count=len(costs),
+            cost_fully_known=cost_fully_known,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -294,21 +475,52 @@ class EvaluationSuiteResult:
             "cases_passed": self.cases_passed,
             "cases_failed": self.cases_failed,
             "pass_rate": self.pass_rate,
+            "trials_per_case": self.trials_per_case,
+            "trial_count": self.trial_count,
+            "trial_success_rate": self.trial_success_rate,
             "avg_latency_ms": self.avg_latency_ms,
             "avg_tokens": self.avg_tokens,
             "avg_steps": self.avg_steps,
+            "total_cost_usd": self.total_cost_usd,
+            "avg_cost_usd": self.avg_cost_usd,
+            "successful_trial_cost_usd": self.successful_trial_cost_usd,
+            "cost_per_success": self.cost_per_success,
+            "cost_known_trial_count": self.cost_known_trial_count,
+            "cost_fully_known": self.cost_fully_known,
+            "case_aggregates": [item.to_dict() for item in self.case_aggregates],
+            "attribution": _json_dict(self.attribution),
             "results": [result.to_dict() for result in self.results],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> EvaluationSuiteResult:
         schema_version = int(data.get("schema_version") or EVALUATION_SCHEMA_VERSION)
-        if schema_version != EVALUATION_SCHEMA_VERSION:
+        if schema_version not in {
+            EVALUATION_SCHEMA_VERSION,
+            2,
+            EVALUATION_RESULT_SCHEMA_VERSION,
+        }:
             raise ValueError(f"unsupported evaluation result schema version: {schema_version}")
         raw_results = data.get("results") or []
         results = tuple(
             EvaluationRunResult.from_dict(item) for item in raw_results if isinstance(item, dict)
         )
+        raw_aggregates = data.get("case_aggregates") or []
+        aggregates = tuple(
+            EvaluationCaseAggregate.from_dict(item)
+            for item in raw_aggregates
+            if isinstance(item, dict)
+        )
+        if not aggregates:
+            case_ids = list(dict.fromkeys(result.case_id for result in results))
+            aggregates = tuple(
+                EvaluationCaseAggregate.create(
+                    case_id, [result for result in results if result.case_id == case_id]
+                )
+                for case_id in case_ids
+            )
+        trial_count = int(data.get("trial_count") or len(results))
+        trial_successes = sum(result.passed for result in results)
         return cls(
             dataset=str(data.get("dataset") or ""),
             dataset_version=str(data.get("dataset_version") or ""),
@@ -322,8 +534,35 @@ class EvaluationSuiteResult:
             avg_tokens=float(data.get("avg_tokens") or 0.0),
             avg_steps=float(data.get("avg_steps") or 0.0),
             results=results,
-            schema_version=schema_version,
+            trials_per_case=max(1, int(data.get("trials_per_case") or 1)),
+            trial_count=trial_count,
+            trial_success_rate=float(
+                data.get("trial_success_rate")
+                if data.get("trial_success_rate") is not None
+                else (trial_successes / trial_count if trial_count else 0.0)
+            ),
+            case_aggregates=aggregates,
+            attribution=_json_dict(data.get("attribution")),
+            schema_version=(
+                EVALUATION_RESULT_SCHEMA_VERSION
+                if schema_version in {EVALUATION_SCHEMA_VERSION, 2}
+                else schema_version
+            ),
+            total_cost_usd=_optional_str(data.get("total_cost_usd")),
+            avg_cost_usd=_optional_str(data.get("avg_cost_usd")),
+            successful_trial_cost_usd=_optional_str(data.get("successful_trial_cost_usd")),
+            cost_per_success=_optional_str(data.get("cost_per_success")),
+            cost_known_trial_count=int(data.get("cost_known_trial_count") or 0),
+            cost_fully_known=bool(data.get("cost_fully_known")),
         )
+
+
+def _cost(result: EvaluationRunResult) -> Decimal:
+    return Decimal(result.cost_usd or "0")
+
+
+def _decimal_text(value: Decimal) -> str:
+    return format(value.normalize(), "f") if value else "0"
 
 
 def now() -> str:

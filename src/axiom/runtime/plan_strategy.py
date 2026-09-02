@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from axiom.plan import ExecutionPlan, Planner, PlannerResult, PlanStatus, Task, TaskStatus
+from axiom.runtime.budget import BudgetExceededError
 from axiom.runtime.checkpoints import CheckpointConflictError
 from axiom.runtime.models import Checkpoint, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType
@@ -213,6 +215,10 @@ class PlanExecuteStrategy:
                 )
             ]
             if launchable:
+                try:
+                    await runtime.budget_manager.preflight_child(state)
+                except BudgetExceededError as exc:
+                    return await runtime._fail(state, exc, step="child")
                 await scheduler.execute(
                     launchable,
                     partial(self._start_child, runtime, state, plan),
@@ -245,10 +251,6 @@ class PlanExecuteStrategy:
         if plan is None:
             return
         for task in plan.all_tasks():
-            if task.child_run_id:
-                child = await runtime.store.load(task.child_run_id)
-                if child is not None and not child.finished:
-                    await self._child_runtime(runtime, task).cancel(child.run_id)
             if task.status not in {
                 TaskStatus.COMPLETED,
                 TaskStatus.FAILED,
@@ -266,6 +268,10 @@ class PlanExecuteStrategy:
         if plan is None:
             return
         for task in plan.all_tasks():
+            if task.child_run_id:
+                child = await runtime.store.load(task.child_run_id)
+                if child is not None and not child.finished:
+                    await self._child_runtime(runtime, task).cancel(child.run_id)
             if task.status == TaskStatus.CANCELLED and task.child_run_id:
                 span = await self._plan_step_span(runtime, state, plan, task, reopen=True)
                 await runtime._finish_span(span, SpanStatus.CANCELLED)
@@ -390,6 +396,14 @@ class PlanExecuteStrategy:
         previous_plan: ExecutionPlan | None = None,
         reason: str = "",
     ) -> tuple[PlannerResult | None, Any]:
+        step_operation = (
+            f"step:{state.run_id}:plan:{name}:{previous_plan.version if previous_plan else 0}"
+        )
+        try:
+            await runtime.budget_manager.consume_step(state, step_operation)
+        except BudgetExceededError as exc:
+            await runtime._fail(state, exc, step=name)
+            return None, None
         plan_span = await runtime._start_span(
             SpanType.AGENT,
             name,
@@ -415,13 +429,33 @@ class PlanExecuteStrategy:
             else None
         )
         started = time.perf_counter()
+        model_operation_id: str | None = None
+        model_reserved = False
         try:
+            if uses_llm:
+                model_operation_id = (
+                    f"model:{state.run_id}:{_span_id(llm_span) or time.perf_counter_ns()}"
+                )
+                await runtime.budget_manager.reserve_model_call(
+                    state,
+                    model_operation_id,
+                )
+                model_reserved = True
+            self.planner.context_manager = runtime.context_manager
             result = (
                 await self.planner.create_plan_result(goal or state.input)
                 if previous_plan is None
                 else await self.planner.replan_result(previous_plan, reason)
             )
         except Exception as exc:  # noqa: BLE001 - persisted Run failure boundary
+            if model_operation_id is not None and model_reserved:
+                with suppress(BudgetExceededError):
+                    await runtime.budget_manager.complete_model_call(
+                        state,
+                        model_operation_id,
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
             latency_ms = round((time.perf_counter() - started) * 1000, 3)
             await runtime._finish_span(
                 llm_span,
@@ -432,6 +466,25 @@ class PlanExecuteStrategy:
             await runtime._fail(state, exc, step="planning" if previous_plan is None else "replan")
             return None, plan_span
         latency_ms = round((time.perf_counter() - started) * 1000, 3)
+        if model_operation_id is not None:
+            try:
+                await runtime.budget_manager.complete_model_call(
+                    state,
+                    model_operation_id,
+                    input_tokens=result.prompt_tokens,
+                    output_tokens=result.completion_tokens,
+                )
+            except BudgetExceededError as exc:
+                await runtime._finish_span(
+                    llm_span,
+                    SpanStatus.FAILED,
+                    attributes={"error": str(exc), "latency_ms": latency_ms},
+                )
+                await runtime._finish_span(
+                    plan_span, SpanStatus.FAILED, attributes={"error": str(exc)}
+                )
+                await runtime._fail(state, exc, step=name)
+                return None, plan_span
         state.total_tokens += result.prompt_tokens + result.completion_tokens
         await runtime._finish_span(
             llm_span,
@@ -444,6 +497,7 @@ class PlanExecuteStrategy:
                 "latency_ms": latency_ms,
                 "finish_reason": result.finish_reason,
                 "planner_shortcut": not result.used_llm,
+                **result.context_attributes,
             },
         )
         return result, plan_span
@@ -530,6 +584,7 @@ class PlanExecuteStrategy:
                 parent_run_id=state.run_id,
                 parent_step_id=plan_task_span_id(state.run_id, plan.version, task.id, task.attempt),
                 run_kind="plan_task",
+                budget_owner_run_id=state.budget_owner_run_id or state.run_id,
             )
         except ValueError as exc:
             existing = await runtime.store.load(task.child_run_id)
@@ -774,6 +829,9 @@ class PlanExecuteStrategy:
             permission_policy=runtime.permission_policy,
             execution_backend=runtime.execution_backend,
             execution_strategy="react",
+            active_run_supervisor=runtime.active_run_supervisor,
+            context_manager=runtime.context_manager,
+            budget_manager=runtime.budget_manager,
             max_turns=self.max_task_turns,
         )
 

@@ -1,4 +1,24 @@
+from axiom.context import (
+    CONTEXT_BUDGET_EXCEEDED,
+    ApproximateTokenEstimator,
+    ContextBudget,
+    ContextBudgetExceededError,
+    ContextBudgetPolicy,
+    ContextCompactionResult,
+    ContextManager,
+    RuntimeContextSummary,
+    TokenEstimator,
+)
 from axiom.runtime.api import RuntimeApiServer
+from axiom.runtime.budget import (
+    BudgetExceededError,
+    BudgetManager,
+    ModelPricing,
+    ModelPricingRegistry,
+    RunBudgetPolicy,
+    RunBudgetState,
+    RunBudgetUsage,
+)
 from axiom.runtime.checkpoints import (
     CheckpointConflictError,
     CheckpointStore,
@@ -50,6 +70,13 @@ from axiom.runtime.plan_strategy import (
     plan_task_child_run_id,
 )
 from axiom.runtime.strategies import ReactExecutionStrategy, RuntimeExecutionStrategy
+from axiom.runtime.supervisor import (
+    ActiveRunRegistrationError,
+    ActiveRunSupervisor,
+    CancellationRequestResult,
+    CancelManyResult,
+    ExecutionHandle,
+)
 from axiom.runtime.tasks import DurableTaskManager, TaskRecord
 
 __all__ = [
@@ -60,10 +87,21 @@ __all__ = [
     "ControlOperationName",
     "ControlOperationRecord",
     "ControlOperationStatus",
+    "CONTEXT_BUDGET_EXCEEDED",
+    "ApproximateTokenEstimator",
+    "ContextBudget",
+    "ContextBudgetExceededError",
+    "ContextBudgetPolicy",
+    "ContextCompactionResult",
+    "ContextManager",
+    "BudgetExceededError",
+    "BudgetManager",
     "DurableAgentRuntime",
     "DurableTaskManager",
     "MemoryCheckpointStore",
     "MemoryObservabilityStore",
+    "ModelPricing",
+    "ModelPricingRegistry",
     "ObservabilityService",
     "PlanExecuteStrategy",
     "LocalPlanTaskScheduler",
@@ -72,9 +110,13 @@ __all__ = [
     "ReactExecutionStrategy",
     "RetryPolicy",
     "RunStatus",
+    "RunBudgetPolicy",
+    "RunBudgetState",
+    "RunBudgetUsage",
     "RunMetrics",
     "RuntimeApiServer",
     "RuntimeExecutionStrategy",
+    "RuntimeContextSummary",
     "MultiAgentExecutionStrategy",
     "LocalChildRunScheduler",
     "MultiAgentState",
@@ -94,5 +136,11 @@ __all__ = [
     "ToolExecutionStatus",
     "Trace",
     "TraceBundle",
+    "TokenEstimator",
     "allowed_operations",
+    "ActiveRunRegistrationError",
+    "ActiveRunSupervisor",
+    "CancellationRequestResult",
+    "CancelManyResult",
+    "ExecutionHandle",
 ]

@@ -109,6 +109,35 @@ class MemoryConfig:
 
 
 @dataclass(slots=True)
+class ContextConfig:
+    """Live model-input budgeting; ``None`` values derive from LLM metadata."""
+
+    model_context_window: int | None = None
+    reserved_output_tokens: int | None = None
+    high_watermark_ratio: float = 0.80
+    target_after_compaction_ratio: float = 0.60
+    recent_message_reserve: int = 6
+    hard_input_limit: int | None = None
+    max_tool_result_chars: int = 2_000
+
+
+@dataclass(slots=True)
+class RunBudgetConfig:
+    """Optional lifetime limits for one durable Run and its descendant tree."""
+
+    max_steps: int | None = None
+    max_model_calls: int | None = None
+    max_tool_calls: int | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_total_tokens: int | None = None
+    max_wall_time_seconds: float | None = None
+    max_cost_usd: str | float | None = None
+    soft_limit_ratio: float = 0.80
+    model_pricing: dict[str, dict[str, str | float]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class PolicyConfig:
     hitl_mode: str = "auto"
     path_guard_enabled: bool = True
@@ -158,6 +187,8 @@ class AxiomConfig:
     plan: PlanConfig = field(default_factory=PlanConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    run_budget: RunBudgetConfig = field(default_factory=RunBudgetConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
@@ -252,6 +283,8 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     execution = result.setdefault("execution", {})
     multi_agent = result.setdefault("multi_agent", {})
     plan = result.setdefault("plan", {})
+    context = result.setdefault("context", {})
+    run_budget = result.setdefault("run_budget", {})
 
     mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_API_KEY", "api_key", str),
@@ -266,6 +299,38 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 llm[config_key] = caster(raw)
+
+    context_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_CONTEXT_WINDOW", "model_context_window", int),
+        ("AXIOM_CONTEXT_RESERVED_OUTPUT_TOKENS", "reserved_output_tokens", int),
+        ("AXIOM_CONTEXT_HIGH_WATERMARK", "high_watermark_ratio", float),
+        ("AXIOM_CONTEXT_TARGET_RATIO", "target_after_compaction_ratio", float),
+        ("AXIOM_CONTEXT_RECENT_MESSAGES", "recent_message_reserve", int),
+        ("AXIOM_CONTEXT_HARD_INPUT_LIMIT", "hard_input_limit", int),
+        ("AXIOM_CONTEXT_MAX_TOOL_RESULT_CHARS", "max_tool_result_chars", int),
+    ]
+    for env_key, config_key, caster in context_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                context[config_key] = caster(raw)
+
+    budget_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_RUN_MAX_STEPS", "max_steps", int),
+        ("AXIOM_RUN_MAX_MODEL_CALLS", "max_model_calls", int),
+        ("AXIOM_RUN_MAX_TOOL_CALLS", "max_tool_calls", int),
+        ("AXIOM_RUN_MAX_INPUT_TOKENS", "max_input_tokens", int),
+        ("AXIOM_RUN_MAX_OUTPUT_TOKENS", "max_output_tokens", int),
+        ("AXIOM_RUN_MAX_TOTAL_TOKENS", "max_total_tokens", int),
+        ("AXIOM_RUN_MAX_WALL_TIME_SECONDS", "max_wall_time_seconds", float),
+        ("AXIOM_RUN_MAX_COST_USD", "max_cost_usd", str),
+        ("AXIOM_RUN_BUDGET_SOFT_LIMIT", "soft_limit_ratio", float),
+    ]
+    for env_key, config_key, caster in budget_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                run_budget[config_key] = caster(raw)
 
     embedding_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_EMBEDDING_PROVIDER", "provider", str),
@@ -379,6 +444,8 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         plan=PlanConfig(**data.get("plan", {})),
         mcp=McpConfig(**data.get("mcp", {})),
         memory=MemoryConfig(**data.get("memory", {})),
+        context=ContextConfig(**data.get("context", {})),
+        run_budget=RunBudgetConfig(**data.get("run_budget", {})),
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),
         features=FeatureConfig(**data.get("features", {})),

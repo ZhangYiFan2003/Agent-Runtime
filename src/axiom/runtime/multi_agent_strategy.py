@@ -6,11 +6,13 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+from axiom.runtime.budget import BudgetExceededError
 from axiom.runtime.checkpoints import CheckpointConflictError
 from axiom.runtime.models import Checkpoint, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType, now
@@ -340,6 +342,10 @@ class MultiAgentExecutionStrategy:
                 )
             ]
             if launchable:
+                try:
+                    await runtime.budget_manager.preflight_child(state)
+                except BudgetExceededError as exc:
+                    return await runtime._fail(state, exc, step="child")
                 orchestration.max_parallelism_observed = max(
                     orchestration.max_parallelism_observed,
                     min(len(launchable), scheduler.max_parallel_workers),
@@ -374,11 +380,6 @@ class MultiAgentExecutionStrategy:
         if orchestration is None:
             return
         for assignment in orchestration.assignments:
-            if assignment.child_run_id:
-                child_state = await runtime.store.load(assignment.child_run_id)
-                if child_state is not None and not child_state.finished:
-                    child_runtime = self._child_runtime(runtime, assignment)
-                    await child_runtime.cancel(assignment.child_run_id)
             if assignment.status not in {
                 AssignmentStatus.COMPLETED,
                 AssignmentStatus.FAILED,
@@ -395,6 +396,14 @@ class MultiAgentExecutionStrategy:
         runtime: DurableAgentRuntime,
         state: Checkpoint,
     ) -> None:
+        orchestration = self.load_state(state)
+        if orchestration is not None:
+            for assignment in orchestration.assignments:
+                if assignment.child_run_id:
+                    child_state = await runtime.store.load(assignment.child_run_id)
+                    if child_state is not None and not child_state.finished:
+                        child_runtime = self._child_runtime(runtime, assignment)
+                        await child_runtime.cancel(assignment.child_run_id)
         await runtime._emit("multi_agent.cancelled", {"run_id": state.run_id})
 
     async def resume_waiting_child(
@@ -557,6 +566,7 @@ class MultiAgentExecutionStrategy:
                     assignment.attempt,
                 ),
                 run_kind="worker",
+                budget_owner_run_id=state.budget_owner_run_id or state.run_id,
             )
         except ValueError as exc:
             existing = await runtime.store.load(assignment.child_run_id)
@@ -858,6 +868,14 @@ class MultiAgentExecutionStrategy:
         content: str,
         parent_span_id: str | None = None,
     ) -> str | None:
+        try:
+            await runtime.budget_manager.consume_step(
+                state,
+                f"step:{state.run_id}:{state.step_index}:{name}",
+            )
+        except BudgetExceededError as exc:
+            await runtime._fail(state, exc, step=name)
+            return None
         step_span = await runtime._start_span(
             SpanType.AGENT,
             name,
@@ -885,11 +903,33 @@ class MultiAgentExecutionStrategy:
         prompt_tokens = 0
         completion_tokens = 0
         finish_reason = "end_turn"
+        model_operation_id: str | None = None
+        model_reserved = False
+        model_accounted = False
         try:
-            async for event in runtime.llm_client.chat(
+            role_system_prompt = _role_system_prompt(runtime, role)
+            projection = await runtime.context_manager.prepare(
                 [Message(role="user", content=content)],
+                system_prompt=role_system_prompt,
+                tools=[],
+                objective=state.input,
+            )
+            context_attributes = projection.observability_attributes(compaction_count=0)
+            if runtime.tracer is not None and llm_span is not None:
+                await runtime.tracer.annotate_span(llm_span.span_id, **context_attributes)
+            model_operation_id = (
+                f"model:{state.run_id}:{_span_id(llm_span) or time.perf_counter_ns()}"
+            )
+            await runtime.budget_manager.reserve_model_call(
+                state,
+                model_operation_id,
+                estimated_input_tokens=projection.estimated_tokens_after,
+            )
+            model_reserved = True
+            async for event in runtime.llm_client.chat(
+                projection.messages,
                 [],
-                system_prompt=_role_system_prompt(runtime, role),
+                system_prompt=role_system_prompt,
             ):
                 event_type = event.get("type")
                 if event_type == "text_delta":
@@ -905,7 +945,22 @@ class MultiAgentExecutionStrategy:
                     finish_reason = str(event.get("stop_reason") or "end_turn")
                 elif event_type == "error":
                     raise RuntimeError(str(event.get("error") or f"{role} failed"))
+            await runtime.budget_manager.complete_model_call(
+                state,
+                model_operation_id,
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+            )
+            model_accounted = True
         except Exception as exc:  # noqa: BLE001 - durable strategy failure boundary
+            if model_operation_id is not None and model_reserved and not model_accounted:
+                with suppress(BudgetExceededError):
+                    await runtime.budget_manager.complete_model_call(
+                        state,
+                        model_operation_id,
+                        input_tokens=prompt_tokens,
+                        output_tokens=completion_tokens,
+                    )
             latency_ms = round((time.perf_counter() - started) * 1000, 3)
             await runtime._finish_span(
                 llm_span,
@@ -938,6 +993,7 @@ class MultiAgentExecutionStrategy:
                 "first_token_at": first_token_at,
                 "latency_ms": latency_ms,
                 "finish_reason": finish_reason,
+                **context_attributes,
             },
         )
         await runtime._finish_span(step_span, SpanStatus.SUCCEEDED)
@@ -974,6 +1030,9 @@ class MultiAgentExecutionStrategy:
             permission_policy=runtime.permission_policy,
             execution_backend=runtime.execution_backend,
             execution_strategy="react",
+            active_run_supervisor=runtime.active_run_supervisor,
+            context_manager=runtime.context_manager,
+            budget_manager=runtime.budget_manager,
             max_turns=self.child_max_turns,
         )
 

@@ -17,13 +17,20 @@ from axiom.bootstrap import build_tool_registry
 from axiom.config import get_config_paths, load_config
 from axiom.entrypoints.repl import start_repl
 from axiom.evaluation import (
+    BadCaseCollector,
+    BadCaseError,
+    BadCaseStore,
     DurableEvaluationExecutor,
     EvaluationComparison,
     EvaluationRunner,
     EvaluationSuiteResult,
+    RegressionThresholds,
+    ReviewStatus,
     compare_results,
+    evaluate_regression_gate,
     load_dataset,
     load_result,
+    promote_badcase,
     save_result,
 )
 from axiom.llm import create_llm_client
@@ -46,9 +53,11 @@ app = typer.Typer(
 mcp_app = typer.Typer(help="MCP server management")
 runs_app = typer.Typer(help="Inspect persisted Runtime runs")
 eval_app = typer.Typer(help="Run and compare Agent evaluation datasets")
+badcase_app = typer.Typer(help="Collect, review, and promote evaluation badcases")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(runs_app, name="runs")
 app.add_typer(eval_app, name="eval")
+eval_app.add_typer(badcase_app, name="badcase")
 console = Console()
 
 
@@ -196,16 +205,17 @@ def eval_run(
         bool,
         typer.Option("--verbose", "-v", help="Show every scorer result"),
     ] = False,
+    trials: Annotated[
+        int,
+        typer.Option("--trials", min=1, help="Independent executions per case"),
+    ] = 1,
 ) -> None:
     root = (cwd or Path.cwd()).resolve()
     try:
-        result = asyncio.run(
-            _execute_evaluation_dataset(
-                dataset,
-                cwd=root,
-                data_dir=data_dir,
-            )
-        )
+        kwargs = {"cwd": root, "data_dir": data_dir}
+        if trials != 1:
+            kwargs["trials"] = trials
+        result = asyncio.run(_execute_evaluation_dataset(dataset, **kwargs))
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         typer.echo(f"Evaluation failed: {exc}", err=True)
         raise typer.Exit(1) from exc
@@ -231,6 +241,10 @@ def eval_compare(
         float,
         typer.Option(help="Warn when average steps increase by this amount"),
     ] = 2.0,
+    cost_warning_percent: Annotated[
+        float,
+        typer.Option(help="Warn when Cost per Success increases by this percentage"),
+    ] = 20.0,
 ) -> None:
     try:
         comparison = compare_results(
@@ -239,11 +253,180 @@ def eval_compare(
             token_warning_percent=token_warning_percent,
             latency_warning_percent=latency_warning_percent,
             step_warning_delta=step_warning_delta,
+            cost_warning_percent=cost_warning_percent,
         )
     except ValueError as exc:
         typer.echo(f"Comparison failed: {exc}", err=True)
         raise typer.Exit(1) from exc
     typer.echo(_format_evaluation_comparison(comparison))
+
+
+@eval_app.command("gate")
+def eval_gate(
+    baseline: Annotated[Path, typer.Argument(help="Baseline evaluation result JSON")],
+    candidate: Annotated[Path, typer.Argument(help="Candidate evaluation result JSON")],
+    max_success_rate_drop: Annotated[
+        float, typer.Option(help="Maximum per-case trial success-rate drop")
+    ] = 0.10,
+    max_token_increase_ratio: Annotated[
+        float | None, typer.Option(help="Hard maximum fractional token increase")
+    ] = None,
+    max_latency_increase_ratio: Annotated[
+        float | None, typer.Option(help="Hard maximum fractional latency increase")
+    ] = None,
+    max_step_increase: Annotated[
+        float | None, typer.Option(help="Hard maximum average step increase")
+    ] = None,
+    max_cost_per_success_increase_ratio: Annotated[
+        float | None,
+        typer.Option(help="Hard maximum fractional Cost per Success increase"),
+    ] = None,
+) -> None:
+    try:
+        result = evaluate_regression_gate(
+            load_result(baseline),
+            load_result(candidate),
+            thresholds=RegressionThresholds(
+                max_success_rate_drop=max_success_rate_drop,
+                max_token_increase_ratio=max_token_increase_ratio,
+                max_latency_increase_ratio=max_latency_increase_ratio,
+                max_step_increase=max_step_increase,
+                max_cost_per_success_increase_ratio=(max_cost_per_success_increase_ratio),
+            ),
+        )
+    except ValueError as exc:
+        typer.echo(f"Regression gate failed to run: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    if not result.passed:
+        raise typer.Exit(1)
+
+
+@badcase_app.command("collect")
+def badcase_collect(
+    result: Annotated[Path | None, typer.Option("--result", help="Evaluation result JSON")] = None,
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Terminal Runtime run ID")] = None,
+    store: Annotated[Path | None, typer.Option("--store", help="Badcase store JSON")] = None,
+    data_dir: Annotated[Path | None, typer.Option("--data-dir")] = None,
+) -> None:
+    if (result is None) == (run_id is None):
+        raise typer.BadParameter("provide exactly one of --result or --run-id")
+    badcases = BadCaseStore(store or _badcase_store_path(data_dir))
+    try:
+        if result is not None:
+            records = BadCaseCollector(badcases).collect_suite(load_result(result))
+        else:
+            database = _runtime_db(data_dir)
+            collector = BadCaseCollector(
+                badcases,
+                runtime_store=SQLiteCheckpointStore(database),
+                observability_store=SQLiteObservabilityStore(database),
+            )
+            records = [asyncio.run(collector.collect_run(str(run_id)))]
+    except (ValueError, BadCaseError) as exc:
+        typer.echo(f"Badcase collection failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps([record.to_dict() for record in records], ensure_ascii=False, indent=2))
+
+
+@badcase_app.command("list")
+def badcase_list(
+    store: Annotated[Path | None, typer.Option("--store", help="Badcase store JSON")] = None,
+    status: Annotated[str | None, typer.Option(help="Filter by review status")] = None,
+    data_dir: Annotated[Path | None, typer.Option("--data-dir")] = None,
+) -> None:
+    try:
+        selected = ReviewStatus(status.upper()) if status else None
+        records = BadCaseStore(store or _badcase_store_path(data_dir)).list(status=selected)
+    except (ValueError, BadCaseError) as exc:
+        typer.echo(f"Badcase list failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps([record.to_dict() for record in records], ensure_ascii=False, indent=2))
+
+
+@badcase_app.command("show")
+def badcase_show(
+    badcase_id: Annotated[str, typer.Argument(help="Badcase ID")],
+    store: Annotated[Path | None, typer.Option("--store", help="Badcase store JSON")] = None,
+    data_dir: Annotated[Path | None, typer.Option("--data-dir")] = None,
+) -> None:
+    record = BadCaseStore(store or _badcase_store_path(data_dir)).get(badcase_id)
+    if record is None:
+        typer.echo(f"Badcase not found: {badcase_id}", err=True)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(record.to_dict(), ensure_ascii=False, indent=2))
+
+
+def _review_badcase(
+    badcase_id: str,
+    status: ReviewStatus,
+    *,
+    note: str,
+    store: Path | None,
+    data_dir: Path | None,
+) -> None:
+    try:
+        record = BadCaseStore(store or _badcase_store_path(data_dir)).update_review_status(
+            badcase_id, status, note=note
+        )
+    except BadCaseError as exc:
+        typer.echo(f"Badcase review failed [{exc.code}]: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(record.to_dict(), ensure_ascii=False, indent=2))
+
+
+@badcase_app.command("approve")
+def badcase_approve(
+    badcase_id: Annotated[str, typer.Argument(help="Badcase ID")],
+    note: Annotated[str, typer.Option(help="Human review note")] = "",
+    store: Annotated[Path | None, typer.Option("--store")] = None,
+    data_dir: Annotated[Path | None, typer.Option("--data-dir")] = None,
+) -> None:
+    _review_badcase(badcase_id, ReviewStatus.APPROVED, note=note, store=store, data_dir=data_dir)
+
+
+@badcase_app.command("ignore")
+def badcase_ignore(
+    badcase_id: Annotated[str, typer.Argument(help="Badcase ID")],
+    note: Annotated[str, typer.Option(help="Human review note")] = "",
+    store: Annotated[Path | None, typer.Option("--store")] = None,
+    data_dir: Annotated[Path | None, typer.Option("--data-dir")] = None,
+) -> None:
+    _review_badcase(badcase_id, ReviewStatus.IGNORED, note=note, store=store, data_dir=data_dir)
+
+
+@badcase_app.command("promote")
+def badcase_promote(
+    badcase_id: Annotated[str, typer.Argument(help="Badcase ID")],
+    dataset: Annotated[Path, typer.Option("--dataset", help="Regression dataset JSON")],
+    store: Annotated[Path | None, typer.Option("--store")] = None,
+    data_dir: Annotated[Path | None, typer.Option("--data-dir")] = None,
+    expected_json: Annotated[
+        str | None, typer.Option("--expected-json", help="Expected JSON object override")
+    ] = None,
+    scorers_json: Annotated[
+        str | None, typer.Option("--scorers-json", help="Scorer JSON list override")
+    ] = None,
+) -> None:
+    try:
+        expected = json.loads(expected_json) if expected_json else None
+        scorers = json.loads(scorers_json) if scorers_json else None
+        if expected is not None and not isinstance(expected, dict):
+            raise ValueError("--expected-json must be an object")
+        if scorers is not None and not isinstance(scorers, list):
+            raise ValueError("--scorers-json must be a list")
+        record, case = promote_badcase(
+            BadCaseStore(store or _badcase_store_path(data_dir)),
+            badcase_id,
+            dataset,
+            expected_override=expected,
+            scorers_override=scorers,
+        )
+    except (ValueError, BadCaseError) as exc:
+        code = f" [{exc.code}]" if isinstance(exc, BadCaseError) else ""
+        typer.echo(f"Badcase promotion failed{code}: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps({"badcase": record.to_dict(), "case": case.to_dict()}, indent=2))
 
 
 @mcp_app.command("serve")
@@ -336,6 +519,7 @@ async def _execute_evaluation_dataset(
     *,
     cwd: Path,
     data_dir: Path | None,
+    trials: int = 1,
 ) -> EvaluationSuiteResult:
     dataset = load_dataset(dataset_path)
     config = load_config(project_root=cwd)
@@ -362,7 +546,7 @@ async def _execute_evaluation_dataset(
         checkpoint_store=SQLiteCheckpointStore(database),
         observability_store=SQLiteObservabilityStore(database),
     )
-    return await EvaluationRunner(executor).run(dataset)
+    return await EvaluationRunner(executor).run(dataset, trials=trials)
 
 
 def _version_of(command: str) -> str:
@@ -386,6 +570,11 @@ def _runtime_db(data_dir: Path | None) -> Path:
     return root / "runtime.db"
 
 
+def _badcase_store_path(data_dir: Path | None) -> Path:
+    root = data_dir.expanduser() if data_dir else Path.home() / ".axiom" / "runtime"
+    return root / "evaluation-badcases.json"
+
+
 def _format_run_metrics(metrics: RunMetrics) -> str:
     success_rate = (
         f"{metrics.tool_success_rate * 100:.1f}%"
@@ -407,6 +596,12 @@ def _format_run_metrics(metrics: RunMetrics) -> str:
             f"Interrupts: {metrics.interrupt_count}",
             f"Resumes: {metrics.resume_count}",
             f"Retries: {metrics.retry_count}",
+            f"Cost: ${metrics.cost_usd}" if metrics.cost_known else "Cost: unknown",
+            f"Budget limits: {json.dumps(metrics.budget_policy, sort_keys=True)}",
+            f"Budget remaining: {json.dumps(metrics.budget_remaining, sort_keys=True)}",
+            "Aggregate budget remaining: "
+            f"{json.dumps(metrics.aggregate_budget_remaining, sort_keys=True)}",
+            f"Budget utilization: {json.dumps(metrics.budget_utilization, sort_keys=True)}",
         ]
     )
 
@@ -419,14 +614,28 @@ def _format_evaluation_suite(result: EvaluationSuiteResult, *, verbose: bool) ->
         f"Passed: {result.cases_passed}",
         f"Failed: {result.cases_failed}",
         f"Pass Rate: {result.pass_rate * 100:.1f}%",
+        f"Trials: {result.trial_count} ({result.trials_per_case} per case)",
+        f"Trial Success Rate: {result.trial_success_rate * 100:.1f}%",
         "",
         f"Avg Steps: {result.avg_steps:.2f}",
         f"Avg Tokens: {result.avg_tokens:.1f}",
+        (
+            f"Total Cost: ${result.total_cost_usd} "
+            f"({result.cost_known_trial_count}/{result.trial_count} trials priced)"
+            if result.total_cost_usd is not None
+            else "Total Cost: unknown"
+        ),
+        (
+            f"Cost per Success: ${result.cost_per_success}"
+            if result.cost_per_success is not None
+            else "Cost per Success: unknown/incomplete"
+        ),
         f"Avg Latency: {_format_duration(result.avg_latency_ms)}",
         "",
     ]
     for case in result.results:
-        lines.append(f"{'✓' if case.passed else '✗'} {case.case_id}")
+        trial = f" trial {case.trial_index}" if result.trials_per_case > 1 else ""
+        lines.append(f"{'✓' if case.passed else '✗'} {case.case_id}{trial}")
         if verbose:
             for score in case.scores:
                 required = "" if score.required else " (optional)"
@@ -445,6 +654,7 @@ def _format_evaluation_comparison(comparison: EvaluationComparison) -> str:
         f"Comparison: {comparison.old_dataset} → {comparison.new_dataset}",
         "",
         _format_change(changes["pass_rate"], percent_value=True),
+        _format_change(changes["trial_success_rate"], percent_value=True),
         _format_change(changes["avg_tokens"]),
         _format_change(changes["avg_latency_ms"], duration=True),
         _format_change(changes["avg_steps"]),
@@ -458,6 +668,9 @@ def _format_evaluation_comparison(comparison: EvaluationComparison) -> str:
     lines.extend(f"  {case_id} FAIL → PASS" for case_id in comparison.improvements)
     if not comparison.improvements:
         lines.append("  (none)")
+    if comparison.stochastic_regressions:
+        lines.append("Stochastic quality regressions:")
+        lines.extend(f"  {case_id}" for case_id in comparison.stochastic_regressions)
     if comparison.performance_warnings:
         lines.append("Performance warnings:")
         lines.extend(f"  {warning.message}" for warning in comparison.performance_warnings)
@@ -468,7 +681,7 @@ def _format_change(change, *, percent_value: bool = False, duration: bool = Fals
     if percent_value:
         old = f"{change.old * 100:.1f}%"
         new = f"{change.new * 100:.1f}%"
-        label = "Pass Rate"
+        label = "Trial Success Rate" if change.metric == "trial_success_rate" else "Pass Rate"
     elif duration:
         old = _format_duration(change.old)
         new = _format_duration(change.new)

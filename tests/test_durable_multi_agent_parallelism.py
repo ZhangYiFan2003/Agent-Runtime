@@ -11,6 +11,7 @@ from axiom.agent import QueryEngine
 from axiom.config import AxiomConfig
 from axiom.evaluation import DurableEvaluationExecutor, EvaluationCase
 from axiom.runtime import (
+    ActiveRunSupervisor,
     AssignmentStatus,
     Checkpoint,
     DurableAgentRuntime,
@@ -57,6 +58,7 @@ class ParallelClient:
         fail_tasks: set[str] | None = None,
         b_waits_for_c: bool = False,
         review_decisions: list[bool] | None = None,
+        hold_tasks: set[str] | None = None,
     ) -> None:
         self.tasks = tasks
         self.barrier_size = barrier_size
@@ -64,6 +66,7 @@ class ParallelClient:
         self.fail_tasks = fail_tasks or set()
         self.b_waits_for_c = b_waits_for_c
         self.review_decisions = list(review_decisions or [True])
+        self.hold_tasks = hold_tasks or set()
         self.planner_calls = 0
         self.reviewer_calls = 0
         self.worker_calls: Counter[str] = Counter()
@@ -73,6 +76,7 @@ class ParallelClient:
         self.started_tasks: set[str] = set()
         self.barrier = asyncio.Event()
         self.c_started = asyncio.Event()
+        self.release: dict[str, asyncio.Event] = {task: asyncio.Event() for task in self.hold_tasks}
 
     async def chat(self, messages, _tools, *, system_prompt):
         if "Planner in a multi-agent workflow" in system_prompt:
@@ -129,6 +133,8 @@ class ParallelClient:
             await self.barrier.wait()
         if self.b_waits_for_c and task == "B":
             await asyncio.wait_for(self.c_started.wait(), timeout=2)
+        if task in self.hold_tasks:
+            await self.release[task].wait()
         await asyncio.sleep(0.01)
         self.timeline.append(f"end:{task}")
         self.active_workers -= 1
@@ -215,6 +221,7 @@ def _runtime(
     events=None,
     observations=None,
     strategy: MultiAgentExecutionStrategy | None = None,
+    supervisor: ActiveRunSupervisor | None = None,
 ) -> DurableAgentRuntime:
     return DurableAgentRuntime(
         llm_client=client,
@@ -227,6 +234,7 @@ def _runtime(
         event_sink=events,
         tracer=RunTracer(observations) if observations is not None else None,
         execution_strategy=strategy or MultiAgentExecutionStrategy(),
+        active_run_supervisor=supervisor,
     )
 
 
@@ -270,6 +278,53 @@ def test_parallelism_one_preserves_sequential_semantics(tmp_path):
             "start:B",
             "start:C",
         ]
+
+    asyncio.run(scenario())
+
+
+def test_parent_cancel_signals_active_workers_and_stops_new_assignments(tmp_path):
+    async def scenario():
+        client = ParallelClient(
+            [_task("A"), _task("B"), _task("C")],
+            hold_tasks={"A", "B"},
+        )
+        store = MemoryCheckpointStore()
+        supervisor = ActiveRunSupervisor()
+        runtime = _runtime(client, store, tmp_path, supervisor=supervisor)
+        parent_task = asyncio.create_task(
+            runtime.start(
+                thread_id="thread-team-supervisor-cancel",
+                run_id="run-team-supervisor-cancel",
+                input="goal",
+            )
+        )
+        for _attempt in range(200):
+            if client.started_tasks == {"A", "B"}:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("worker children did not start")
+        assert len(supervisor.list_active()) == 3
+
+        cancelled = await _runtime(
+            client,
+            store,
+            tmp_path,
+            supervisor=supervisor,
+        ).cancel("run-team-supervisor-cancel")
+        observed = await asyncio.wait_for(parent_task, timeout=3)
+        children = [
+            state
+            for state in await store.list("thread-team-supervisor-cancel")
+            if state.parent_run_id == cancelled.run_id
+        ]
+
+        assert cancelled.status == RunStatus.CANCELLED
+        assert observed.status == RunStatus.CANCELLED
+        assert len(children) == 2
+        assert {child.status for child in children} == {RunStatus.CANCELLED}
+        assert "C" not in client.started_tasks
+        assert supervisor.list_active() == ()
 
     asyncio.run(scenario())
 

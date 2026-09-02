@@ -201,9 +201,11 @@ def test_success_record_deduplicates_tool_when_state_checkpoint_was_not_written(
 
         restarted = _runtime(llm=llm, registry=registry, store=store, tmp_path=tmp_path)
         completed = await restarted.resume("run_record_dedupe")
+        budget = await restarted.budget_snapshot(completed)
 
         assert completed.status == RunStatus.COMPLETED
         assert executions == 1
+        assert budget.local_usage.tool_calls == 1
 
     asyncio.run(scenario())
 

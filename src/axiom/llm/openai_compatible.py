@@ -153,11 +153,19 @@ class OpenAICompatibleClient:
 
         usage = chunk.get("usage")
         if isinstance(usage, dict):
+            prompt_details = usage.get("prompt_tokens_details")
+            completion_details = usage.get("completion_tokens_details")
             yield {
                 "type": "usage",
                 "usage": {
                     "input_tokens": int(usage.get("prompt_tokens") or 0),
                     "output_tokens": int(usage.get("completion_tokens") or 0),
+                    "cached_input_tokens": int(prompt_details.get("cached_tokens") or 0)
+                    if isinstance(prompt_details, dict)
+                    else 0,
+                    "reasoning_tokens": int(completion_details.get("reasoning_tokens") or 0)
+                    if isinstance(completion_details, dict)
+                    else 0,
                 },
             }
 

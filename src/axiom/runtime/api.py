@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -43,6 +45,7 @@ from axiom.runtime.observability_store import (
     RunTracer,
     SQLiteObservabilityStore,
 )
+from axiom.runtime.supervisor import ActiveRunSupervisor
 from axiom.runtime.tasks import DurableTaskManager
 from axiom.types import Message
 
@@ -239,6 +242,8 @@ class RuntimeApiServer:
         checkpoint_store: RuntimeStore | None = None,
         observability_store: ObservabilityStore | None = None,
         retry_policy: RetryPolicy | None = None,
+        active_run_supervisor: ActiveRunSupervisor | None = None,
+        shutdown_timeout: float = 5.0,
     ):
         self.cwd = str(Path(cwd).resolve())
         self.config = config
@@ -259,6 +264,8 @@ class RuntimeApiServer:
         )
         self.observability = ObservabilityService(self.observability_store)
         self.retry_policy = retry_policy or RetryPolicy()
+        self.active_run_supervisor = active_run_supervisor or ActiveRunSupervisor()
+        self.shutdown_timeout = max(0.0, shutdown_timeout)
         self.task_manager = task_manager or DurableTaskManager(self.data_dir / "tasks.db")
         self.memory_service = memory_service or MemoryService(
             self.data_dir / "memory.db",
@@ -275,6 +282,8 @@ class RuntimeApiServer:
         self._thread_locks_guard = threading.Lock()
         self._run_locks: dict[str, threading.Lock] = {}
         self._run_locks_guard = threading.Lock()
+        self._cancel_locks: dict[str, threading.Lock] = {}
+        self._cancel_locks_guard = threading.Lock()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -309,6 +318,7 @@ class RuntimeApiServer:
             self._httpd.serve_forever()
         finally:
             self._stop.set()
+            self._shutdown_active_executions()
             if self._httpd is not None:
                 self._httpd.server_close()
             for worker in self._worker_threads:
@@ -322,6 +332,8 @@ class RuntimeApiServer:
         httpd = self._httpd
         if httpd is not None:
             httpd.shutdown()
+        self._shutdown_active_executions()
+        if httpd is not None:
             httpd.server_close()
         thread = self._server_thread
         if thread is not None and thread.is_alive():
@@ -332,6 +344,64 @@ class RuntimeApiServer:
         self._httpd = None
         self._server_thread = None
         self._worker_threads = []
+
+    def _shutdown_active_executions(self) -> None:
+        handles = self.active_run_supervisor.list_active()
+        if not handles:
+            return
+        run_ids = tuple(handle.run_id for handle in handles)
+        deadline = time.monotonic() + self.shutdown_timeout
+        if self.shutdown_timeout > 0:
+            self._persist_active_cancellation(run_ids, deadline)
+        unsignalled = tuple(
+            run_id
+            for run_id in run_ids
+            if (handle := self.active_run_supervisor.get(run_id)) is not None
+            and not handle.cancellation_requested
+        )
+        self.active_run_supervisor.request_cancel_many(unsignalled)
+        self.active_run_supervisor.drain(max(0.0, deadline - time.monotonic()))
+
+    def _persist_active_cancellation(self, run_ids: tuple[str, ...], deadline: float) -> None:
+        def persist() -> None:
+            with contextlib.suppress(RuntimeError, TimeoutError):
+                asyncio.run(self._cancel_active_durably(run_ids, deadline))
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            persist()
+            return
+        thread = threading.Thread(
+            target=persist,
+            name="axiom-shutdown-cancellation",
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    async def _cancel_active_durably(
+        self,
+        run_ids: tuple[str, ...],
+        deadline: float,
+    ) -> None:
+        for run_id in run_ids:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                state = await asyncio.wait_for(
+                    self.checkpoint_store.load(run_id),
+                    timeout=remaining,
+                )
+                if state is None or state.finished:
+                    continue
+                await asyncio.wait_for(
+                    self._cancel_run(state),
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+            except (ApiError, CheckpointConflictError, ValueError, TimeoutError):
+                continue
 
     def running(self):
         return _RunningRuntimeServer(self)
@@ -431,6 +501,12 @@ class RuntimeApiServer:
             elif method == "GET" and path == "/v1/runs":
                 runs = asyncio.run(self._list_run_views())
                 _send_json(request, 200, {"runs": runs})
+            elif method == "GET" and path == "/v1/runtime/active-runs":
+                _send_json(
+                    request,
+                    200,
+                    {"active_runs": self.active_run_supervisor.inspect_active()},
+                )
             elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/trace"):
                 run_id = path.split("/")[3]
                 bundle = asyncio.run(self.observability.trace(run_id))
@@ -526,7 +602,10 @@ class RuntimeApiServer:
                 _send_json(request, 200 if task else 404, payload)
             elif method == "POST" and path.startswith("/v1/tasks/") and path.endswith("/cancel"):
                 task_id = path.split("/")[3]
-                _send_json(request, 200, {"canceled": self.task_manager.cancel(task_id)})
+                canceled = self.task_manager.cancel(task_id)
+                if canceled:
+                    asyncio.run(self._cancel_background_task_run(task_id))
+                _send_json(request, 200, {"canceled": canceled})
             else:
                 _send_json(request, 404, {"error": "not found"})
         except ApiError as exc:
@@ -768,7 +847,11 @@ class RuntimeApiServer:
             )
             return self._replay_operation(record)
 
-        lock = self._run_lock(run_id)
+        lock = (
+            self._cancel_lock(run_id)
+            if operation == ControlOperationName.CANCEL
+            else self._run_lock(run_id)
+        )
         if not lock.acquire(blocking=False):
             raise ApiError(
                 "operation_in_progress",
@@ -1114,6 +1197,7 @@ class RuntimeApiServer:
             event_sink=self._runtime_event_sink(thread_id),
             tracer=RunTracer(self.observability_store),
             execution_strategy=execution_strategy,
+            active_run_supervisor=self.active_run_supervisor,
         )
 
     def _runtime_event_sink(self, thread_id: str):
@@ -1319,21 +1403,59 @@ class RuntimeApiServer:
                 self._stop.wait(0.05)
                 continue
             try:
-                result = asyncio.run(self._run_task(task.prompt))
-                self.task_manager.complete(task.id, result)
+                result = asyncio.run(self._run_task(task.prompt, task_id=task.id))
+                current = self.task_manager.get(task.id)
+                run_state = asyncio.run(self.checkpoint_store.load(_task_run_id(task.id)))
+                if current is not None and current.status == "canceled":
+                    continue
+                if run_state is not None and run_state.status == RunStatus.CANCELLED:
+                    self.task_manager.cancel(task.id)
+                elif run_state is not None and run_state.status != RunStatus.COMPLETED:
+                    self.task_manager.fail(task.id, f"run stopped in {run_state.status.value}")
+                else:
+                    self.task_manager.complete(task.id, result)
             except Exception as exc:  # noqa: BLE001
                 self.task_manager.fail(task.id, _safe_error(exc))
 
-    async def _run_task(self, prompt: str) -> str:
+    async def _run_task(self, prompt: str, *, task_id: str | None = None) -> str:
+        thread_id = self._create_thread() if task_id is not None else None
+        turn_id = f"turn_{uuid4().hex}" if task_id is not None else None
+        run_id = _task_run_id(task_id) if task_id is not None else None
         context = RuntimeTurnContext(
-            thread_id=None,
+            thread_id=thread_id,
             message=prompt,
             history=[],
             cwd=self.cwd,
             config=self.config,
+            turn_id=turn_id,
+            run_id=run_id,
         )
         engine = await self._engine(context)
+        if isinstance(engine, QueryEngine) and thread_id and turn_id and run_id:
+            task_record = self.task_manager.get(task_id)
+            if task_record is not None and task_record.status == "canceled":
+                return ""
+            runtime = self._durable_runtime(
+                engine,
+                thread_id,
+                execution_strategy=_execution_strategy_name(engine.config.prompt.agent_mode),
+            )
+            state = await runtime.start(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                input=prompt,
+                run_kind="background_task",
+            )
+            return state.output_text
         return (await engine.ask_complete_async(prompt)).text
+
+    async def _cancel_background_task_run(self, task_id: str) -> None:
+        state = await self.checkpoint_store.load(_task_run_id(task_id))
+        if state is None or state.finished:
+            return
+        with contextlib.suppress(ApiError, CheckpointConflictError, ValueError):
+            await self._cancel_run(state)
 
     async def _engine(self, context: RuntimeTurnContext) -> Any:
         if self.engine_factory is not None:
@@ -1385,6 +1507,14 @@ class RuntimeApiServer:
             if lock is None:
                 lock = threading.Lock()
                 self._run_locks[run_id] = lock
+            return lock
+
+    def _cancel_lock(self, run_id: str) -> threading.Lock:
+        with self._cancel_locks_guard:
+            lock = self._cancel_locks.get(run_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._cancel_locks[run_id] = lock
             return lock
 
     def _derive_conversation_memory(
@@ -1641,6 +1771,10 @@ def _execution_strategy_name(agent_mode: str) -> str:
     if normalized in {"team", "multi_agent"}:
         return "multi_agent"
     return "react"
+
+
+def _task_run_id(task_id: str) -> str:
+    return f"run_{task_id}"
 
 
 def _now() -> str:

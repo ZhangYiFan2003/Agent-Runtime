@@ -175,6 +175,39 @@ def segment_messages(
     return segments
 
 
+def segment_runtime_messages(
+    messages: Sequence[Message],
+    *,
+    max_estimated_tokens: int,
+) -> list[list[Message]]:
+    """Segment an in-flight message sequence for the existing map stage.
+
+    Persisted conversation summaries use event-backed ``segment_messages`` above.
+    Live runtime context has no event IDs yet, but it must use the same bounded
+    map/reduce shape and summarizer protocol.  Tool-call protocol groups are
+    selected atomically by the runtime context manager before this function is
+    called, so this helper only has to create deterministic token-bounded maps.
+    """
+
+    limit = max(1, int(max_estimated_tokens))
+    segments: list[list[Message]] = []
+    current: list[Message] = []
+    current_tokens = 0
+    for message in messages:
+        message_tokens = estimate_tokens(str(message.content))
+        if message.tool_calls:
+            message_tokens += estimate_tokens(str(message.tool_calls))
+        if current and current_tokens + message_tokens > limit:
+            segments.append(current)
+            current = []
+            current_tokens = 0
+        current.append(message)
+        current_tokens += message_tokens
+    if current:
+        segments.append(current)
+    return segments
+
+
 def _clip(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text

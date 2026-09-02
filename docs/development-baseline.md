@@ -48,6 +48,7 @@ stage. This document does not repeat the model request.
 | MCP client | `src/axiom/mcp/client.py`, `src/axiom/mcp/config.py` | Verified | Tests passed for stdio MCP tool discovery/call and stderr suppression. |
 | MCP server | `src/axiom/mcp/server.py` | Partially verified | Handler-level tests cover initialize, tools/list, safe tools/call, unknown tools, unknown methods, and malformed missing-method requests. Long-running stdio/http transports were not started in this baseline. |
 | Runtime API and durable execution | `src/axiom/runtime/*` | Verified | Runtime lifecycle/API tests plus crash recovery tests cover Memory/SQLite checkpoints, restart resume, approval/reject/manual interrupt, parent/child discovery, restart-safe control-operation idempotency, structured transition conflicts, cancellation cascade, bounded retry, successful-tool deduplication, optimistic sequence conflicts, hierarchical SSE replay, and socket release. |
+| Active Run Supervisor | `src/axiom/runtime/supervisor.py`, `src/axiom/runtime/durable.py`, `src/axiom/runtime/api.py` | Verified | Tests cover registration lifecycle, live duplicate conflicts, stale replacement, safe inspection, real cross-thread and multiple-loop cancellation, HTTP and background-worker ownership, repeated cancel, cancel-vs-complete CAS, Plan/Multi-Agent Child propagation, waiting-state cancellation, restricted subprocess cleanup, restart boundaries, and bounded server shutdown drain. |
 | Runtime observability | `src/axiom/runtime/observability.py`, `src/axiom/runtime/observability_store.py` | Verified | Deterministic tests cover LLM token/TTFT/latency spans, Tool success/failure/retry/reuse and ambiguity attributes, interrupt/resume continuity, crash recovery on one trace, SQLite reload, lifecycle Events, HTTP metrics/trace endpoints, and CLI rendering. |
 | Agent evaluation | `src/axiom/evaluation/*`, `benchmarks/datasets/agent-core.json` | Verified | Tests cover JSON dataset validation, five deterministic scorers, composite scoring, real durable Runtime execution, failed Runs, metrics projection, JSON report round-trip, regression comparison, and CLI wiring. |
 
@@ -91,6 +92,7 @@ Pytest configuration:
 Representative test files (pytest discovers the complete `tests/test_*.py` suite):
 
 - `tests/test_code_call_graph.py`
+- `tests/test_active_run_supervisor.py`
 - `tests/test_code_context.py`
 - `tests/test_code_index_ast.py`
 - `tests/test_code_search_lexical.py`
@@ -123,10 +125,10 @@ uv run pytest
 
 Result:
 
-- Passed: 305
+- Passed: 335
 - Failed: 0
 - Skipped: 0
-- Total executed: 305
+- Total executed: 335
 
 The pytest baseline is currently green after test home-directory isolation was
 added for Windows.
@@ -144,7 +146,7 @@ added for Windows.
 
 ## 6. Feature-freeze posture
 
-The current Runtime feature set is intentionally frozen after durable bounded Plan DAG parallelism.
+The current Runtime feature set is intentionally frozen after process-local Active Run supervision.
 Known limitations remain documented rather than being expanded into another feature stage. Paid
 model verification remains an explicit manual smoke command and is never part of the default
 automated suite.

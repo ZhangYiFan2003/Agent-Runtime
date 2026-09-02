@@ -369,13 +369,19 @@ class RunTracer:
         attributes: dict[str, object] | None = None,
     ) -> Span:
         provided = json_attributes(dict(attributes or {}))
-        span.attributes.update(provided)
-        span.status = status
-        span.ended_at = now()
+        persisted = await self.store.load_span(span.span_id)
+        target = persisted or span
+        if persisted is not None:
+            target.attributes = {**span.attributes, **persisted.attributes}
+        target.attributes.update(provided)
+        target.status = status
+        target.ended_at = now()
         if "latency_ms" not in provided:
-            span.attributes["latency_ms"] = duration_ms(span.started_at, span.ended_at)
-        await self.store.save_span(span)
-        return span
+            target.attributes["latency_ms"] = duration_ms(target.started_at, target.ended_at)
+        await self.store.save_span(target)
+        if self.root_span is not None and target.span_id == self.root_span.span_id:
+            self.root_span = target
+        return target
 
     async def annotate_span(self, span_id: str, **attributes: object) -> Span | None:
         span = await self.store.load_span(span_id)

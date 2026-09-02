@@ -25,6 +25,7 @@ from axiom.execution import (
 )
 from axiom.policy import Capability
 from axiom.runtime import (
+    ActiveRunSupervisor,
     DurableAgentRuntime,
     MemoryCheckpointStore,
     MemoryObservabilityStore,
@@ -167,6 +168,7 @@ def _runtime(
     config=None,
     backend=None,
     observations=None,
+    supervisor=None,
 ):
     return DurableAgentRuntime(
         llm_client=llm,
@@ -176,6 +178,7 @@ def _runtime(
         config=config or _config(tmp_path),
         store=store,
         execution_backend=backend,
+        active_run_supervisor=supervisor,
         tracer=RunTracer(observations) if observations is not None else None,
     )
 
@@ -561,6 +564,61 @@ def test_runtime_task_cancellation_updates_tool_record_and_span(tmp_path):
         assert record.error == "tool execution cancelled"
         assert tool_span.status == SpanStatus.CANCELLED
         assert tool_span.attributes["cancelled"] is True
+
+    asyncio.run(scenario())
+
+
+def test_supervisor_cancellation_reaches_restricted_process_tree_cleanup(tmp_path):
+    async def scenario():
+        marker = tmp_path / "supervisor-child-survived.txt"
+        child = (
+            "import time; "
+            "time.sleep(0.8); "
+            f"open({str(marker)!r}, 'w', encoding='utf-8').write('alive')"
+        )
+        parent = (
+            "import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+            "time.sleep(10)"
+        )
+        store = MemoryCheckpointStore()
+        supervisor = ActiveRunSupervisor()
+        runtime = _runtime(
+            ToolLlm("bash", {"command": _python_command(parent), "timeout": 10}),
+            _registry(_builtin("bash")),
+            store,
+            tmp_path,
+            config=_config(tmp_path, hitl="never"),
+            backend=_restricted(tmp_path),
+            supervisor=supervisor,
+        )
+        task = asyncio.create_task(
+            runtime.start(
+                thread_id="thread-supervisor-process",
+                input="shell",
+                run_id="run-supervisor-process",
+            )
+        )
+        for _attempt in range(200):
+            record = await store.load_tool_execution("run-supervisor-process:call_bash")
+            if record is not None and record.status == ToolExecutionStatus.RUNNING:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("subprocess tool did not start")
+
+        signal_result = supervisor.request_cancel("run-supervisor-process")
+        state = await asyncio.wait_for(task, timeout=3)
+        await asyncio.sleep(1.0)
+        record = await store.load_tool_execution("run-supervisor-process:call_bash")
+
+        assert signal_result.status == "signalled"
+        assert state.status == RunStatus.CANCELLED
+        assert record is not None
+        assert record.status == ToolExecutionStatus.FAILED
+        assert record.error == "tool execution cancelled"
+        assert not marker.exists()
+        assert supervisor.list_active() == ()
 
     asyncio.run(scenario())
 

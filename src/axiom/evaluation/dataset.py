@@ -17,12 +17,11 @@ def load_dataset(path: str | Path) -> EvaluationDataset:
 
 def save_result(result: EvaluationSuiteResult, path: str | Path) -> Path:
     target = Path(path).expanduser()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(result.to_dict(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return target
+    return _write_object(target, result.to_dict())
+
+
+def save_dataset(dataset: EvaluationDataset, path: str | Path) -> Path:
+    return _write_object(Path(path).expanduser(), dataset.to_dict())
 
 
 def load_result(path: str | Path) -> EvaluationSuiteResult:
@@ -41,3 +40,14 @@ def _read_object(path: Path, *, artifact: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{artifact} must be a JSON object")
     return value
+
+
+def _write_object(target: Path, value: dict[str, Any]) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return target

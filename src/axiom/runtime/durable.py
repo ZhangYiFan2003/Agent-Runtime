@@ -4,13 +4,24 @@ import asyncio
 import hashlib
 import inspect
 import json
+import threading
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from axiom.config import AxiomConfig
+from axiom.context import (
+    ContextBudgetExceededError,
+    ContextCompactionResult,
+    ContextManager,
+    apply_compaction_to_strategy_state,
+    compaction_count_from_strategy_state,
+    context_policy_from_config,
+    summary_from_strategy_state,
+)
 from axiom.execution import ExecutionBackend, create_execution_backend
 from axiom.llm.base import LlmClient
 from axiom.policy import (
@@ -20,7 +31,14 @@ from axiom.policy import (
     PermissionDecision,
     PermissionPolicy,
 )
-from axiom.runtime.checkpoints import RuntimeStore
+from axiom.runtime.budget import (
+    BudgetExceededError,
+    BudgetManager,
+    ModelPricingRegistry,
+    RunBudgetPolicy,
+    RunBudgetState,
+)
+from axiom.runtime.checkpoints import CheckpointConflictError, RuntimeStore
 from axiom.runtime.models import (
     Checkpoint,
     Interrupt,
@@ -32,6 +50,7 @@ from axiom.runtime.models import (
 from axiom.runtime.observability import Span, SpanStatus, SpanType, now, tool_span_id
 from axiom.runtime.observability_store import RunTracer
 from axiom.runtime.strategies import RuntimeExecutionStrategy, execution_strategy_from_name
+from axiom.runtime.supervisor import ActiveRunSupervisor, ExecutionHandle
 from axiom.tools.base import Tool, ToolContext, ToolResult
 from axiom.tools.executor import ToolExecutor
 from axiom.tools.registry import ToolRegistry
@@ -60,8 +79,27 @@ class _LlmCallResult:
     stop_reason: str
     prompt_tokens: int
     completion_tokens: int
+    cached_input_tokens: int
+    reasoning_tokens: int
     first_token_at: str | None
     ttft_ms: float | None
+
+
+class _LlmStreamError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cached_input_tokens: int,
+        reasoning_tokens: int,
+    ) -> None:
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.cached_input_tokens = cached_input_tokens
+        self.reasoning_tokens = reasoning_tokens
 
 
 class DurableAgentRuntime:
@@ -86,6 +124,9 @@ class DurableAgentRuntime:
         permission_policy: PermissionPolicy | None = None,
         execution_backend: ExecutionBackend | None = None,
         execution_strategy: RuntimeExecutionStrategy | str = "react",
+        active_run_supervisor: ActiveRunSupervisor | None = None,
+        context_manager: ContextManager | None = None,
+        budget_manager: BudgetManager | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -107,6 +148,18 @@ class DurableAgentRuntime:
             if isinstance(execution_strategy, str)
             else execution_strategy
         )
+        self.active_run_supervisor = active_run_supervisor or ActiveRunSupervisor()
+        self.context_manager = context_manager or ContextManager(
+            context_policy_from_config(config, llm_client)
+        )
+        self.budget_manager = budget_manager or BudgetManager(
+            store,
+            policy=RunBudgetPolicy.from_config(config.run_budget),
+            provider=llm_client.provider_name,
+            model=llm_client.model_name,
+            pricing_registry=ModelPricingRegistry.from_config(config.run_budget.model_pricing),
+            observability_store=tracer.store if tracer is not None else None,
+        )
         self.max_turns = max_turns
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -121,9 +174,16 @@ class DurableAgentRuntime:
         parent_run_id: str | None = None,
         parent_step_id: str | None = None,
         run_kind: str = "agent",
+        budget_owner_run_id: str | None = None,
     ) -> Checkpoint:
         if run_kind == "agent" and self.execution_strategy.name == "multi_agent":
             run_kind = "orchestrator"
+        resolved_budget_owner = budget_owner_run_id
+        if resolved_budget_owner is None and parent_run_id is not None:
+            parent = await self.store.load(parent_run_id)
+            resolved_budget_owner = (
+                parent.budget_owner_run_id or parent.run_id if parent is not None else parent_run_id
+            )
         state = Checkpoint.create(
             thread_id=thread_id,
             input=input,
@@ -134,20 +194,43 @@ class DurableAgentRuntime:
             parent_run_id=parent_run_id,
             parent_step_id=parent_step_id,
             run_kind=run_kind,
+            budget_owner_run_id=resolved_budget_owner,
+            budget_policy=self.budget_manager.policy.to_dict(),
         )
+
         async with self._run_lock(state.run_id):
             if await self.store.load(state.run_id) is not None:
                 raise ValueError(f"run already exists: {state.run_id}")
             if self.tracer is not None:
                 await self.tracer.start_run(state)
+            await self.budget_manager.initialize(state)
             await self._save_checkpoint(state, operation="run.start")
             await self._emit(
                 "run.started",
-                {"run_id": state.run_id, "turn_id": state.turn_id, "status": state.status.value},
+                {
+                    "run_id": state.run_id,
+                    "turn_id": state.turn_id,
+                    "status": state.status.value,
+                },
             )
+
+        async def execute() -> Checkpoint:
             return await self._advance(state)
 
+        return await self._supervise(state, execute)
+
+    async def budget_snapshot(self, state: Checkpoint) -> RunBudgetState:
+        return await self.budget_manager.snapshot(state)
+
     async def resume(self, run_id: str, *, decision: str | None = None) -> Checkpoint:
+        state = await self._require(run_id)
+
+        async def execute() -> Checkpoint:
+            return await self._resume_inner(run_id, decision=decision)
+
+        return await self._supervise(state, execute)
+
+    async def _resume_inner(self, run_id: str, *, decision: str | None) -> Checkpoint:
         async with self._run_lock(run_id):
             state = await self._require(run_id)
             if state.execution_strategy != self.execution_strategy.name:
@@ -163,6 +246,7 @@ class DurableAgentRuntime:
             was_recovery = state.status == RunStatus.RUNNING
             if self.tracer is not None:
                 await self.tracer.start_run(state, recovered=was_recovery)
+            await self.budget_manager.initialize(state)
             resume_span = await self._start_span(
                 SpanType.AGENT,
                 "resume",
@@ -211,36 +295,36 @@ class DurableAgentRuntime:
                 "run.resumed",
                 {"run_id": run_id, "recovered": was_recovery},
             )
-            try:
-                state = await self._advance(state)
-            except Exception as exc:
-                await self._finish_span(
-                    resume_span,
-                    SpanStatus.FAILED,
-                    attributes={"error": _safe_error(exc)},
-                )
-                await self._emit(
-                    "resume.completed",
-                    {"run_id": run_id, "status": "FAILED", "error": _safe_error(exc)},
-                )
-                raise
-            resume_status = {
-                RunStatus.COMPLETED: SpanStatus.SUCCEEDED,
-                RunStatus.FAILED: SpanStatus.FAILED,
-                RunStatus.CANCELLED: SpanStatus.CANCELLED,
-            }.get(state.status, SpanStatus.INTERRUPTED)
+        try:
+            state = await self._advance(state)
+        except Exception as exc:
             await self._finish_span(
                 resume_span,
-                resume_status,
-                attributes={"result_status": state.status.value},
+                SpanStatus.FAILED,
+                attributes={"error": _safe_error(exc)},
             )
-            if state.finished:
-                await self._finish_run_trace(state.status)
             await self._emit(
                 "resume.completed",
-                {"run_id": run_id, "status": state.status.value},
+                {"run_id": run_id, "status": "FAILED", "error": _safe_error(exc)},
             )
-            return state
+            raise
+        resume_status = {
+            RunStatus.COMPLETED: SpanStatus.SUCCEEDED,
+            RunStatus.FAILED: SpanStatus.FAILED,
+            RunStatus.CANCELLED: SpanStatus.CANCELLED,
+        }.get(state.status, SpanStatus.INTERRUPTED)
+        await self._finish_span(
+            resume_span,
+            resume_status,
+            attributes={"result_status": state.status.value},
+        )
+        if state.finished:
+            await self._finish_run_trace(state.status)
+        await self._emit(
+            "resume.completed",
+            {"run_id": run_id, "status": state.status.value},
+        )
+        return state
 
     async def interrupt(self, run_id: str, *, reason: str = "manual interrupt") -> Checkpoint:
         async with self._run_lock(run_id):
@@ -258,6 +342,9 @@ class DurableAgentRuntime:
             return state
 
     async def cancel(self, run_id: str) -> Checkpoint:
+        return await self._cancel_durable(run_id, signal_owner=True)
+
+    async def _cancel_durable(self, run_id: str, *, signal_owner: bool = False) -> Checkpoint:
         async with self._run_lock(run_id):
             state = await self._require(run_id)
             if state.status == RunStatus.CANCELLED:
@@ -273,7 +360,51 @@ class DurableAgentRuntime:
             await self.execution_strategy.after_cancel(self, state)
             await self._finish_run_trace(state.status)
             await self._emit("run.cancelled", {"run_id": run_id})
+            if signal_owner:
+                self.active_run_supervisor.request_cancel(run_id)
             return state
+
+    async def _supervise(
+        self,
+        state: Checkpoint,
+        execute: Callable[[], Awaitable[Checkpoint]],
+    ) -> Checkpoint:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("durable execution must run inside an asyncio Task")
+        handle = self.active_run_supervisor.register(
+            ExecutionHandle(
+                run_id=state.run_id,
+                thread_id=state.thread_id,
+                turn_id=state.turn_id,
+                parent_run_id=state.parent_run_id,
+                run_kind=state.run_kind,
+                event_loop=loop,
+                asyncio_task=task,
+                owner_thread_id=threading.get_ident(),
+                metadata={"execution_strategy": state.execution_strategy},
+            )
+        )
+        try:
+            return await execute()
+        except asyncio.CancelledError:
+            if not handle.cancellation_requested:
+                raise
+            return await self._converge_cancelled(state.run_id)
+        except CheckpointConflictError:
+            current = await self.store.load(state.run_id)
+            if current is not None and current.status == RunStatus.CANCELLED:
+                return current
+            raise
+        finally:
+            self.active_run_supervisor.unregister(state.run_id, expected=handle)
+
+    async def _converge_cancelled(self, run_id: str) -> Checkpoint:
+        current = await self._require(run_id)
+        if current.finished:
+            return current
+        return await self._cancel_durable(run_id)
 
     async def _advance(self, state: Checkpoint) -> Checkpoint:
         if state.execution_strategy != self.execution_strategy.name:
@@ -316,6 +447,13 @@ class DurableAgentRuntime:
         output_state_key: str | None = None,
         tool_call_scope: str | None = None,
     ) -> Checkpoint:
+        try:
+            await self.budget_manager.consume_step(
+                state,
+                f"step:{state.run_id}:{state.step_index}:llm",
+            )
+        except BudgetExceededError as exc:
+            return await self._fail(state, exc, step="llm")
         attempt = 0
         while True:
             attempt += 1
@@ -361,15 +499,118 @@ class DurableAgentRuntime:
                     "attempt": attempt,
                 },
             )
+            projection: ContextCompactionResult | None = None
+            model_operation_id: str | None = None
+            model_reserved = False
+            model_accounted = False
+            partial_usage = (0, 0, 0, 0)
             try:
-                llm_result = await self._collect_llm_response(
-                    state,
-                    call_started=call_started,
-                    system_prompt=system_prompt,
+                effective_system_prompt = system_prompt or self.system_prompt
+                projection = await self.context_manager.prepare(
+                    state.messages,
+                    system_prompt=effective_system_prompt,
+                    tools=self.tool_registry.definitions(),
+                    objective=state.input,
+                    previous_summary=summary_from_strategy_state(state.strategy_state),
                 )
+                compaction_count = apply_compaction_to_strategy_state(
+                    state.strategy_state,
+                    projection,
+                )
+                context_attributes = projection.observability_attributes(
+                    compaction_count=compaction_count
+                )
+                if self.tracer is not None and llm_span is not None:
+                    await self.tracer.annotate_span(llm_span.span_id, **context_attributes)
+                if projection.compacted or projection.tool_results_projected:
+                    await self._emit(
+                        "context.compacted",
+                        {"run_id": state.run_id, **context_attributes},
+                    )
+                model_operation_id = (
+                    f"model:{state.run_id}:{_span_id(llm_span) or time.perf_counter_ns()}"
+                )
+                await self.budget_manager.reserve_model_call(
+                    state,
+                    model_operation_id,
+                    estimated_input_tokens=projection.estimated_tokens_after,
+                )
+                model_reserved = True
+                try:
+                    llm_result = await self._collect_llm_response(
+                        state,
+                        call_started=call_started,
+                        system_prompt=effective_system_prompt,
+                        messages=projection.messages,
+                    )
+                except _LlmStreamError as stream_error:
+                    partial_usage = (
+                        stream_error.prompt_tokens,
+                        stream_error.completion_tokens,
+                        stream_error.cached_input_tokens,
+                        stream_error.reasoning_tokens,
+                    )
+                    await self.budget_manager.complete_model_call(
+                        state,
+                        model_operation_id,
+                        input_tokens=stream_error.prompt_tokens,
+                        output_tokens=stream_error.completion_tokens,
+                        cached_input_tokens=stream_error.cached_input_tokens,
+                        reasoning_tokens=stream_error.reasoning_tokens,
+                    )
+                    model_accounted = True
+                    raise
+                partial_usage = (
+                    llm_result.prompt_tokens,
+                    llm_result.completion_tokens,
+                    llm_result.cached_input_tokens,
+                    llm_result.reasoning_tokens,
+                )
+                await self.budget_manager.complete_model_call(
+                    state,
+                    model_operation_id,
+                    input_tokens=llm_result.prompt_tokens,
+                    output_tokens=llm_result.completion_tokens,
+                    cached_input_tokens=llm_result.cached_input_tokens,
+                    reasoning_tokens=llm_result.reasoning_tokens,
+                )
+                model_accounted = True
             except Exception as exc:
+                if model_operation_id is not None and model_reserved and not model_accounted:
+                    with suppress(BudgetExceededError):
+                        await self.budget_manager.complete_model_call(
+                            state,
+                            model_operation_id,
+                            input_tokens=partial_usage[0],
+                            output_tokens=partial_usage[1],
+                            cached_input_tokens=partial_usage[2],
+                            reasoning_tokens=partial_usage[3],
+                        )
                 message = _safe_error(exc)
                 latency_ms = round((time.perf_counter() - call_started) * 1000, 3)
+                context_attributes = (
+                    projection.observability_attributes(
+                        compaction_count=compaction_count_from_strategy_state(state.strategy_state)
+                    )
+                    if projection is not None
+                    else {}
+                )
+                if isinstance(exc, ContextBudgetExceededError):
+                    context_attributes.update(
+                        {
+                            "context.estimated_tokens_before": exc.estimated_tokens,
+                            "context.estimated_tokens_after": exc.estimated_tokens,
+                            "context.compaction_triggered": False,
+                            "context.compaction_count": compaction_count_from_strategy_state(
+                                state.strategy_state
+                            ),
+                            "context.compression_ratio": 1.0,
+                            "context.evicted_messages": 0,
+                            "context.preserved_messages": len(state.messages),
+                            "context.tool_results_projected": 0,
+                            "context.trigger_reason": "hard_input_limit",
+                        }
+                    )
                 await self._finish_span(
                     llm_span,
                     SpanStatus.FAILED,
@@ -377,6 +618,10 @@ class DurableAgentRuntime:
                         "latency_ms": latency_ms,
                         "error": message,
                         "retry_count": attempt - 1,
+                        "prompt_tokens": partial_usage[0],
+                        "completion_tokens": partial_usage[1],
+                        "total_tokens": partial_usage[0] + partial_usage[1],
+                        **context_attributes,
                     },
                 )
                 await self._emit(
@@ -387,9 +632,26 @@ class DurableAgentRuntime:
                         "latency_ms": latency_ms,
                         "error": message,
                         "attempt": attempt,
+                        **(
+                            {"code": exc.code}
+                            if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError))
+                            else {}
+                        ),
                     },
                 )
-                state.error = RunError(type=type(exc).__name__, message=message, step="llm")
+                error_type = (
+                    exc.code
+                    if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError))
+                    else type(exc).__name__
+                )
+                if isinstance(exc, BudgetExceededError):
+                    await self.budget_manager.record_hard_limit(state, exc)
+                state.error = RunError(
+                    type=error_type,
+                    message=message,
+                    step="llm",
+                    metadata=exc.metadata() if isinstance(exc, BudgetExceededError) else {},
+                )
                 await self._save_checkpoint(
                     state,
                     operation="llm.failed",
@@ -414,7 +676,9 @@ class DurableAgentRuntime:
                     "agent.step.failed",
                     {"run_id": state.run_id, "step_index": step_index, "error": message},
                 )
-                if not self.retry_policy.can_retry(message, attempt):
+                if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError)) or not (
+                    self.retry_policy.can_retry(message, attempt)
+                ):
                     if fail_run:
                         state.status = RunStatus.FAILED
                         await self._save_checkpoint(state, operation="run.failed")
@@ -435,12 +699,17 @@ class DurableAgentRuntime:
                 attributes={
                     "prompt_tokens": llm_result.prompt_tokens,
                     "completion_tokens": llm_result.completion_tokens,
+                    "cached_input_tokens": llm_result.cached_input_tokens,
+                    "reasoning_tokens": llm_result.reasoning_tokens,
                     "total_tokens": llm_result.prompt_tokens + llm_result.completion_tokens,
                     "first_token_at": llm_result.first_token_at,
                     "ttft_ms": llm_result.ttft_ms,
                     "latency_ms": latency_ms,
                     "finish_reason": llm_result.stop_reason,
                     "retry_count": attempt - 1,
+                    **projection.observability_attributes(
+                        compaction_count=compaction_count_from_strategy_state(state.strategy_state)
+                    ),
                 },
             )
             await self._emit(
@@ -521,46 +790,62 @@ class DurableAgentRuntime:
         *,
         call_started: float,
         system_prompt: str | None = None,
+        messages: list[Message] | None = None,
     ) -> _LlmCallResult:
         text = ""
         stop_reason = "end_turn"
         prompt_tokens = 0
         completion_tokens = 0
+        cached_input_tokens = 0
+        reasoning_tokens = 0
         first_token_at: str | None = None
         ttft_ms: float | None = None
         tool_states: dict[int, dict[str, Any]] = {}
-        async for event in self.llm_client.chat(
-            state.messages,
-            self.tool_registry.definitions(),
-            system_prompt=system_prompt or self.system_prompt,
-        ):
-            event_type = event.get("type")
-            if (
-                event_type in {"text_delta", "thinking_delta", "tool_call_delta"}
-                and first_token_at is None
+        try:
+            async for event in self.llm_client.chat(
+                messages if messages is not None else state.messages,
+                self.tool_registry.definitions(),
+                system_prompt=system_prompt or self.system_prompt,
             ):
-                first_token_at = now()
-                ttft_ms = round((time.perf_counter() - call_started) * 1000, 3)
-            if event_type == "text_delta":
-                text += str(event.get("text") or "")
-            elif event_type == "tool_call_delta" and isinstance(event.get("tool_call"), dict):
-                _merge_tool_delta(tool_states, event["tool_call"], state.agent_turn)
-            elif event_type == "message_end":
-                stop_reason = str(event.get("stop_reason") or "end_turn")
-            elif event_type == "usage":
-                usage = event.get("usage") or {}
-                if isinstance(usage, dict):
-                    prompt_tokens += int(usage.get("input_tokens") or 0)
-                    completion_tokens += int(usage.get("output_tokens") or 0)
-            elif event_type == "error":
-                error = event.get("error")
-                raise RuntimeError(str(error or "LLM stream failed"))
+                event_type = event.get("type")
+                if (
+                    event_type in {"text_delta", "thinking_delta", "tool_call_delta"}
+                    and first_token_at is None
+                ):
+                    first_token_at = now()
+                    ttft_ms = round((time.perf_counter() - call_started) * 1000, 3)
+                if event_type == "text_delta":
+                    text += str(event.get("text") or "")
+                elif event_type == "tool_call_delta" and isinstance(event.get("tool_call"), dict):
+                    _merge_tool_delta(tool_states, event["tool_call"], state.agent_turn)
+                elif event_type == "message_end":
+                    stop_reason = str(event.get("stop_reason") or "end_turn")
+                elif event_type == "usage":
+                    usage = event.get("usage") or {}
+                    if isinstance(usage, dict):
+                        prompt_tokens += int(usage.get("input_tokens") or 0)
+                        completion_tokens += int(usage.get("output_tokens") or 0)
+                        cached_input_tokens += int(usage.get("cached_input_tokens") or 0)
+                        reasoning_tokens += int(usage.get("reasoning_tokens") or 0)
+                elif event_type == "error":
+                    error = event.get("error")
+                    raise RuntimeError(str(error or "LLM stream failed"))
+        except Exception as exc:
+            raise _LlmStreamError(
+                _safe_error(exc),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_input_tokens=cached_input_tokens,
+                reasoning_tokens=reasoning_tokens,
+            ) from exc
         return _LlmCallResult(
             text=text,
             tool_calls=_finalize_tool_calls(tool_states),
             stop_reason=stop_reason,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            cached_input_tokens=cached_input_tokens,
+            reasoning_tokens=reasoning_tokens,
             first_token_at=first_token_at,
             ttft_ms=ttft_ms,
         )
@@ -571,6 +856,13 @@ class DurableAgentRuntime:
         *,
         parent_span_id: str | None = None,
     ) -> Checkpoint:
+        try:
+            await self.budget_manager.consume_step(
+                state,
+                f"step:{state.run_id}:{state.step_index}:tool",
+            )
+        except BudgetExceededError as exc:
+            return await self._fail(state, exc, step="tool")
         step_index = state.step_index
         step_span = await self._start_span(
             SpanType.AGENT,
@@ -809,6 +1101,14 @@ class DurableAgentRuntime:
         )
 
         while True:
+            next_attempt = record.attempt + 1
+            try:
+                await self.budget_manager.consume_tool_call(
+                    state,
+                    f"tool:{invocation_id}:attempt:{next_attempt}",
+                )
+            except BudgetExceededError as exc:
+                return await self._fail(state, exc, step="tool")
             record.attempt += 1
             record.status = ToolExecutionStatus.RUNNING
             record.started_at = record.started_at or _now()
@@ -961,6 +1261,7 @@ class DurableAgentRuntime:
             Message(
                 role="tool",
                 content=result.content,
+                name=f"{tool_name}{' (error)' if result.is_error else ''}",
                 tool_call_id=result.tool_use_id,
             )
         )
@@ -1040,7 +1341,24 @@ class DurableAgentRuntime:
 
     async def _fail(self, state: Checkpoint, exc: Exception, *, step: str) -> Checkpoint:
         state.status = RunStatus.FAILED
-        state.error = RunError(type=type(exc).__name__, message=_safe_error(exc), step=step)
+        state.error = RunError(
+            type=exc.code if isinstance(exc, BudgetExceededError) else type(exc).__name__,
+            message=_safe_error(exc),
+            step=step,
+            metadata=exc.metadata() if isinstance(exc, BudgetExceededError) else {},
+        )
+        if isinstance(exc, BudgetExceededError):
+            await self.budget_manager.record_hard_limit(state, exc)
+        if isinstance(exc, BudgetExceededError) and self.tracer is not None:
+            await self.tracer.annotate_span(
+                self.tracer.root_span_id,
+                **{
+                    "budget.hard_limit_reached": True,
+                    "budget.exceeded_dimension": exc.dimension,
+                    "budget.exceeded_limit": str(exc.limit),
+                    "budget.exceeded_used": str(exc.used),
+                },
+            )
         await self._save_checkpoint(state, operation="run.failed")
         await self._finish_run_trace(state.status)
         await self._emit(

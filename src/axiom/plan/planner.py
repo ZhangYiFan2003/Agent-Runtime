@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from axiom.context import (
+    DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW,
+    MINIMUM_TRUSTED_MODEL_CONTEXT_WINDOW,
+    ContextBudgetPolicy,
+    ContextManager,
+)
 from axiom.llm.base import LlmClient
 from axiom.plan.models import ExecutionPlan, Task, TaskType
 from axiom.types import Message
@@ -36,11 +42,28 @@ class PlannerResult:
     completion_tokens: int = 0
     finish_reason: str = "end_turn"
     ttft_ms: float | None = None
+    context_attributes: dict[str, object] = field(default_factory=dict)
 
 
 class Planner:
-    def __init__(self, llm_client: LlmClient):
+    def __init__(
+        self,
+        llm_client: LlmClient,
+        *,
+        context_manager: ContextManager | None = None,
+    ):
         self.llm_client = llm_client
+        window = getattr(llm_client, "max_context_window", DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW)
+        if not isinstance(window, int) or window < MINIMUM_TRUSTED_MODEL_CONTEXT_WINDOW:
+            window = DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW
+        requested_output = getattr(llm_client, "max_tokens", max(256, int(window) // 4))
+        reserve = min(int(requested_output), max(0, int(window) - 1))
+        self.context_manager = context_manager or ContextManager(
+            ContextBudgetPolicy(
+                model_context_window=int(window),
+                reserved_output_tokens=reserve,
+            )
+        )
 
     def requires_llm(self, goal: str) -> bool:
         return not _is_simple_goal(goal)
@@ -55,6 +78,8 @@ class Planner:
             self.llm_client,
             [Message(role="user", content=f"Please create an execution plan for:\n{goal}")],
             system_prompt=PLANNER_PROMPT,
+            context_manager=self.context_manager,
+            objective=goal,
         )
         return PlannerResult(
             plan=self.parse_plan(goal, response.text),
@@ -63,6 +88,7 @@ class Planner:
             completion_tokens=response.completion_tokens,
             finish_reason=response.finish_reason,
             ttft_ms=response.ttft_ms,
+            context_attributes=response.context_attributes,
         )
 
     async def replan(self, failed_plan: ExecutionPlan, failure_reason: str) -> ExecutionPlan:
@@ -131,6 +157,8 @@ async def _collect_text(
     messages: list[Message],
     *,
     system_prompt: str,
+    context_manager: ContextManager,
+    objective: str,
 ) -> _PlannerResponse:
     text = ""
     prompt_tokens = 0
@@ -138,7 +166,13 @@ async def _collect_text(
     finish_reason = "end_turn"
     started = time.perf_counter()
     ttft_ms: float | None = None
-    async for event in llm_client.chat(messages, [], system_prompt=system_prompt):
+    projection = await context_manager.prepare(
+        messages,
+        system_prompt=system_prompt,
+        tools=[],
+        objective=objective,
+    )
+    async for event in llm_client.chat(projection.messages, [], system_prompt=system_prompt):
         event_type = event.get("type")
         if event_type == "text_delta":
             if ttft_ms is None:
@@ -159,6 +193,7 @@ async def _collect_text(
         completion_tokens=completion_tokens,
         finish_reason=finish_reason,
         ttft_ms=ttft_ms,
+        context_attributes=projection.observability_attributes(compaction_count=0),
     )
 
 
@@ -169,6 +204,7 @@ class _PlannerResponse:
     completion_tokens: int
     finish_reason: str
     ttft_ms: float | None
+    context_attributes: dict[str, object]
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

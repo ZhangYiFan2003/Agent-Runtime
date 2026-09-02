@@ -5,6 +5,11 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from axiom.config import AxiomConfig
+from axiom.context import (
+    ContextBudgetExceededError,
+    ContextManager,
+    context_policy_from_config,
+)
 from axiom.image import parse_image_references
 from axiom.llm.base import LlmClient
 from axiom.tools.base import ToolContext
@@ -42,6 +47,9 @@ async def query(
 
     total_tokens = 0
     turn = 0
+    context_manager = ContextManager(context_policy_from_config(config, llm_client))
+    context_summary = None
+    context_compaction_count = 0
 
     while turn < max_turns:
         turn += 1
@@ -52,7 +60,31 @@ async def query(
         usage_output = 0
         tool_states: dict[int, dict[str, Any]] = {}
 
-        async for event in llm_client.chat(messages, tool_definitions, system_prompt=system_prompt):
+        try:
+            projection = await context_manager.prepare(
+                messages,
+                system_prompt=system_prompt,
+                tools=tool_definitions,
+                objective=user_message,
+                previous_summary=context_summary,
+            )
+        except ContextBudgetExceededError as exc:
+            yield {"type": "error", "error": exc, "code": exc.code}
+            return
+        context_summary = projection.summary
+        if projection.compacted:
+            context_compaction_count += 1
+        if projection.compacted or projection.tool_results_projected:
+            yield {
+                "type": "context_compaction",
+                **projection.observability_attributes(compaction_count=context_compaction_count),
+            }
+
+        async for event in llm_client.chat(
+            projection.messages,
+            tool_definitions,
+            system_prompt=system_prompt,
+        ):
             event_type = event.get("type")
             if event_type == "text_delta":
                 delta = str(event.get("text") or "")
@@ -105,6 +137,8 @@ async def query(
                 Message(
                     role="tool",
                     content=result.content,
+                    name=f"{_tool_name_by_id(tool_calls, result.tool_use_id or '')}"
+                    f"{' (error)' if result.is_error else ''}",
                     tool_call_id=result.tool_use_id,
                 )
             )

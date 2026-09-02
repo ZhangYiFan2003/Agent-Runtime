@@ -14,6 +14,7 @@ from axiom.config import AxiomConfig
 from axiom.evaluation import DurableEvaluationExecutor, EvaluationCase
 from axiom.plan import ExecutionPlan, Planner, PlanStatus, Task, TaskStatus, TaskType
 from axiom.runtime import (
+    ActiveRunSupervisor,
     Checkpoint,
     DurableAgentRuntime,
     MemoryCheckpointStore,
@@ -222,6 +223,7 @@ def _runtime(
     event_sink=None,
     observations=None,
     strategy: PlanExecuteStrategy | None = None,
+    supervisor: ActiveRunSupervisor | None = None,
 ) -> DurableAgentRuntime:
     return DurableAgentRuntime(
         llm_client=client,
@@ -234,6 +236,7 @@ def _runtime(
         event_sink=event_sink,
         tracer=RunTracer(observations) if observations is not None else None,
         execution_strategy=strategy or PlanExecuteStrategy(Planner(client)),
+        active_run_supervisor=supervisor,
     )
 
 
@@ -270,6 +273,53 @@ def test_plan_parallelism_one_preserves_sequential_order(tmp_path):
             "start:B",
             "start:C",
         ]
+
+    asyncio.run(scenario())
+
+
+def test_parent_cancel_signals_active_plan_children_and_stops_refill(tmp_path):
+    async def scenario():
+        client = ParallelPlanClient(
+            [_task("A"), _task("B"), _task("C")],
+            hold_tasks={"A", "B"},
+        )
+        store = MemoryCheckpointStore()
+        supervisor = ActiveRunSupervisor()
+        runtime = _runtime(client, store, tmp_path, supervisor=supervisor)
+        parent_task = asyncio.create_task(
+            runtime.start(
+                thread_id="thread-plan-supervisor-cancel",
+                run_id="run-plan-supervisor-cancel",
+                input="complex goal",
+            )
+        )
+        for _attempt in range(200):
+            if client.started == {"A", "B"}:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("plan children did not start")
+        assert len(supervisor.list_active()) == 3
+
+        cancelled = await _runtime(
+            client,
+            store,
+            tmp_path,
+            supervisor=supervisor,
+        ).cancel("run-plan-supervisor-cancel")
+        observed = await asyncio.wait_for(parent_task, timeout=3)
+        children = [
+            state
+            for state in await store.list("thread-plan-supervisor-cancel")
+            if state.parent_run_id == cancelled.run_id
+        ]
+
+        assert cancelled.status == RunStatus.CANCELLED
+        assert observed.status == RunStatus.CANCELLED
+        assert len(children) == 2
+        assert {child.status for child in children} == {RunStatus.CANCELLED}
+        assert "C" not in client.started
+        assert supervisor.list_active() == ()
 
     asyncio.run(scenario())
 

@@ -234,8 +234,15 @@ flowchart TD
     API errors, child/interrupt summaries, and restart-safe SQLite idempotency records.
 - `src/axiom/runtime/durable.py`
   - Advances the default ReAct loop across LLM and per-tool durable boundaries,
-    persists approval interrupts, resumes after restart, applies bounded retry,
-    and reuses successful tool invocation records.
+  persists approval interrupts, resumes after restart, applies bounded retry,
+    reuses successful tool invocation records, and registers each executing durable
+    Run with the process-local active execution supervisor.
+- `src/axiom/runtime/supervisor.py`
+  - Tracks process-local Run ownership by thread, event loop, and `asyncio.Task`;
+    provides thread-safe lookup, cross-thread cancellation, safe batch results,
+    stale-handle cleanup, active inspection, and bounded shutdown drain.
+  - Never persists handles. Checkpoints and ToolExecution records remain the
+    recovery source of truth.
 - `src/axiom/runtime/observability.py`
   - Defines Trace, Span, RunMetrics, stable Run/tool span identities, JSON
     attributes, and latency/token aggregation rules.
@@ -243,7 +250,9 @@ flowchart TD
   - Provides Memory/SQLite observability stores, schema versioning, the
     RunTracer execution hook, and trace/metrics query service.
 - `src/axiom/runtime/tasks.py`
-  - Stores durable background tasks in SQLite.
+  - Stores durable background tasks in SQLite. Production QueryEngine workers execute claimed
+    tasks as deterministic durable Runs, so worker-owned event loops participate in active Run
+    supervision and shutdown cancellation.
 - `src/axiom/evaluation/`
   - Defines JSON datasets, deterministic scorers, the durable Runtime evaluation
     adapter, JSON results, and functional/performance regression comparison.
@@ -467,7 +476,286 @@ MCP server expansion points:
 
 - `src/axiom/mcp/server.py` for JSON-RPC methods and exposed tool behavior.
 
-## 8. Current limitations
+## 8. Live context management
+
+Live context management protects every model invocation, including an unfinished ReAct loop. It
+is a projection layer, not a persistence or memory replacement:
+
+```text
+Durable State
+     ↓
+Context Projection
+     ↓
+Token Budget
+     ↓
+Optional Compaction
+     ↓
+LLM Request
+```
+
+The three layers remain intentionally distinct:
+
+- **Durable State** is the append-only Runtime event history, versioned Checkpoint sequence, full
+  ToolExecution records, Run lineage, and trace/audit evidence. These records support recovery and
+  investigation and are never deleted by model-context compaction.
+- **Conversation / Memory** contains derived typed conversation records, active map/reduce
+  summaries with source event ranges, facts/preferences, and bounded tool-result digests. A Memory
+  Summary improves later context but is not the durable source of truth.
+- **Model Context** is the transient system prompt, tool schemas, and message projection sent for
+  one LLM request. A Checkpoint is not Context: it stores resumable raw execution state, while the
+  projection can replace an eligible old prefix with one derived summary without rewriting that
+  Checkpoint.
+
+### Budget and configuration
+
+`ContextManager` runs immediately before each provider call in normal ReAct, durable ReAct,
+planning, compatibility multi-agent roles, and durable multi-agent parent roles. Plan-and-Execute
+and Multi-Agent tool-capable Child Runs use nested `DurableAgentRuntime` instances and therefore
+inherit the same check.
+
+The deterministic estimator counts the system prompt, tool definitions, message content,
+tool-call metadata, and per-message overhead. It implements the pluggable `TokenEstimator`
+protocol; a provider tokenizer can replace it later without changing compaction policy.
+
+Default policy:
+
+- model context window: explicit `context.model_context_window`, then trusted
+  `LlmClient.max_context_window`, then a deterministic 64,000-token unknown-model fallback;
+- reserved output: explicit `context.reserved_output_tokens`, otherwise the configured LLM output
+  maximum bounded to one quarter of the input window;
+- high watermark: `0.80` of usable input;
+- target after compaction: `0.60` of usable input;
+- recent raw reserve: 6 messages;
+- hard input limit: usable input (`model_context_window - reserved_output_tokens`);
+- bounded historical tool-result projection: 2,000 characters.
+
+Project/user JSON config follows the repository's existing configuration precedence, with CLI and
+environment overrides applied afterward. `AXIOM_CONTEXT_WINDOW`,
+`AXIOM_CONTEXT_RESERVED_OUTPUT_TOKENS`, `AXIOM_CONTEXT_HIGH_WATERMARK`,
+`AXIOM_CONTEXT_TARGET_RATIO`, `AXIOM_CONTEXT_RECENT_MESSAGES`,
+`AXIOM_CONTEXT_HARD_INPUT_LIMIT`, and `AXIOM_CONTEXT_MAX_TOOL_RESULT_CHARS` are supported. Invalid
+ratios, negative reserves, or hard limits outside usable input are rejected.
+
+The trigger is estimated input usage rather than Agent iteration count:
+
+```text
+usable_input = model_context_window - reserved_output_tokens
+compact when estimated_input >= usable_input * high_watermark_ratio
+target = usable_input * target_after_compaction_ratio
+```
+
+### Compaction and pinned context
+
+The manager first reuses a valid prior live summary and its covered-prefix fingerprint. When the
+projection reaches the high watermark, it selects only the oldest eligible prefix, segments it for
+the existing map stage, calls the existing `ConversationSummarizer` map/reduce protocol, and emits
+one structured summary containing objective, constraints, decisions, completed work, open work,
+modified files, important evidence, and known failures. New compactions summarize only the raw
+suffix after the prior coverage cursor, so summaries do not accumulate as repeated system
+messages.
+
+Pinned/non-evictable context includes the current user objective, current constraints and task
+state, the recent raw reserve, incomplete or pending tool protocol state, and plan/worker
+continuation information supplied in the current objective/system prompt. Assistant tool calls and
+their matching tool results are selected atomically, so compaction never leaves only one side of a
+provider-required tool exchange.
+
+An oversized historical tool result may be replaced only in the model-facing copy. The projection
+includes the tool name, success/error state, original character size, `truncated: true`, and bounded
+head/tail content. The full ToolExecution result remains durable. Current/recent tool interactions
+remain pinned; if they alone cannot fit, the request fails rather than silently discarding them.
+
+After compaction the manager re-estimates the complete request. If the configured summarizer
+fails, it retains the prior derived summary and durable history, then uses the deterministic local
+summarizer for eligible old context. If pinned context still exceeds the hard input limit, the Run
+fails before provider invocation with `CONTEXT_BUDGET_EXCEEDED`. No known-oversized request is sent,
+and the prior Checkpoint remains recoverable.
+
+Existing LLM spans record `context.estimated_tokens_before`,
+`context.estimated_tokens_after`, `context.compaction_triggered`,
+`context.compaction_count`, `context.compression_ratio`, `context.evicted_messages`,
+`context.preserved_messages`, `context.tool_results_projected`, and
+`context.trigger_reason`. These attributes contain counts and decisions, never full tool payloads.
+
+### Interview-oriented explanation
+
+1. **How do you prevent a long Agent loop from exhausting context?** Before every model call,
+   estimate the complete request, compact an eligible old prefix with the existing map/reduce
+   summarizer, preserve pinned state, and re-estimate before sending.
+2. **Why token budget rather than fixed loop count?** One tool result can be larger than many normal
+   turns, while dozens of short turns may still fit. Estimated request size tracks the actual risk.
+3. **What cannot be compacted?** The current objective and constraints, recent messages, unresolved
+   execution state, pending approvals/tool work, atomic tool protocol exchanges, and state required
+   to continue a plan or Child Run.
+4. **What if compaction fails?** Durable history remains unchanged; deterministic local compaction
+   is attempted for eligible old context. If pinned context still exceeds the hard limit, the Run
+   returns `CONTEXT_BUDGET_EXCEEDED` without calling the provider.
+5. **How is durable state different from model context?** Durable state is the complete recovery and
+   audit record. Model context is a disposable, budgeted view derived from it for one request.
+
+## 9. Evaluation feedback and regression gate
+
+Evaluation keeps Runtime self-correction, badcase feedback, and regression evaluation as separate
+layers:
+
+```text
+Runtime / Evaluation → Failure → BadCase Collector → Deterministic Taxonomy
+        → Human Review → Regression Dataset → Repeated Trials
+        → Baseline vs Candidate → Regression Gate
+```
+
+- **Runtime self-correction** is part of the live reasoning loop. A Tool error can be returned to
+  the current LLM and the same Run can recover.
+- **Badcase collection** occurs after a completed or terminal execution. It writes a compact local
+  JSON record with stable Run/Thread/Turn/Trace references and never feeds the record into the
+  current conversation.
+- **Regression evaluation** creates fresh durable Runs from explicitly promoted `EvaluationCase`
+  records. It does not resume or mutate the source failure.
+
+`BadCaseCollector` converts failed evaluation trials or an explicitly selected terminal `run_id`.
+It combines scorer failures, Checkpoint status/error, ToolExecution state, and safe Trace/Span
+attributes into a multi-label taxonomy. `BadCaseStore` provides atomic, duplicate-safe local JSON
+persistence and review states `PENDING`, `APPROVED`, `IGNORED`, and `PROMOTED`. Only human-approved
+records may be promoted. Dataset persistence happens before the store is marked promoted, making
+retries idempotent without silently overwriting unrelated cases. Missing deterministic
+expected/scorer evidence is a structured promotion failure rather than an invented oracle.
+
+Evaluation result schema v3 retains every trial, preserves v1/v2 loading, and adds per-case `trial_success_rate`,
+success/failure counts, and average/minimum/maximum tokens, steps, and latency. `--trials 1` is the
+backward-compatible default. Each trial receives independent Run, Thread, Turn, Trace, Checkpoint,
+and ToolExecution state.
+
+Baseline comparison distinguishes a hard 100%-to-0% functional regression, an intermediate
+stochastic quality change, performance drift, and improvement. The regression gate fails on hard
+functional regressions, new required failures, per-case success-rate drops beyond tolerance, or
+explicit token/step/latency hard thresholds. Token/latency/step comparison thresholds remain
+warning-only by default because provider behavior is noisy, especially latency.
+
+Attribution uses the explicit package/build version and safe deterministic SHA-256 fingerprints of
+whitelisted model configuration, the assembled prompt, Tool schemas, permission policy, Context
+policy, and dataset version. It stores model provider/name for readability. API keys, credentials,
+base URLs, Tool arguments, and raw payloads are excluded from both reports and fingerprints. Git is
+not a Runtime dependency.
+
+### Interview-oriented explanation
+
+1. **How is a nondeterministic Agent evaluated?** Independent trials preserve every outcome while
+   per-case success rates and resource aggregates express observed variability.
+2. **How does an LLM-visible error differ from a Badcase?** The error supports recovery inside one
+   Run; the Badcase is an after-the-fact review artifact and never enters that Run's context.
+3. **How does failure become a regression test?** Deterministic collection and classification are
+   followed by human approval and explicit, provenance-preserving dataset promotion.
+4. **Why human review?** Provider outages, bad tests, environment failures, expected randomness,
+   and product defects require different action, and only a reviewer can validate the oracle.
+5. **How is the responsible change identified?** Compare runtime, model/configuration, prompt,
+   Tool-schema, policy, Context-policy, and dataset fingerprints, then resolve durable Run/Trace
+   references for evidence.
+6. **What fails the gate?** Hard functional/new-required failures, excessive success-rate drops,
+   and explicitly enabled resource limits. Default performance drift warns.
+
+## 10. Run Budget and Cost Accounting
+
+Run budgeting is a durable execution guard, separate from request Context budgeting and from
+post-run metrics:
+
+```text
+                     Run Budget
+                         |
+        +----------------+----------------+
+        |                |                |
+   Model Calls        Tool Calls        Steps
+        |
+        v
+ Input / Output Tokens
+        |
+        v
+ Model Pricing
+        |
+        v
+     Cost Ledger
+```
+
+`RunBudgetPolicy` defines optional hard limits for steps, model calls, actual Tool invocations,
+input/output/total tokens, total Run lifetime, and model cost. `None` is unbounded; defaults are
+therefore backward compatible. `soft_limit_ratio` defaults to `0.8`: crossing it annotates the Run
+but neither rewrites prompts nor changes strategy. Invalid non-positive limits and ratios outside
+`(0, 1)` are rejected.
+
+The durable ReAct path checks a step before each durable decision/execution transition, reserves a
+model-call unit immediately before each provider request, and consumes a Tool-call unit immediately
+before Tool code executes. Plan/replan and Multi-Agent role provider requests use the same manager;
+Plan and Multi-Agent worker Tasks share it with their durable Child Runs. Runtime-owned retries are
+new operations and consume new call units. A successful persisted ToolExecution reused on resume is
+resolved before the Tool preflight and is therefore not charged twice.
+
+Context estimation is used conservatively before an LLM call. Provider-reported input, output,
+cached-input, and reasoning usage replaces the reservation during reconciliation and is the
+authoritative token/cost record. Cached tokens are a subset of input tokens: regular input is
+`input - cached`, so cached input is never double-counted. Partial streamed usage is retained;
+failed requests without usage consume a model-call unit but invent no tokens. An unknowable
+post-call token/cost overshoot is persisted and terminates the Run; the next operation is never
+started.
+
+```text
+Parent Run Budget
+      |
+      +-- Child Run A
+      +-- Child Run B
+      +-- Child Run C
+
+All local usage --> one Parent aggregate ledger
+```
+
+The root Run owns a versioned ledger in the Runtime store. Every descendant has local usage and
+the same atomic ledger also computes aggregate usage. CAS updates plus a process-local lock prevent
+concurrent children from both reserving the same final call/token/cost allowance. Model-call units
+are exact reservations; input tokens/cost use request estimates followed by actual reconciliation.
+Checkpoint stores the stable owner and policy, while the ledger persists counters and idempotent
+operation identities. Resume reloads both, so cancellation, interruption, approval waiting, or
+restart never refunds or resets usage. Wall time means total lifetime including approval waits and
+downtime: persisted `created_at` establishes the restart baseline and a process-local monotonic
+anchor protects live enforcement from wall-clock adjustments.
+
+Pricing is explicit local configuration under `run_budget.model_pricing`, keyed by
+`provider/model`, with input/output and optional cached-input USD-per-million rates. No network
+lookup or guessed built-in price is used. Decimal arithmetic is retained in the ledger. Unknown
+pricing produces `cost_known=false` and `cost_usd=null`, never `$0`; configuring `max_cost_usd`
+without matching pricing fails Runtime construction visibly.
+
+Hard failures use structured codes (`STEP_BUDGET_EXCEEDED`, `MODEL_CALL_BUDGET_EXCEEDED`,
+`TOOL_CALL_BUDGET_EXCEEDED`, input/output/total token variants,
+`WALL_TIME_BUDGET_EXCEEDED`, and `COST_BUDGET_EXCEEDED`) with dimension, limit, used, remaining,
+and Run ID. Root span attributes and `RunMetrics` expose policy, local usage, descendant aggregate,
+remaining values, cost-known state, soft/hard pressure, and the exceeded dimension.
+
+Configuration precedence is the existing default/config-file/environment order. Environment
+overrides use `AXIOM_RUN_MAX_*` and `AXIOM_RUN_BUDGET_SOFT_LIMIT`; pricing remains structured local
+configuration so secrets are neither required nor fingerprinted.
+
+### Budget interview answers
+
+1. **How is unlimited work prevented?** Every resource-consuming durable boundary atomically
+   checks and records the Run/tree ledger before proceeding.
+2. **Are overruns detected only afterward?** Calls, Tools, steps, and existing consumption are
+   preflighted. Unknown provider output can only be reconciled afterward and then fails the Run.
+3. **Estimated versus actual tokens?** Estimates reserve scarce input capacity; provider usage is
+   authoritative accounting and billing evidence.
+4. **How do Multi-Agent children share budget?** Local child counters roll into one root-owned
+   aggregate ledger; children do not receive independent copies of the parent allowance.
+5. **How are worker races avoided?** Ledger changes use atomic compare-and-swap retries, with a
+   local async lock reducing contention.
+6. **What if pricing is unknown?** Tokens still work, cost stays explicitly unknown, and a hard
+   cost policy is rejected because it cannot be enforced honestly.
+7. **Why is fewer tokens not automatically better?** Efficiency that lowers task success can be
+   a product regression.
+8. **Why Cost per Success?** It divides total fully known trial cost by successful outcomes, making
+   quality loss visible in an efficiency metric.
+9. **How are retries charged?** Each real provider request and each repeated Tool execution is a
+   new unit; a restored successful Tool result is not.
+10. **How does budget survive resume?** Checkpoints retain ownership/policy and the versioned
+    Runtime ledger retains counters, reservations, operation IDs, cost, and original lifetime.
+
+## 11. Current limitations
 
 - The only concrete LLM client implementation is OpenAI-compatible streaming
   chat completions. Non-compatible providers need new client adapters.
@@ -486,6 +774,10 @@ MCP server expansion points:
   Plan Tasks and tool-capable Multi-Agent Workers use stable React Child Runs; Parent state is
   checkpointed with stable lineage and CAS-safe terminal reconciliation. There is no distributed
   lock, distributed scheduler, cross-process worker supervisor, or checkpoint compaction yet.
+- Active execution supervision and cancellation are process-local. A crashed process loses
+  every handle; a persisted `RUNNING` Run can therefore have no active owner until a client
+  explicitly resumes it. There is no startup recovery scanner, lease, heartbeat, fencing token,
+  cross-process cancellation, or automatic abandoned-Run takeover.
 - Runtime tool records provide best-effort deduplication after a persisted
   success, not exactly-once semantics for arbitrary external side effects.
 - Observability is local and unsampled. There is no distributed trace context,

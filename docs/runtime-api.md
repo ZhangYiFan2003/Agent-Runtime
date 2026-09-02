@@ -28,6 +28,7 @@ GET /v1/runs/{run_id}/children
 GET /v1/runs/{run_id}/interrupts
 GET /v1/runs/{run_id}/trace
 GET /v1/runs/{run_id}/metrics
+GET /v1/runtime/active-runs
 ```
 
 The public Run representation contains identity, strategy, status, parent linkage,
@@ -43,6 +44,12 @@ status, interrupt summary, and parent linkage when available.
 identifies the exact `run_id` and `invocation_id`; Tool arguments are omitted. Clients
 approve or reject the specific child Run rather than asking the parent to guess which
 child is intended.
+
+`GET /v1/runtime/active-runs` is an authenticated, process-local diagnostic view. It
+returns safe identity, strategy, registration, owner-thread, Task completion, and cancellation
+flag fields. It does not expose checkpoint bodies, messages, prompts, Tool arguments, event-loop
+or Task representations, or environment data. A durable non-terminal Run is not guaranteed to
+appear: waiting Runs and `RUNNING` checkpoints from an earlier process normally have no handle.
 
 ## Control operations and idempotency
 
@@ -75,6 +82,9 @@ Cancel is state-idempotent: cancelling an already `CANCELLED` Run returns its cu
 representation. Cancelling a terminal `COMPLETED` or `FAILED` Run is a conflict.
 Cancelling a parent requests cancellation for every non-terminal direct child and stops
 further child scheduling; cancelling a child does not automatically cancel its parent.
+For an execution active in this process, cancellation first commits the durable `CANCELLED`
+checkpoint and then uses the handle's owner loop to signal its `asyncio.Task`. A missing handle
+is normal for waiting or restarted Runs and does not make durable cancellation fail.
 
 ## State transitions
 
@@ -88,8 +98,9 @@ further child scheduling; cancelling a child does not automatically cancel its p
 | `FAILED` | none | Mutations return HTTP 409. |
 | `CANCELLED` | cancel | Repeated cancel is a no-op; resume/approval conflict. |
 
-Same-process per-Run locks prevent duplicate local advancement. SQLite checkpoint CAS
-remains the durable conflict detector. A competing operation returns
+Same-process per-Run operation locks and active registration conflicts prevent duplicate local
+advancement. Cancel has a separate local control lock so it can commit while an execution owns
+the advancement lock. SQLite checkpoint CAS remains the durable conflict detector. A competing operation returns
 `operation_in_progress` or `checkpoint_conflict` rather than advancing twice.
 
 ## Error model
@@ -158,7 +169,9 @@ bounded durable scheduling; no distributed scheduler is implied.
 ## Current limitations
 
 - No distributed scheduler or distributed execution.
-- Active cancellation across separate Runtime processes is best effort.
+- Active cancellation is supported only inside the current Runtime process. There is no
+  cross-process signal, lease, heartbeat, fencing token, or distributed owner.
+- No automatic startup recovery scanner or abandoned `RUNNING` ownership takeover is implemented.
 - SSE is a persisted replay stream, not a distributed live event bus.
 - Operation retention and compaction are not implemented.
 - SQLite schema evolution is additive and has no general migration manager yet.

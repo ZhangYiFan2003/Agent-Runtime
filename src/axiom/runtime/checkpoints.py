@@ -9,11 +9,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from axiom.runtime.models import Checkpoint, ToolExecutionRecord
+from axiom.runtime.models import BudgetLedgerRecord, Checkpoint, ToolExecutionRecord
 
 
 class CheckpointConflictError(RuntimeError):
     """Raised when a stale worker attempts to advance a run."""
+
+
+class BudgetLedgerConflictError(RuntimeError):
+    """Raised when an atomic budget ledger update loses a CAS race."""
 
 
 class CheckpointStore(Protocol):
@@ -31,13 +35,16 @@ class ToolExecutionStore(Protocol):
 
 
 class RuntimeStore(CheckpointStore, ToolExecutionStore, Protocol):
-    pass
+    async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None: ...
+
+    async def save_budget_ledger(self, record: BudgetLedgerRecord) -> None: ...
 
 
 class MemoryCheckpointStore:
     def __init__(self) -> None:
         self._checkpoints: dict[str, list[dict[str, object]]] = {}
         self._tool_executions: dict[str, dict[str, object]] = {}
+        self._budget_ledgers: dict[str, dict[str, object]] = {}
         self._lock = asyncio.Lock()
 
     async def save(self, checkpoint: Checkpoint) -> None:
@@ -80,6 +87,32 @@ class MemoryCheckpointStore:
             row = self._tool_executions.get(invocation_id)
             return ToolExecutionRecord.from_dict(deepcopy(row)) if row else None
 
+    async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None:
+        async with self._lock:
+            row = self._budget_ledgers.get(owner_run_id)
+            if row is None:
+                return None
+            return BudgetLedgerRecord(
+                owner_run_id=owner_run_id,
+                version=int(row["version"]),
+                state=deepcopy(row["state"]),
+            )
+
+    async def save_budget_ledger(self, record: BudgetLedgerRecord) -> None:
+        async with self._lock:
+            current = self._budget_ledgers.get(record.owner_run_id)
+            current_version = int(current["version"]) if current else 0
+            if current_version != record.version:
+                raise BudgetLedgerConflictError(
+                    f"stale budget ledger for {record.owner_run_id}: "
+                    f"expected {current_version}, got {record.version}"
+                )
+            record.version += 1
+            self._budget_ledgers[record.owner_run_id] = {
+                "version": record.version,
+                "state": deepcopy(record.state),
+            }
+
 
 class SQLiteCheckpointStore:
     def __init__(self, db_path: str | Path):
@@ -101,6 +134,12 @@ class SQLiteCheckpointStore:
 
     async def load_tool_execution(self, invocation_id: str) -> ToolExecutionRecord | None:
         return await asyncio.to_thread(self._load_tool_execution, invocation_id)
+
+    async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None:
+        return await asyncio.to_thread(self._load_budget_ledger, owner_run_id)
+
+    async def save_budget_ledger(self, record: BudgetLedgerRecord) -> None:
+        await asyncio.to_thread(self._save_budget_ledger, record)
 
     def _save(self, checkpoint: Checkpoint) -> None:
         with self._connect() as conn:
@@ -243,6 +282,46 @@ class SQLiteCheckpointStore:
             }
         )
 
+    def _load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "select version, state_json from run_budget_ledgers where owner_run_id = ?",
+                (owner_run_id,),
+            ).fetchone()
+        if not row:
+            return None
+        state = json.loads(str(row[1]))
+        if not isinstance(state, dict):
+            raise ValueError("budget ledger state must be a JSON object")
+        return BudgetLedgerRecord(owner_run_id=owner_run_id, version=int(row[0]), state=state)
+
+    def _save_budget_ledger(self, record: BudgetLedgerRecord) -> None:
+        payload = json.dumps(record.state, ensure_ascii=False, separators=(",", ":"))
+        with self._connect() as conn:
+            conn.execute("begin immediate")
+            if record.version == 0:
+                try:
+                    conn.execute(
+                        "insert into run_budget_ledgers(owner_run_id, version, state_json) "
+                        "values (?, 1, ?)",
+                        (record.owner_run_id, payload),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise BudgetLedgerConflictError(
+                        f"budget ledger already exists: {record.owner_run_id}"
+                    ) from exc
+            else:
+                cursor = conn.execute(
+                    "update run_budget_ledgers set version = ?, state_json = ? "
+                    "where owner_run_id = ? and version = ?",
+                    (record.version + 1, payload, record.owner_run_id, record.version),
+                )
+                if cursor.rowcount != 1:
+                    raise BudgetLedgerConflictError(
+                        f"stale budget ledger for {record.owner_run_id}"
+                    )
+            record.version += 1
+
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -289,6 +368,15 @@ class SQLiteCheckpointStore:
                 """
                 create index if not exists idx_tool_executions_run
                 on tool_executions(run_id, invocation_id)
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists run_budget_ledgers (
+                    owner_run_id text primary key,
+                    version integer not null,
+                    state_json text not null
+                )
                 """
             )
 

@@ -139,6 +139,21 @@ class RunMetrics:
     interrupt_count: int
     resume_count: int
     retry_count: int
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    cost_usd: str | None = None
+    cost_known: bool = False
+    elapsed_seconds: float | None = None
+    budget_policy: dict[str, Any] = field(default_factory=dict)
+    budget_usage: dict[str, Any] = field(default_factory=dict)
+    aggregate_budget_usage: dict[str, Any] = field(default_factory=dict)
+    budget_remaining: dict[str, Any] = field(default_factory=dict)
+    aggregate_budget_remaining: dict[str, Any] = field(default_factory=dict)
+    budget_utilization: dict[str, float] = field(default_factory=dict)
+    aggregate_budget_utilization: dict[str, float] = field(default_factory=dict)
+    budget_soft_limit_reached: bool = False
+    budget_hard_limit_reached: bool = False
+    budget_exceeded_dimension: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -159,6 +174,21 @@ class RunMetrics:
             "interrupt_count": self.interrupt_count,
             "resume_count": self.resume_count,
             "retry_count": self.retry_count,
+            "cached_input_tokens": self.cached_input_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cost_usd": self.cost_usd,
+            "cost_known": self.cost_known,
+            "elapsed_seconds": self.elapsed_seconds,
+            "budget_policy": dict(self.budget_policy),
+            "budget_usage": dict(self.budget_usage),
+            "aggregate_budget_usage": dict(self.aggregate_budget_usage),
+            "budget_remaining": dict(self.budget_remaining),
+            "aggregate_budget_remaining": dict(self.aggregate_budget_remaining),
+            "budget_utilization": dict(self.budget_utilization),
+            "aggregate_budget_utilization": dict(self.aggregate_budget_utilization),
+            "budget_soft_limit_reached": self.budget_soft_limit_reached,
+            "budget_hard_limit_reached": self.budget_hard_limit_reached,
+            "budget_exceeded_dimension": self.budget_exceeded_dimension,
         }
 
     @classmethod
@@ -173,6 +203,32 @@ class RunMetrics:
         decided_tools = successes + failures
         prompt_tokens = sum(_int_attribute(span, "prompt_tokens") for span in llm)
         completion_tokens = sum(_int_attribute(span, "completion_tokens") for span in llm)
+        root = next(
+            (
+                span
+                for span in spans
+                if span.span_type == SpanType.AGENT and span.parent_span_id is None
+            ),
+            None,
+        )
+        budget = root.attributes if root is not None else {}
+        budget_policy = {
+            key.removeprefix("budget."): value
+            for key, value in budget.items()
+            if key.startswith("budget.max_") or key == "budget.soft_limit_ratio"
+        }
+        budget_usage = _budget_attributes(budget, "budget.", aggregate=False)
+        aggregate_usage = _budget_attributes(budget, "budget.aggregate_", aggregate=True)
+        remaining = {
+            key.removeprefix("budget.remaining_"): value
+            for key, value in budget.items()
+            if key.startswith("budget.remaining_")
+        }
+        aggregate_remaining = {
+            key.removeprefix("budget.aggregate_remaining_"): value
+            for key, value in budget.items()
+            if key.startswith("budget.aggregate_remaining_")
+        }
         return cls(
             trace_id=trace.trace_id,
             run_id=trace.run_id,
@@ -199,6 +255,21 @@ class RunMetrics:
                 sum(_int_attribute(span, "retry_count") > 0 for span in llm)
                 + sum(_int_attribute(span, "retry_count") for span in tools)
             ),
+            cached_input_tokens=int(budget.get("budget.cached_input_tokens_used") or 0),
+            reasoning_tokens=int(budget.get("budget.reasoning_tokens_used") or 0),
+            cost_usd=_optional_string(budget.get("budget.cost_usd")),
+            cost_known=bool(budget.get("budget.cost_known")),
+            elapsed_seconds=_optional_number(budget.get("budget.elapsed_seconds")),
+            budget_policy=budget_policy,
+            budget_usage=budget_usage,
+            aggregate_budget_usage=aggregate_usage,
+            budget_remaining=remaining,
+            aggregate_budget_remaining=aggregate_remaining,
+            budget_utilization=_budget_utilization(budget_policy, budget_usage),
+            aggregate_budget_utilization=_budget_utilization(budget_policy, aggregate_usage),
+            budget_soft_limit_reached=bool(budget.get("budget.soft_limit_reached")),
+            budget_hard_limit_reached=bool(budget.get("budget.hard_limit_reached")),
+            budget_exceeded_dimension=_optional_string(budget.get("budget.exceeded_dimension")),
         )
 
 
@@ -263,6 +334,73 @@ def _json_value(value: Any) -> Any:
 def _int_attribute(span: Span, key: str) -> int:
     value = span.attributes.get(key)
     return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _budget_attributes(
+    attributes: dict[str, Any], prefix: str, *, aggregate: bool
+) -> dict[str, Any]:
+    names = (
+        "steps_used",
+        "model_calls_used",
+        "tool_calls_used",
+        "input_tokens_used",
+        "output_tokens_used",
+        "total_tokens_used",
+        "cost_usd",
+        "cost_known",
+    )
+    values: dict[str, Any] = {}
+    for name in names:
+        key = f"{prefix}{name}"
+        if key in attributes:
+            values[name.removesuffix("_used")] = attributes[key]
+    aggregate_elapsed = attributes.get("budget.aggregate_elapsed_seconds")
+    if aggregate and isinstance(aggregate_elapsed, (int, float)):
+        values["elapsed_seconds"] = aggregate_elapsed
+    if not aggregate and "budget.elapsed_seconds" in attributes:
+        values["elapsed_seconds"] = attributes["budget.elapsed_seconds"]
+    return values
+
+
+def _optional_string(value: Any) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _optional_number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _budget_utilization(policy: dict[str, Any], usage: dict[str, Any]) -> dict[str, float]:
+    utilization: dict[str, float] = {}
+    for dimension in ("steps", "model_calls", "tool_calls", "input_tokens", "output_tokens"):
+        limit = policy.get(f"max_{dimension}")
+        used = usage.get(dimension)
+        if isinstance(limit, (int, float)) and limit > 0 and isinstance(used, (int, float)):
+            utilization[dimension] = round(float(used) / float(limit), 6)
+    total_limit = policy.get("max_total_tokens")
+    total_used = usage.get("total_tokens")
+    if (
+        isinstance(total_limit, (int, float))
+        and total_limit > 0
+        and isinstance(total_used, (int, float))
+    ):
+        utilization["total_tokens"] = round(float(total_used) / float(total_limit), 6)
+    wall_limit = policy.get("max_wall_time_seconds")
+    elapsed = usage.get("elapsed_seconds")
+    if (
+        isinstance(wall_limit, (int, float))
+        and wall_limit > 0
+        and isinstance(elapsed, (int, float))
+    ):
+        utilization["elapsed_seconds"] = round(float(elapsed) / float(wall_limit), 6)
+    cost_limit = policy.get("max_cost_usd")
+    cost_used = usage.get("cost_usd")
+    try:
+        if cost_limit is not None and cost_used is not None and float(cost_limit) > 0:
+            utilization["cost_usd"] = round(float(cost_used) / float(cost_limit), 6)
+    except (TypeError, ValueError):
+        pass
+    return utilization
 
 
 def _dict(value: Any) -> dict[str, Any]:

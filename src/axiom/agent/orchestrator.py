@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from axiom.agent.query import query
 from axiom.config import AxiomConfig
+from axiom.context import ContextManager, context_policy_from_config
 from axiom.execution import ExecutionBackend
 from axiom.llm.base import LlmClient
 from axiom.prompt import PromptAssembler
@@ -104,6 +105,8 @@ class SubAgent:
         self.approval_callback = approval_callback
         self.skill_context_buffer = skill_context_buffer or SkillContextBuffer()
         self.history: list[Message] = []
+        self.context_manager = ContextManager(context_policy_from_config(config, llm_client))
+        self.context_summary = None
 
     async def execute(self, task: AgentMessage, context: str = "") -> AgentMessage:
         content = f"{context}\n\nCurrent task:\n{task.content}".strip() if context else task.content
@@ -155,10 +158,19 @@ class SubAgent:
         text = ""
         messages = [*self.history, Message(role="user", content=content)]
         try:
-            async for event in self.llm_client.chat(
+            system_prompt = self._system_prompt()
+            projection = await self.context_manager.prepare(
                 messages,
+                system_prompt=system_prompt,
+                tools=[],
+                objective=content,
+                previous_summary=self.context_summary,
+            )
+            self.context_summary = projection.summary
+            async for event in self.llm_client.chat(
+                projection.messages,
                 [],
-                system_prompt=self._system_prompt(),
+                system_prompt=system_prompt,
             ):
                 if event.get("type") == "text_delta":
                     text += str(event.get("text") or "")
