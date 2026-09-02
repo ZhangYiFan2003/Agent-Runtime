@@ -190,7 +190,8 @@ bounded derived evidence. It does not copy a Trace and does not persist Tool arg
 Deterministic classification supports multiple labels: `run_failed`, `timeout`, `wrong_answer`,
 `wrong_tool`, `forbidden_tool`, `tool_failure`, `tool_argument_failure`,
 `step_budget_exceeded`, `token_budget_exceeded`, `context_budget_exceeded`, `policy_denied`,
-`recovery_failure`, and `unknown_failure`. Evidence comes from failed scorers, terminal status,
+`recovery_failure`, `no_progress`, and `unknown_failure`. Evidence comes from failed scorers,
+terminal status,
 structured Checkpoint errors, ToolExecution state, and safe Trace/Span attributes. No LLM
 classifier is required.
 
@@ -282,6 +283,26 @@ raw prompts/tool arguments, and other secrets.
 Context Budget and Run Budget remain independent. Context answers whether one request fits;
 Run Budget answers whether the entire durable Run tree may consume more resources. Context
 compaction does not mutate accounting, while actual provider usage after compaction does.
+
+## No-progress failures
+
+The durable Runtime may terminate a Run as `NO_PROGRESS` after deterministic identical-action,
+repeated-error, short-cycle, or stable-state detection exhausts bounded recovery. Evaluation keeps
+the structured error and detector metadata, so offline cases can assert this behavior. Badcase
+classification adds `no_progress` alongside `run_failed` and any applicable Tool failure, storing
+the detector type rather than raw Tool arguments.
+
+This remains three separate mechanisms:
+
+```text
+Runtime recovery signal -> current Run only
+NO_PROGRESS terminal Run -> optional Badcase collection
+approved Badcase         -> explicit regression-case promotion
+```
+
+Every repeated trial still has an independent Run and detector. A no-progress trial remains
+inspectable and participates in existing functional and success-rate gates. Detection adds no LLM
+judge, automatic prompt rewriting, or automatic dataset promotion.
 
 ## Current limitations
 

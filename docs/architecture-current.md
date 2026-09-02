@@ -755,7 +755,74 @@ configuration so secrets are neither required nor fingerprinted.
 10. **How does budget survive resume?** Checkpoints retain ownership/policy and the versioned
     Runtime ledger retains counters, reservations, operation IDs, cost, and original lifetime.
 
-## 11. Current limitations
+## 11. No-Progress / Loop Degeneration Detection
+
+`max_steps` bounds how long a Run may work; it cannot tell whether that work remains useful. The
+durable Runtime records a bounded deterministic progress projection at Tool and orchestration
+boundaries:
+
+```text
+Agent Loop
+   -> Progress Observation
+   -> Progress Detector
+        |-- progress -> continue
+        `-- stagnation -> bounded recovery
+                            |-- progress -> continue
+                            `-- repeated -> NO_PROGRESS
+```
+
+`ProgressPolicy` has conservative thresholds for identical actions, equivalent errors, complete
+short cycles (length 2-4), unchanged stable state, and recovery attempts. Action fingerprints hash
+the Tool name and canonical JSON arguments. Error fingerprints hash type, Tool/category, and a
+bounded message after removing timestamps, UUIDs, request IDs, addresses, and other volatile
+values. State fingerprints use durable facts such as completed Plan tasks, completed Workers,
+structured review decisions, and bounded successful Tool evidence. The detector neither scans the
+whole repository nor judges free-form reasoning.
+
+New evidence, Plan/Worker completion, an approved review, or another changed stable state resets
+stagnation. Different prose alone does not. Read-only exploration is allowed by conservative
+defaults, and restored successful ToolExecution records are not counted as new actions.
+
+The first detection adds a marked Runtime-derived recovery instruction to the next model-facing
+Context projection; it does not alter raw conversation history. Recovery consumes ordinary
+step/model/token/cost budget. Progress resets recovery state. Repeated detection after the recovery
+limit fails with `NO_PROGRESS` and safe metadata: detector type, repetition/cycle counts, hashes,
+attempts, Run ID, and step. A normal Run-budget failure during recovery remains authoritative.
+
+Policy, bounded fingerprints, processed operation IDs, counters, and recovery state are persisted
+in Checkpoint. Resume therefore continues near the prior threshold without double-counting an
+operation. Child Runs have independent detectors. Their failures flow through existing
+Plan/Multi-Agent replan, dependency, review, and sibling semantics; Parent observations cover
+structured orchestration transitions without merging every Child action. Context compaction cannot
+erase detector state.
+
+Defaults are enabled with 4 identical actions, 3 identical errors, 3 complete cycle repetitions,
+8 stagnant eligible steps, 1 recovery attempt, and 32 retained entries. `AXIOM_PROGRESS_*`
+environment overrides follow normal config precedence; inconsistent bounds are rejected.
+
+### No-progress interview answers
+
+1. **Why is `max_iterations` insufficient?** It caps quantity but cannot detect repeated useless
+   work before the cap.
+2. **How is no progress detected?** Canonical actions, normalized errors, complete short cycles,
+   and unchanged durable state are checked against explicit thresholds.
+3. **How are legitimate retries distinguished?** Thresholds permit retries and changed evidence
+   resets counters; restored Tool results do not add observations.
+4. **Can A-B-A-B be found?** Yes, after multiple complete cycles of length 2-4.
+5. **What follows detection?** One bounded recovery signal requests a materially different
+   approach; repeated detection ends in `NO_PROGRESS`.
+6. **Why not terminate immediately?** Transient failures can recover, while the recovery cap keeps
+   that attempt bounded.
+7. **How does restart work?** Checkpoint retains bounded histories, operation IDs, counters,
+   last-progress step, and recovery attempts.
+8. **How does Budget interact?** Recovery is charged normally; no-progress may stop earlier, while
+   any budget reached during recovery remains authoritative.
+9. **How do Multi-Agent children behave?** Each detects locally and its terminal state is reconciled
+   by the Parent without directly cancelling unrelated siblings.
+10. **Can it false-positive?** Yes; conservative defaults, complete-cycle requirements, evidence
+    resets, and recovery-before-termination mitigate that risk.
+
+## 12. Current limitations
 
 - The only concrete LLM client implementation is OpenAI-compatible streaming
   chat completions. Non-compatible providers need new client adapters.
