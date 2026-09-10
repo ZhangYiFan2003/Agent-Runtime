@@ -163,6 +163,11 @@ class ToolExecutor:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - tool errors must flow back to the model
+            error_message = str(exc).strip()
+            if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and not error_message:
+                error_message = "timed out"
+            elif not error_message:
+                error_message = type(exc).__name__
             if context.config.features.audit_log and tool and not tool.is_read_only:
                 audit.record(
                     tool_name=tool.name,
@@ -173,7 +178,7 @@ class ToolExecutor:
                 )
             return ToolResult(
                 tool_use_id=tool_call_id,
-                content=f'Tool "{name}" execution error: {exc}',
+                content=f'Tool "{name}" execution error: {error_message}',
                 is_error=True,
                 metadata={
                     "error_type": type(exc).__name__,

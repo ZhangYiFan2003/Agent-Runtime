@@ -1549,10 +1549,10 @@ class DurableAgentRuntime:
                     execution_backend=self.execution_backend,
                 ).execute_one(execution_call, context)
             except asyncio.CancelledError:
-                record.status = ToolExecutionStatus.RUNNING
+                record.status = ToolExecutionStatus.FAILED
                 record.is_error = True
                 record.error = "tool execution cancelled"
-                record.completed_at = None
+                record.completed_at = _now()
                 await self.store.save_tool_execution(record)
                 cancelled = {
                     **self._execution_start_attributes(tool, payload),

@@ -293,7 +293,7 @@ def test_filesystem_tool_cannot_modify_outside_workspace(tmp_path):
     asyncio.run(scenario())
 
 
-def test_shell_timeout_fails_tool_execution_and_terminates_process(tmp_path):
+def test_shell_timeout_marks_tool_execution_unknown_and_terminates_process(tmp_path):
     async def scenario():
         config = _config(tmp_path, hitl="never")
         config.tools.timeout = 0.1
@@ -315,8 +315,10 @@ def test_shell_timeout_fails_tool_execution_and_terminates_process(tmp_path):
 
         assert state.status == RunStatus.COMPLETED
         assert record is not None
-        assert record.status == ToolExecutionStatus.FAILED
+        assert record.status == ToolExecutionStatus.UNKNOWN
         assert "timed out" in str(record.error)
+        assert record.retry_suppressed_reason == "unsafe"
+        assert record.attempt == 1
 
     asyncio.run(scenario())
 
