@@ -88,7 +88,9 @@ formats, requires no new YAML dependency, and produces directly diffable benchma
 ```
 
 `metadata`, `setup`, and `expected` are JSON extension fields. v1 does not execute arbitrary setup
-code. A case with no scorer receives the safe default `RunStatusScorer(COMPLETED)`.
+code. A case with no scorer receives the safe default `RunStatusScorer(COMPLETED)`. If it also has
+a non-empty `completion_contract`, the default scoring additionally requires
+`CompletionVerificationScorer(VERIFIED)`.
 
 The maintained starter dataset is
 [`benchmarks/datasets/agent-core.json`](../benchmarks/datasets/agent-core.json). It contains a small
@@ -103,6 +105,7 @@ All built-in scorers are async-compatible, deterministic, and return an explaina
 - `exact_match`: optional trimming and case sensitivity for deterministic answers.
 - `tool_usage`: required and forbidden tool sets; duplicates and ordering are ignored for success.
 - `run_status`: accepted Runtime statuses, defaulting to `COMPLETED`.
+- `completion_verification`: accepted verification states, defaulting to `VERIFIED`.
 - `metric_threshold`: `max_steps`, `max_tokens`, `max_latency_ms`, and `max_tool_calls`.
 
 Every scorer has `required` (default `true`) and a numeric score reserved for later weighting. A case
@@ -112,6 +115,59 @@ nondeterministic.
 
 The public `Scorer` protocol and injectable scorer factory allow future RAG metrics or an optional
 LLM judge without making them core dependencies.
+
+## Completion contracts
+
+An `EvaluationCase` may carry a serializable `completion_contract`. Its checks run inside the real
+durable Runtime when the strategy proposes completion. Supported deterministic checks are Run
+status, required/forbidden Tool names, successful persisted Tool execution (optionally matching a
+bounded expected result substring), output contains/exact match, workspace artifact existence, and
+Plan task/Child Run completion.
+
+Evaluation results preserve the distinction between merely terminal and objectively verified with
+`completion_verified`, `verification_status`, `verification_attempts`, and
+`failed_verification_checks`. Verification failures can be classified as
+`completion_verification_failed`. A Run with no contract remains backward compatible and reports
+`NOT_APPLICABLE`; this is not treated as objective verification.
+
+The verifier does not execute commands outside Runtime controls. If a contract requires command or
+test success, the Agent must invoke the normal Tool path and the verifier checks its durable
+`ToolExecutionRecord`. ReAct allows one normal-budget corrective continuation by default; repeated
+failure terminates with `COMPLETION_NOT_VERIFIED`.
+
+## Context retention evaluation
+
+The focused offline dataset
+[`benchmarks/datasets/context-retention-v1.json`](../benchmarks/datasets/context-retention-v1.json)
+contains 10 designed long-context cases: an old objective, multiple constraints, completed versus
+open work, earlier failure evidence, an oversized Tool result, protocol pairing, a previous summary
+plus new history, removable noise, pinned recent state, and a pending Tool call.
+
+`ContextRetentionEvaluator` runs the existing `ContextManager` directly and reports, per case:
+
+- input and output estimated tokens plus `after / before` compression ratio;
+- retained/required counts and `required_state_retention_rate` across objective, constraints, open
+  tasks, decisions, artifact references, critical evidence, and pending protocol state;
+- Tool call/result protocol integrity;
+- optional deterministic full-context versus compressed-context task outcome.
+
+`compare_context_retention()` treats any per-case retention decrease, protocol regression, or
+configured deterministic outcome regression as hard. A worse compression ratio is a warning by
+default. Better compression never cancels a retention failure. Irrelevant `must_drop` noise is
+reported but does not affect required-state score. Because `ContextManager` does not expose a full
+stage-by-stage provenance graph, an unavailable exact cause is reported as
+`lost_after_compaction`; the benchmark does not add heavy instrumentation to production context.
+
+This evidence proves declared state retention and protocol behavior for a fixed offline set. It
+does not prove universal semantic equivalence or that every open-ended Agent remains equally
+capable after summarization. No LLM judge is used.
+
+Current deterministic fixture evidence uses a 1,200-token model window, 200-token output reserve,
+35% high watermark, 20% target, two recent messages, and a 1,000-token hard limit. The 10 cases
+retained 22/22 declared items (`1.0000` retention), preserved protocol integrity in 10/10 cases,
+and produced a mean `after / before` ratio of `0.5348` (about 46.5% estimated-token removal). These
+numbers describe this fixed synthetic dataset and policy only; they are not a universal Agent
+quality claim.
 
 ## Running an evaluation
 

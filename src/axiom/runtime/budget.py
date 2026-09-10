@@ -515,6 +515,42 @@ class BudgetManager:
         await self._publish(snapshot)
         return snapshot
 
+    async def remaining_wall_time(self, state: Checkpoint) -> float | None:
+        """Return the tightest local/owner wall-time remainder for an operation."""
+
+        snapshot = await self.snapshot(state)
+        candidates = [
+            value
+            for value in (
+                snapshot.remaining.get("elapsed_seconds"),
+                snapshot.aggregate_remaining.get("elapsed_seconds"),
+            )
+            if value is not None
+        ]
+        if not candidates:
+            return None
+        return max(0.0, min(float(value) for value in candidates))
+
+    async def ensure_wall_time(self, state: Checkpoint) -> float | None:
+        remaining = await self.remaining_wall_time(state)
+        if remaining is None or remaining > 0:
+            return remaining
+        snapshot = await self.snapshot(state)
+        local_limit = snapshot.policy.max_wall_time_seconds
+        used = max(
+            snapshot.local_usage.elapsed_seconds,
+            snapshot.aggregate_usage.elapsed_seconds,
+        )
+        error = BudgetExceededError(
+            code="WALL_TIME_BUDGET_EXCEEDED",
+            dimension="elapsed_seconds",
+            limit=local_limit if local_limit is not None else used,
+            used=used,
+            run_id=state.run_id,
+        )
+        await self.record_hard_limit(state, error)
+        raise error
+
     async def record_hard_limit(
         self, state: Checkpoint, error: BudgetExceededError
     ) -> RunBudgetState:

@@ -129,6 +129,34 @@ class RunStatusScorer:
 
 
 @dataclass(frozen=True, slots=True)
+class CompletionVerificationScorer:
+    accepted: tuple[str, ...] = ("VERIFIED",)
+    required: bool = True
+    name: str = "completion_verification"
+
+    async def score(self, case: EvaluationCase, result: EvaluationRunResult) -> ScoreResult:
+        del case
+        passed = result.verification_status in self.accepted
+        return _score(
+            self.name,
+            passed,
+            self.required,
+            (
+                f"verification status {result.verification_status} is accepted"
+                if passed
+                else f"verification status {result.verification_status} is not accepted"
+            ),
+            {
+                "accepted": list(self.accepted),
+                "actual": result.verification_status,
+                "verified": result.completion_verified,
+                "attempts": result.verification_attempts,
+                "failed_checks": list(result.failed_verification_checks),
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class MetricThresholdScorer:
     max_steps: int | None = None
     max_tokens: int | None = None
@@ -196,6 +224,14 @@ def scorer_from_spec(spec: ScorerSpec) -> Scorer:
             accepted=_strings(
                 config.get("accepted", config.get("expected", RunStatus.COMPLETED.value)),
                 field="run_status.accepted",
+            ),
+            required=spec.required,
+        )
+    if spec.type == "completion_verification":
+        return CompletionVerificationScorer(
+            accepted=_strings(
+                config.get("accepted", "VERIFIED"),
+                field="completion_verification.accepted",
             ),
             required=spec.required,
         )

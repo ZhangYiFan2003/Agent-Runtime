@@ -843,6 +843,7 @@ class PlanExecuteStrategy:
         state.output_text = _build_plan_result(plan)
         state.messages.append(Message(role="assistant", content=state.output_text))
         self._store_plan(state, plan)
+        await runtime._apply_completion_verification(state, allow_correction=False)
         await runtime._save_checkpoint(state, operation="plan.completed")
         await runtime._emit(
             "plan.completed",
@@ -854,8 +855,16 @@ class PlanExecuteStrategy:
         )
         await runtime._finish_run_trace(state.status)
         await runtime._emit(
-            "run.completed",
-            {"run_id": state.run_id, "total_tokens": state.total_tokens},
+            "run.completed" if state.status == RunStatus.COMPLETED else "run.failed",
+            {
+                "run_id": state.run_id,
+                "total_tokens": state.total_tokens,
+                **(
+                    {"error": state.error.to_dict() if state.error else None}
+                    if state.status == RunStatus.FAILED
+                    else {}
+                ),
+            },
         )
         return state
 

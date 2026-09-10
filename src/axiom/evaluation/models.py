@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from axiom.runtime.completion import CompletionContract
+
 EVALUATION_SCHEMA_VERSION = 1
 EVALUATION_RESULT_SCHEMA_VERSION = 3
 
@@ -45,6 +47,7 @@ class EvaluationCase:
     setup: dict[str, Any] = field(default_factory=dict)
     expected: dict[str, Any] = field(default_factory=dict)
     scorers: tuple[ScorerSpec, ...] = ()
+    completion_contract: CompletionContract | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> EvaluationCase:
@@ -75,6 +78,11 @@ class EvaluationCase:
             scorers=tuple(
                 ScorerSpec.from_dict(item) for item in raw_scorers if isinstance(item, dict)
             ),
+            completion_contract=(
+                CompletionContract.from_dict(data["completion_contract"])
+                if isinstance(data.get("completion_contract"), dict)
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -88,6 +96,9 @@ class EvaluationCase:
             "setup": _json_dict(self.setup),
             "expected": _json_dict(self.expected),
             "scorers": [scorer.to_dict() for scorer in self.scorers],
+            "completion_contract": (
+                self.completion_contract.to_dict() if self.completion_contract else None
+            ),
         }
 
 
@@ -194,6 +205,10 @@ class EvaluationRunResult:
     attribution: dict[str, Any] = field(default_factory=dict)
     cost_usd: str | None = None
     cost_known: bool = False
+    completion_verified: bool | None = None
+    verification_status: str = "NOT_APPLICABLE"
+    verification_attempts: int = 0
+    failed_verification_checks: list[str] = field(default_factory=list)
 
     @property
     def tool_call_count(self) -> int:
@@ -224,6 +239,12 @@ class EvaluationRunResult:
             },
             "error": self.error,
             "error_metadata": _json_dict(self.error_metadata),
+            "completion_verification": {
+                "verified": self.completion_verified,
+                "status": self.verification_status,
+                "attempts": self.verification_attempts,
+                "failed_checks": list(self.failed_verification_checks),
+            },
             "case_definition": _json_dict(self.case_definition),
             "attribution": _json_dict(self.attribution),
         }
@@ -231,6 +252,7 @@ class EvaluationRunResult:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> EvaluationRunResult:
         metrics = _json_dict(data.get("metrics"))
+        verification = _json_dict(data.get("completion_verification"))
         raw_tools = metrics.get("tool_calls") or []
         raw_scores = data.get("scores") or []
         return cls(
@@ -256,6 +278,18 @@ class EvaluationRunResult:
             attribution=_json_dict(data.get("attribution")),
             cost_usd=_optional_str(metrics.get("cost_usd")),
             cost_known=bool(metrics.get("cost_known")),
+            completion_verified=(
+                verification.get("verified")
+                if isinstance(verification.get("verified"), bool)
+                else None
+            ),
+            verification_status=str(verification.get("status") or "NOT_APPLICABLE"),
+            verification_attempts=max(0, int(verification.get("attempts") or 0)),
+            failed_verification_checks=[
+                str(item)
+                for item in verification.get("failed_checks", [])
+                if isinstance(item, str)
+            ],
         )
 
 

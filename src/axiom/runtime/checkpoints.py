@@ -33,6 +33,8 @@ class ToolExecutionStore(Protocol):
 
     async def load_tool_execution(self, invocation_id: str) -> ToolExecutionRecord | None: ...
 
+    async def list_tool_executions(self, run_id: str) -> list[ToolExecutionRecord]: ...
+
 
 class RuntimeStore(CheckpointStore, ToolExecutionStore, Protocol):
     async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None: ...
@@ -87,6 +89,15 @@ class MemoryCheckpointStore:
             row = self._tool_executions.get(invocation_id)
             return ToolExecutionRecord.from_dict(deepcopy(row)) if row else None
 
+    async def list_tool_executions(self, run_id: str) -> list[ToolExecutionRecord]:
+        async with self._lock:
+            rows = [
+                ToolExecutionRecord.from_dict(deepcopy(row))
+                for row in self._tool_executions.values()
+                if row.get("run_id") == run_id
+            ]
+        return sorted(rows, key=lambda record: record.invocation_id)
+
     async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None:
         async with self._lock:
             row = self._budget_ledgers.get(owner_run_id)
@@ -134,6 +145,9 @@ class SQLiteCheckpointStore:
 
     async def load_tool_execution(self, invocation_id: str) -> ToolExecutionRecord | None:
         return await asyncio.to_thread(self._load_tool_execution, invocation_id)
+
+    async def list_tool_executions(self, run_id: str) -> list[ToolExecutionRecord]:
+        return await asyncio.to_thread(self._list_tool_executions, run_id)
 
     async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None:
         return await asyncio.to_thread(self._load_budget_ledger, owner_run_id)
@@ -281,6 +295,38 @@ class SQLiteCheckpointStore:
                 "updated_at": row[12],
             }
         )
+
+    def _list_tool_executions(self, run_id: str) -> list[ToolExecutionRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                select invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
+                       status, attempt, result, is_error, error, started_at,
+                       completed_at, updated_at
+                from tool_executions where run_id = ? order by invocation_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            ToolExecutionRecord.from_dict(
+                {
+                    "invocation_id": row[0],
+                    "run_id": row[1],
+                    "tool_call_id": row[2],
+                    "tool_name": row[3],
+                    "arguments_hash": row[4],
+                    "status": row[5],
+                    "attempt": row[6],
+                    "result": row[7],
+                    "is_error": bool(row[8]),
+                    "error": row[9],
+                    "started_at": row[10],
+                    "completed_at": row[11],
+                    "updated_at": row[12],
+                }
+            )
+            for row in rows
+        ]
 
     def _load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None:
         with self._connect() as conn:

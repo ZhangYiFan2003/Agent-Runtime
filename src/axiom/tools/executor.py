@@ -92,6 +92,10 @@ class ToolExecutor:
                     f"{', '.join(self.registry.list_names())}"
                 ),
                 is_error=True,
+                metadata={
+                    "error_type": "ToolNotFoundError",
+                    "failure_category": "validation_error",
+                },
             )
 
         audit = AuditLog(context.config.policy.audit_log_path)
@@ -119,6 +123,10 @@ class ToolExecutor:
                         f"{permission.reason}"
                     ),
                     is_error=True,
+                    metadata={
+                        "error_type": "PermissionDenied",
+                        "failure_category": "policy_denied",
+                    },
                 )
             if permission.action == PermissionAction.REQUIRE_APPROVAL:
                 approver = "hitl"
@@ -135,6 +143,10 @@ class ToolExecutor:
                         tool_use_id=tool_call_id,
                         content=f'Tool "{tool.name}" was rejected by approval policy.',
                         is_error=True,
+                        metadata={
+                            "error_type": "ApprovalRejected",
+                            "failure_category": "policy_denied",
+                        },
                     )
 
             result = await tool.execute(data, context)
@@ -148,6 +160,8 @@ class ToolExecutor:
                     cwd=context.cwd,
                 )
             return result
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001 - tool errors must flow back to the model
             if context.config.features.audit_log and tool and not tool.is_read_only:
                 audit.record(
@@ -161,6 +175,11 @@ class ToolExecutor:
                 tool_use_id=tool_call_id,
                 content=f'Tool "{name}" execution error: {exc}',
                 is_error=True,
+                metadata={
+                    "error_type": type(exc).__name__,
+                    "dependency_timeout": isinstance(exc, (asyncio.TimeoutError, TimeoutError)),
+                    **_safe_exception_metadata(exc),
+                },
             )
 
     async def _approval_decision(
@@ -228,3 +247,27 @@ def _tool_call_arguments(call: dict[str, Any]) -> dict[str, Any]:
             parsed = {"raw": arguments}
         return parsed if isinstance(parsed, dict) else {"value": parsed}
     return arguments if isinstance(arguments, dict) else {}
+
+
+def _safe_exception_metadata(exc: Exception) -> dict[str, int | float]:
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(response, "status_code", None)
+    metadata: dict[str, int | float] = {}
+    try:
+        parsed_status = int(status)
+    except (TypeError, ValueError):
+        parsed_status = 0
+    if 100 <= parsed_status <= 599:
+        metadata["status_code"] = parsed_status
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        try:
+            parsed_retry_after = float(retry_after)
+        except (TypeError, ValueError):
+            parsed_retry_after = -1
+        if parsed_retry_after >= 0:
+            metadata["retry_after_seconds"] = parsed_retry_after
+    return metadata

@@ -25,6 +25,15 @@ from axiom.runtime.checkpoints import (
     MemoryCheckpointStore,
     SQLiteCheckpointStore,
 )
+from axiom.runtime.completion import (
+    COMPLETION_NOT_VERIFIED,
+    CompletionCheck,
+    CompletionCheckResult,
+    CompletionContract,
+    CompletionVerificationResult,
+    CompletionVerificationStatus,
+    CompletionVerifier,
+)
 from axiom.runtime.control_plane import (
     ApiError,
     ControlOperationName,
@@ -33,7 +42,19 @@ from axiom.runtime.control_plane import (
     SQLiteControlOperationStore,
     allowed_operations,
 )
-from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
+from axiom.runtime.dependency import (
+    DEPENDENCY_DEADLINE_EXCEEDED,
+    DEPENDENCY_RETRY_EXHAUSTED,
+    DEPENDENCY_TIMEOUT,
+    BackoffPolicy,
+    DependencyFailureCategory,
+    OperationDeadline,
+    RetryClassifier,
+    RetryDecision,
+    RetryPolicy,
+    RetrySafety,
+)
+from axiom.runtime.durable import DurableAgentRuntime
 from axiom.runtime.models import (
     Checkpoint,
     RunStatus,
@@ -101,6 +122,22 @@ __all__ = [
     "ControlOperationName",
     "ControlOperationRecord",
     "ControlOperationStatus",
+    "COMPLETION_NOT_VERIFIED",
+    "CompletionCheck",
+    "CompletionCheckResult",
+    "CompletionContract",
+    "CompletionVerificationResult",
+    "CompletionVerificationStatus",
+    "CompletionVerifier",
+    "DEPENDENCY_DEADLINE_EXCEEDED",
+    "DEPENDENCY_RETRY_EXHAUSTED",
+    "DEPENDENCY_TIMEOUT",
+    "BackoffPolicy",
+    "DependencyFailureCategory",
+    "OperationDeadline",
+    "RetryClassifier",
+    "RetryDecision",
+    "RetrySafety",
     "CONTEXT_BUDGET_EXCEEDED",
     "ApproximateTokenEstimator",
     "ContextBudget",

@@ -17,6 +17,7 @@ class SpanType(StrEnum):
     CHECKPOINT = "checkpoint"
     INTERRUPT = "interrupt"
     POLICY = "policy"
+    VERIFICATION = "verification"
 
 
 class SpanStatus(StrEnum):
@@ -139,6 +140,12 @@ class RunMetrics:
     interrupt_count: int
     resume_count: int
     retry_count: int
+    retried_model_calls: int = 0
+    retried_tool_calls: int = 0
+    dependency_timeouts: int = 0
+    rate_limit_failures: int = 0
+    retry_exhausted_count: int = 0
+    retry_backoff_ms: float = 0.0
     cached_input_tokens: int = 0
     reasoning_tokens: int = 0
     cost_usd: str | None = None
@@ -162,6 +169,10 @@ class RunMetrics:
     progress_cycle_length: int | None = None
     progress_recovery_attempts: int = 0
     progress_last_progress_step: int = 0
+    completion_verified: bool | None = None
+    verification_status: str = "NOT_APPLICABLE"
+    verification_attempts: int = 0
+    verification_failed_checks: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -182,6 +193,12 @@ class RunMetrics:
             "interrupt_count": self.interrupt_count,
             "resume_count": self.resume_count,
             "retry_count": self.retry_count,
+            "retried_model_calls": self.retried_model_calls,
+            "retried_tool_calls": self.retried_tool_calls,
+            "dependency_timeouts": self.dependency_timeouts,
+            "rate_limit_failures": self.rate_limit_failures,
+            "retry_exhausted_count": self.retry_exhausted_count,
+            "retry_backoff_ms": self.retry_backoff_ms,
             "cached_input_tokens": self.cached_input_tokens,
             "reasoning_tokens": self.reasoning_tokens,
             "cost_usd": self.cost_usd,
@@ -205,6 +222,10 @@ class RunMetrics:
             "progress_cycle_length": self.progress_cycle_length,
             "progress_recovery_attempts": self.progress_recovery_attempts,
             "progress_last_progress_step": self.progress_last_progress_step,
+            "completion_verified": self.completion_verified,
+            "verification_status": self.verification_status,
+            "verification_attempts": self.verification_attempts,
+            "verification_failed_checks": list(self.verification_failed_checks),
         }
 
     @classmethod
@@ -271,6 +292,28 @@ class RunMetrics:
                 sum(_int_attribute(span, "retry_count") > 0 for span in llm)
                 + sum(_int_attribute(span, "retry_count") for span in tools)
             ),
+            retried_model_calls=sum(
+                _int_attribute(span, "dependency.retry_attempt") > 1 for span in llm
+            ),
+            retried_tool_calls=sum(
+                _int_attribute(span, "dependency.retry_count") for span in tools
+            ),
+            dependency_timeouts=sum(
+                span.attributes.get("dependency.failure_category") == "timeout"
+                for span in [*llm, *tools]
+            ),
+            rate_limit_failures=sum(
+                span.attributes.get("dependency.failure_category") == "rate_limited"
+                for span in [*llm, *tools]
+            ),
+            retry_exhausted_count=sum(
+                bool(span.attributes.get("dependency.retry_exhausted"))
+                for span in [*llm, *tools]
+            ),
+            retry_backoff_ms=round(
+                sum(_float_attribute(span, "dependency.backoff_ms") for span in [*llm, *tools]),
+                3,
+            ),
             cached_input_tokens=int(budget.get("budget.cached_input_tokens_used") or 0),
             reasoning_tokens=int(budget.get("budget.reasoning_tokens_used") or 0),
             cost_usd=_optional_string(budget.get("budget.cost_usd")),
@@ -298,6 +341,16 @@ class RunMetrics:
             ),
             progress_recovery_attempts=int(budget.get("progress.recovery_attempts") or 0),
             progress_last_progress_step=int(budget.get("progress.last_progress_step") or 0),
+            completion_verified=_optional_bool(budget.get("verification.verified")),
+            verification_status=str(
+                budget.get("verification.status") or "NOT_APPLICABLE"
+            ),
+            verification_attempts=int(budget.get("verification.attempt") or 0),
+            verification_failed_checks=tuple(
+                str(item)
+                for item in budget.get("verification.failed_check_ids", [])
+                if isinstance(item, str)
+            ),
         )
 
 
@@ -364,6 +417,11 @@ def _int_attribute(span: Span, key: str) -> int:
     return int(value) if isinstance(value, (int, float)) else 0
 
 
+def _float_attribute(span: Span, key: str) -> float:
+    value = span.attributes.get(key)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
 def _budget_attributes(
     attributes: dict[str, Any], prefix: str, *, aggregate: bool
 ) -> dict[str, Any]:
@@ -396,6 +454,10 @@ def _optional_string(value: Any) -> str | None:
 
 def _optional_number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 def _budget_utilization(policy: dict[str, Any], usage: dict[str, Any]) -> dict[str, float]:

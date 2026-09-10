@@ -16,13 +16,9 @@ from axiom.evaluation.models import (
     ScorerSpec,
     now,
 )
-from axiom.evaluation.scorers import (
-    Scorer,
-    required_scores_passed,
-    score_case,
-    scorer_from_spec,
-)
+from axiom.evaluation.scorers import Scorer, required_scores_passed, score_case, scorer_from_spec
 from axiom.runtime.checkpoints import RuntimeStore
+from axiom.runtime.completion import CompletionVerificationResult
 from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
 from axiom.runtime.models import Checkpoint, RunStatus
 from axiom.runtime.multi_agent_strategy import MultiAgentExecutionStrategy
@@ -84,6 +80,7 @@ class DurableEvaluationExecutor:
                     turn_id=turn_id,
                     run_id=run_id,
                     input=case.prompt,
+                    completion_contract=case.completion_contract,
                 ),
                 timeout=case.timeout_seconds,
             )
@@ -157,6 +154,11 @@ class DurableEvaluationExecutor:
             actual_status = "ERROR"
         budget = await runtime.budget_snapshot(state) if state is not None else None
         aggregate_usage = budget.aggregate_usage if budget is not None else None
+        verification = (
+            CompletionVerificationResult.from_dict(state.completion_verification)
+            if state is not None and state.completion_verification
+            else None
+        )
         return EvaluationRunResult(
             case_id=case.id,
             run_id=run_id,
@@ -200,6 +202,14 @@ class DurableEvaluationExecutor:
                 else None
             ),
             cost_known=bool(aggregate_usage and aggregate_usage.cost_known),
+            completion_verified=verification.verified if verification is not None else None,
+            verification_status=(
+                verification.status.value if verification is not None else "NOT_APPLICABLE"
+            ),
+            verification_attempts=(verification.attempt if verification is not None else 0),
+            failed_verification_checks=(
+                list(verification.failed_check_ids) if verification is not None else []
+            ),
         )
 
 
@@ -269,8 +279,12 @@ class EvaluationRunner:
         )
 
     def _scorers_for(self, case: EvaluationCase) -> list[Scorer]:
-        specs = case.scorers or (ScorerSpec(type="run_status"),)
-        return [self.scorer_factory(spec) for spec in specs]
+        if case.scorers:
+            return [self.scorer_factory(spec) for spec in case.scorers]
+        defaults: list[Scorer] = [self.scorer_factory(ScorerSpec(type="run_status"))]
+        if case.completion_contract is not None and case.completion_contract.checks:
+            defaults.append(self.scorer_factory(ScorerSpec(type="completion_verification")))
+        return defaults
 
 
 def _safe_error(exc: BaseException) -> str:

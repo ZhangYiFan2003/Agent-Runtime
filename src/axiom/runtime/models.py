@@ -26,6 +26,7 @@ class ToolExecutionStatus(StrEnum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(slots=True)
@@ -106,6 +107,9 @@ class Checkpoint:
     budget_policy: dict[str, Any] = field(default_factory=dict)
     progress_policy: dict[str, Any] = field(default_factory=dict)
     progress_state: dict[str, Any] = field(default_factory=dict)
+    completion_contract: dict[str, Any] = field(default_factory=dict)
+    completion_verification: dict[str, Any] = field(default_factory=dict)
+    completion_verification_attempts: int = 0
     run_kind: str = "agent"
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     next_tool_index: int = 0
@@ -132,6 +136,7 @@ class Checkpoint:
         budget_policy: dict[str, Any] | None = None,
         progress_policy: dict[str, Any] | None = None,
         progress_state: dict[str, Any] | None = None,
+        completion_contract: dict[str, Any] | None = None,
     ) -> Checkpoint:
         return cls(
             run_id=run_id or _new_id("run"),
@@ -147,6 +152,7 @@ class Checkpoint:
             budget_policy=dict(budget_policy or {}),
             progress_policy=dict(progress_policy or {}),
             progress_state=dict(progress_state or {}),
+            completion_contract=dict(completion_contract or {}),
         )
 
     @property
@@ -179,6 +185,9 @@ class Checkpoint:
             "budget_policy": _json_value(self.budget_policy),
             "progress_policy": _json_value(self.progress_policy),
             "progress_state": _json_value(self.progress_state),
+            "completion_contract": _json_value(self.completion_contract),
+            "completion_verification": _json_value(self.completion_verification),
+            "completion_verification_attempts": self.completion_verification_attempts,
             "run_kind": self.run_kind,
             "pending_tool_calls": _json_value(self.pending_tool_calls),
             "next_tool_index": self.next_tool_index,
@@ -219,6 +228,11 @@ class Checkpoint:
             budget_policy=_dict(data.get("budget_policy")),
             progress_policy=_dict(data.get("progress_policy")),
             progress_state=_dict(data.get("progress_state")),
+            completion_contract=_dict(data.get("completion_contract")),
+            completion_verification=_dict(data.get("completion_verification")),
+            completion_verification_attempts=max(
+                0, int(data.get("completion_verification_attempts") or 0)
+            ),
             run_kind=str(data.get("run_kind") or "agent"),
             pending_tool_calls=[item for item in raw_calls if isinstance(item, dict)]
             if isinstance(raw_calls, list)
@@ -252,6 +266,9 @@ class Checkpoint:
             "budget_policy": _json_value(self.budget_policy),
             "progress_policy": _json_value(self.progress_policy),
             "progress_state": _json_value(self.progress_state),
+            "completion_contract": _json_value(self.completion_contract),
+            "completion_verification": _json_value(self.completion_verification),
+            "completion_verification_attempts": self.completion_verification_attempts,
             "run_kind": self.run_kind,
             "interrupt": self.interrupt.to_dict() if self.interrupt else None,
             "error": self.error.to_dict() if self.error else None,
@@ -272,6 +289,12 @@ class ToolExecutionRecord:
     result: str | None = None
     is_error: bool = False
     error: str | None = None
+    last_failure_category: str | None = None
+    last_error_code: str | None = None
+    retry_exhausted: bool = False
+    retry_suppressed_reason: str | None = None
+    next_retry_at: str | None = None
+    retry_backoff_seconds: float = 0.0
     started_at: str | None = None
     completed_at: str | None = None
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -288,6 +311,12 @@ class ToolExecutionRecord:
             "result": self.result,
             "is_error": self.is_error,
             "error": self.error,
+            "last_failure_category": self.last_failure_category,
+            "last_error_code": self.last_error_code,
+            "retry_exhausted": self.retry_exhausted,
+            "retry_suppressed_reason": self.retry_suppressed_reason,
+            "next_retry_at": self.next_retry_at,
+            "retry_backoff_seconds": self.retry_backoff_seconds,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "updated_at": self.updated_at,
@@ -306,6 +335,12 @@ class ToolExecutionRecord:
             result=_optional_str(data.get("result")),
             is_error=bool(data.get("is_error")),
             error=_optional_str(data.get("error")),
+            last_failure_category=_optional_str(data.get("last_failure_category")),
+            last_error_code=_optional_str(data.get("last_error_code")),
+            retry_exhausted=bool(data.get("retry_exhausted")),
+            retry_suppressed_reason=_optional_str(data.get("retry_suppressed_reason")),
+            next_retry_at=_optional_str(data.get("next_retry_at")),
+            retry_backoff_seconds=float(data.get("retry_backoff_seconds") or 0.0),
             started_at=_optional_str(data.get("started_at")),
             completed_at=_optional_str(data.get("completed_at")),
             updated_at=str(data.get("updated_at") or datetime.now(UTC).isoformat()),

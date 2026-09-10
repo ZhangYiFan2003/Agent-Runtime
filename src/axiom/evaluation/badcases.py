@@ -52,6 +52,7 @@ class FailureType(StrEnum):
     POLICY_DENIED = "policy_denied"
     RECOVERY_FAILURE = "recovery_failure"
     NO_PROGRESS = "no_progress"
+    COMPLETION_VERIFICATION_FAILED = "completion_verification_failed"
     UNKNOWN_FAILURE = "unknown_failure"
 
 
@@ -515,6 +516,14 @@ def classify_failure(
             or "unknown"
         )
         add(FailureType.NO_PROGRESS, f"runtime detected no progress: {detector}")
+    if result.completion_verified is False or result.verification_status in {
+        "NOT_VERIFIED",
+        "ERROR",
+    }:
+        add(
+            FailureType.COMPLETION_VERIFICATION_FAILED,
+            "deterministic completion verification did not pass",
+        )
     if "tool" in error_text and any(
         marker in error_text for marker in ("fail", "error", "invalid")
     ):
@@ -540,6 +549,11 @@ def classify_failure(
                 add(FailureType.STEP_BUDGET_EXCEEDED, "step threshold scorer failed")
             if _metric_failed(score.details.get("tokens")):
                 add(FailureType.TOKEN_BUDGET_EXCEEDED, "token threshold scorer failed")
+        elif score.scorer == "completion_verification":
+            add(
+                FailureType.COMPLETION_VERIFICATION_FAILED,
+                f"completion verification scorer failed: {score.reason}",
+            )
 
     for record in tools or []:
         if record.is_error or record.status.value == "FAILED":

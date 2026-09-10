@@ -914,12 +914,21 @@ class MultiAgentExecutionStrategy:
         state.output_text = orchestration.synthesis_result
         state.messages.append(Message(role="assistant", content=state.output_text))
         self.store_state(state, orchestration)
+        await runtime._apply_completion_verification(state, allow_correction=False)
         await runtime._save_checkpoint(state, operation="multi_agent.completed")
         await runtime._emit("multi_agent.completed", self._event(state, orchestration))
         await runtime._finish_run_trace(state.status)
         await runtime._emit(
-            "run.completed",
-            {"run_id": state.run_id, "total_tokens": state.total_tokens},
+            "run.completed" if state.status == RunStatus.COMPLETED else "run.failed",
+            {
+                "run_id": state.run_id,
+                "total_tokens": state.total_tokens,
+                **(
+                    {"error": state.error.to_dict() if state.error else None}
+                    if state.status == RunStatus.FAILED
+                    else {}
+                ),
+            },
         )
         return state
 

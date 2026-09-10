@@ -19,6 +19,17 @@ from axiom.evaluation.comparison import (
     compare_results,
     evaluate_regression_gate,
 )
+from axiom.evaluation.context_retention import (
+    ContextRetentionCase,
+    ContextRetentionCaseResult,
+    ContextRetentionComparison,
+    ContextRetentionDataset,
+    ContextRetentionEvaluator,
+    ContextRetentionSuiteResult,
+    RetainedItemResult,
+    compare_context_retention,
+    load_context_retention_dataset,
+)
 from axiom.evaluation.dataset import load_dataset, load_result, save_dataset, save_result
 from axiom.evaluation.models import (
     EvaluationCase,
@@ -31,6 +42,7 @@ from axiom.evaluation.models import (
 )
 from axiom.evaluation.runner import DurableEvaluationExecutor, EvaluationExecutor, EvaluationRunner
 from axiom.evaluation.scorers import (
+    CompletionVerificationScorer,
     ContainsScorer,
     ExactMatchScorer,
     MetricThresholdScorer,
@@ -49,6 +61,13 @@ __all__ = [
     "BadCaseRecord",
     "BadCaseStore",
     "ContainsScorer",
+    "CompletionVerificationScorer",
+    "ContextRetentionCase",
+    "ContextRetentionCaseResult",
+    "ContextRetentionComparison",
+    "ContextRetentionDataset",
+    "ContextRetentionEvaluator",
+    "ContextRetentionSuiteResult",
     "DurableEvaluationExecutor",
     "EvaluationCase",
     "EvaluationCaseAggregate",
@@ -66,6 +85,7 @@ __all__ = [
     "RegressionGateResult",
     "RegressionGateStatus",
     "RegressionThresholds",
+    "RetainedItemResult",
     "ReviewStatus",
     "RunStatusScorer",
     "ScoreResult",
@@ -73,9 +93,11 @@ __all__ = [
     "ScorerSpec",
     "ToolUsageScorer",
     "compare_results",
+    "compare_context_retention",
     "classify_failure",
     "evaluate_regression_gate",
     "load_dataset",
+    "load_context_retention_dataset",
     "load_result",
     "required_scores_passed",
     "promote_badcase",

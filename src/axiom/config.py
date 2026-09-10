@@ -138,6 +138,16 @@ class RunBudgetConfig:
 
 
 @dataclass(slots=True)
+class DependencyConfig:
+    """Bounded retry defaults; per-attempt timeouts remain on LLM and Tool config."""
+
+    max_attempts: int = 3
+    base_backoff_seconds: float = 0.5
+    max_backoff_seconds: float = 4.0
+    jitter_enabled: bool = True
+
+
+@dataclass(slots=True)
 class ProgressConfig:
     """Deterministic, bounded no-progress detection for durable Runs."""
 
@@ -202,6 +212,7 @@ class AxiomConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     run_budget: RunBudgetConfig = field(default_factory=RunBudgetConfig)
+    dependency: DependencyConfig = field(default_factory=DependencyConfig)
     progress: ProgressConfig = field(default_factory=ProgressConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
@@ -478,6 +489,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         memory=MemoryConfig(**data.get("memory", {})),
         context=ContextConfig(**data.get("context", {})),
         run_budget=RunBudgetConfig(**data.get("run_budget", {})),
+        dependency=DependencyConfig(**data.get("dependency", {})),
         progress=ProgressConfig(**data.get("progress", {})),
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),

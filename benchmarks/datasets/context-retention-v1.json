@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "name": "context-retention-v1",
+  "version": "1.0",
+  "cases": [
+    {
+      "id": "old-objective",
+      "objective": "Ship the restart-safe verifier",
+      "messages": [
+        {"role": "user", "content": "Objective: Ship the restart-safe verifier. background background background background background."},
+        {"role": "assistant", "content": "I will inspect the existing runtime first. incidental notes incidental notes incidental notes."},
+        {"role": "user", "content": "Unrelated discussion about naming and formatting with enough filler to become historical.", "repeat": 20},
+        {"role": "assistant", "content": "More low-priority progress narration and repeated background details that are not acceptance criteria."},
+        {"role": "user", "content": "Continue with the current objective."},
+        {"role": "assistant", "content": "Working."}
+      ],
+      "must_preserve": {"objective": ["Ship the restart-safe verifier"]}
+    },
+    {
+      "id": "multiple-constraints",
+      "objective": "Update runtime evidence",
+      "messages": [
+        {"role": "user", "content": "Must use durable evidence. Do not use an LLM judge. Never expose tool arguments."},
+        {"role": "assistant", "content": "Acknowledged the constraints and collected several pages of unrelated implementation notes."},
+        {"role": "user", "content": "Noise about alternative naming, old drafts, and discarded ideas that can be compacted safely.", "repeat": 20},
+        {"role": "assistant", "content": "More incidental detail more incidental detail more incidental detail more incidental detail."},
+        {"role": "user", "content": "Update runtime evidence"},
+        {"role": "assistant", "content": "Continuing."}
+      ],
+      "must_preserve": {
+        "objective": ["Update runtime evidence"],
+        "constraints": ["Must use durable evidence", "Do not use an LLM judge", "Never expose tool arguments"]
+      }
+    },
+    {
+      "id": "open-vs-completed",
+      "objective": "Finish the remaining verification test",
+      "messages": [
+        {"role": "user", "content": "Remaining open work: add the checkpoint restart test."},
+        {"role": "assistant", "content": "Completed the output substring test. Implemented the artifact existence check."},
+        {"role": "user", "content": "Historical chatter about earlier completed work and nonessential formatting decisions.", "repeat": 20},
+        {"role": "assistant", "content": "Additional low-priority status prose that may disappear after compaction without penalty."},
+        {"role": "user", "content": "Finish the remaining verification test"},
+        {"role": "assistant", "content": "Working."}
+      ],
+      "must_preserve": {
+        "objective": ["Finish the remaining verification test"],
+        "open_tasks": ["Remaining open work: add the checkpoint restart test"],
+        "decisions": ["Completed the output substring test"]
+      }
+    },
+    {
+      "id": "critical-failure",
+      "objective": "Repair restart behavior",
+      "messages": [
+        {"role": "user", "content": "Repair restart behavior after the earlier failure."},
+        {"role": "assistant", "content": "I will use the persisted checkpoint instead of reconstructing state from prose."},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "old_failure", "type": "function", "function": {"name": "test", "arguments": "{}"}}]},
+        {"role": "tool", "name": "test (error)", "tool_call_id": "old_failure", "content": "error: checkpoint sequence conflict at restart boundary"},
+        {"role": "user", "content": "Noncritical debugging speculation and discarded hypotheses can be summarized away.", "repeat": 20},
+        {"role": "user", "content": "Repair restart behavior"},
+        {"role": "assistant", "content": "Continuing."}
+      ],
+      "must_preserve": {
+        "objective": ["Repair restart behavior"],
+        "critical_evidence": ["checkpoint sequence conflict at restart boundary"]
+      }
+    },
+    {
+      "id": "oversized-tool-critical-tail",
+      "objective": "Use the command evidence",
+      "messages": [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_large", "type": "function", "function": {"name": "shell", "arguments": "{}"}}]},
+        {"role": "tool", "name": "shell", "tool_call_id": "call_large", "content": "CRITICAL_MARKER=tests-passed command output start ............................................................................................................................................................................................................................................................................................................................... CRITICAL_MARKER=tests-passed"},
+        {"role": "user", "content": "Incidental commentary after the command that does not change the objective.", "repeat": 20},
+        {"role": "assistant", "content": "More historical narration and routine status information."},
+        {"role": "user", "content": "Use the command evidence"},
+        {"role": "assistant", "content": "Working."}
+      ],
+      "must_preserve": {
+        "objective": ["Use the command evidence"],
+        "critical_evidence": ["CRITICAL_MARKER=tests-passed"]
+      }
+    },
+    {
+      "id": "tool-protocol-pair",
+      "objective": "Continue after lookup",
+      "messages": [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_lookup", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"role": "tool", "name": "lookup", "tool_call_id": "call_lookup", "content": "lookup evidence: durable.py owns the loop"},
+        {"role": "user", "content": "Low priority discussion that makes the completed tool exchange historical.", "repeat": 20},
+        {"role": "assistant", "content": "More noise more noise more noise more noise more noise."},
+        {"role": "user", "content": "Continue after lookup"},
+        {"role": "assistant", "content": "Working."}
+      ],
+      "must_preserve": {
+        "objective": ["Continue after lookup"],
+        "critical_evidence": ["durable.py owns the loop"]
+      }
+    },
+    {
+      "id": "previous-summary-plus-raw",
+      "objective": "Preserve the active decision",
+      "messages": [
+        {"role": "system", "content": "[live runtime context summary]\nobjective: Preserve the active decision\ndecisions:\n- Decision: use deterministic evidence\n[end live runtime context summary]"},
+        {"role": "user", "content": "Historical raw continuation with details that are lower priority than the recorded decision.", "repeat": 20},
+        {"role": "assistant", "content": "Routine progress text routine progress text routine progress text."},
+        {"role": "user", "content": "More irrelevant history before the recent message reserve."},
+        {"role": "user", "content": "Preserve the active decision. Decision: use deterministic evidence"},
+        {"role": "assistant", "content": "Working."}
+      ],
+      "must_preserve": {
+        "objective": ["Preserve the active decision"],
+        "decisions": ["Decision: use deterministic evidence"]
+      }
+    },
+    {
+      "id": "irrelevant-noise",
+      "objective": "Keep the acceptance token",
+      "messages": [
+        {"role": "user", "content": "Must retain ACCEPTANCE_TOKEN_42. disposable-noise-alpha disposable-noise-alpha."},
+        {"role": "assistant", "content": "disposable-noise-beta disposable-noise-beta disposable-noise-beta.", "repeat": 20},
+        {"role": "user", "content": "Old brainstorming about colors, names, and rejected alternatives."},
+        {"role": "assistant", "content": "More verbose incidental history with no required state."},
+        {"role": "user", "content": "Keep the acceptance token"},
+        {"role": "assistant", "content": "Working."}
+      ],
+      "must_preserve": {
+        "objective": ["Keep the acceptance token"],
+        "constraints": ["ACCEPTANCE_TOKEN_42"]
+      },
+      "must_drop": ["disposable-noise-beta"]
+    },
+    {
+      "id": "pinned-recent-state",
+      "objective": "Honor the pinned recent constraint",
+      "messages": [
+        {"role": "user", "content": "Old background old background old background old background old background.", "repeat": 20},
+        {"role": "assistant", "content": "Old response old response old response old response old response."},
+        {"role": "user", "content": "More historical noise more historical noise more historical noise."},
+        {"role": "assistant", "content": "Additional old detail additional old detail additional old detail."},
+        {"role": "user", "content": "Honor the pinned recent constraint. Must preserve PINNED_RECENT_CONSTRAINT while honoring the hard context limit."},
+        {"role": "assistant", "content": "Working on the pinned recent constraint."}
+      ],
+      "must_preserve": {
+        "objective": ["Honor the pinned recent constraint"],
+        "constraints": ["PINNED_RECENT_CONSTRAINT"]
+      }
+    },
+    {
+      "id": "pending-tool-state",
+      "objective": "Resume the pending write",
+      "messages": [
+        {"role": "user", "content": "Old setup and background old setup and background old setup and background.", "repeat": 20},
+        {"role": "assistant", "content": "Historical response historical response historical response."},
+        {"role": "user", "content": "More context that is safe to summarize before the pending protocol state."},
+        {"role": "assistant", "content": "Routine status routine status routine status."},
+        {"role": "user", "content": "Resume the pending write"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_pending_write", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}]}
+      ],
+      "must_preserve": {
+        "objective": ["Resume the pending write"],
+        "pending_protocol_state": ["call_pending_write"]
+      }
+    }
+  ]
+}

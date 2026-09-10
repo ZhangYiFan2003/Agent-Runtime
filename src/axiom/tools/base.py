@@ -44,6 +44,7 @@ class ToolContext:
         Callable[[PermissionRequest, PermissionDecision], Awaitable[None] | None] | None
     ) = None
     execution_backend: ExecutionBackend | None = None
+    operation_timeout_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -59,6 +60,7 @@ class Tool:
     timeout: float = 60.0
     required_keys: list[str] = field(default_factory=list)
     idempotency_key_parameter: str | None = None
+    retry_safety: str | None = None
     capabilities: tuple[str, ...] = ()
     path_argument_names: tuple[str, ...] = ()
 
@@ -82,7 +84,10 @@ class Tool:
 
     async def execute(self, payload: dict[str, Any], context: ToolContext) -> ToolResult:
         data = self.validate(payload)
-        return await asyncio.wait_for(self.handler(data, context), timeout=self.timeout)
+        timeout = self.timeout
+        if context.operation_timeout_seconds is not None:
+            timeout = min(timeout, context.operation_timeout_seconds)
+        return await asyncio.wait_for(self.handler(data, context), timeout=max(0.001, timeout))
 
     def permission_request(
         self,

@@ -4,12 +4,13 @@ import asyncio
 import hashlib
 import inspect
 import json
+import random
 import threading
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from axiom.config import AxiomConfig
@@ -39,6 +40,25 @@ from axiom.runtime.budget import (
     RunBudgetState,
 )
 from axiom.runtime.checkpoints import CheckpointConflictError, RuntimeStore
+from axiom.runtime.completion import (
+    COMPLETION_NOT_VERIFIED,
+    CompletionContract,
+    CompletionVerificationResult,
+    CompletionVerificationStatus,
+    CompletionVerifier,
+    verification_feedback,
+)
+from axiom.runtime.dependency import (
+    DEPENDENCY_DEADLINE_EXCEEDED,
+    DEPENDENCY_RETRY_EXHAUSTED,
+    DEPENDENCY_TIMEOUT,
+    DependencyFailureCategory,
+    OperationDeadline,
+    RetryClassifier,
+    RetryDecision,
+    RetryPolicy,
+    RetrySafety,
+)
 from axiom.runtime.models import (
     Checkpoint,
     Interrupt,
@@ -70,19 +90,6 @@ from axiom.tools.registry import ToolRegistry
 from axiom.types import Message
 
 EventSink = Callable[[str, dict[str, Any]], Awaitable[None] | None]
-RetryableError = Callable[[str], bool]
-
-
-@dataclass(frozen=True, slots=True)
-class RetryPolicy:
-    max_attempts: int = 3
-    backoff_seconds: float = 0.0
-    retryable_error: RetryableError | None = None
-
-    def can_retry(self, error: str, attempt: int) -> bool:
-        if attempt >= max(1, self.max_attempts):
-            return False
-        return self.retryable_error(error) if self.retryable_error else True
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +148,9 @@ class DurableAgentRuntime:
         context_manager: ContextManager | None = None,
         budget_manager: BudgetManager | None = None,
         progress_detector: ProgressDetector | None = None,
+        completion_verifier: CompletionVerifier | None = None,
+        retry_random: Callable[[], float] | None = None,
+        retry_sleep: Callable[[float], Awaitable[None]] | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -149,7 +159,10 @@ class DurableAgentRuntime:
         self.cwd = cwd
         self.config = config
         self.store = store
-        self.retry_policy = retry_policy or RetryPolicy()
+        self.retry_policy = retry_policy or RetryPolicy.from_config(config.dependency)
+        self.retry_classifier = RetryClassifier()
+        self.retry_random = retry_random or random.random
+        self.retry_sleep = retry_sleep or asyncio.sleep
         self.event_sink = event_sink
         self.tracer = tracer
         self.permission_policy = permission_policy or DefaultPermissionPolicy(
@@ -177,6 +190,7 @@ class DurableAgentRuntime:
         self.progress_detector = progress_detector or ProgressDetector(
             ProgressPolicy.from_config(config.progress)
         )
+        self.completion_verifier = completion_verifier or CompletionVerifier()
         self.max_turns = max_turns
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -192,6 +206,7 @@ class DurableAgentRuntime:
         parent_step_id: str | None = None,
         run_kind: str = "agent",
         budget_owner_run_id: str | None = None,
+        completion_contract: CompletionContract | None = None,
     ) -> Checkpoint:
         if run_kind == "agent" and self.execution_strategy.name == "multi_agent":
             run_kind = "orchestrator"
@@ -215,6 +230,9 @@ class DurableAgentRuntime:
             budget_policy=self.budget_manager.policy.to_dict(),
             progress_policy=self.progress_detector.policy.to_dict(),
             progress_state=ProgressState().to_dict(),
+            completion_contract=(
+                completion_contract.to_dict() if completion_contract is not None else None
+            ),
         )
 
         async with self._run_lock(state.run_id):
@@ -474,8 +492,82 @@ class DurableAgentRuntime:
         except BudgetExceededError as exc:
             return await self._fail(state, exc, step="llm")
         attempt = 0
+        persisted_retry = (
+            state.error.metadata
+            if state.error is not None
+            and state.error.step == "llm"
+            and state.error.metadata.get("dependency_type") == "model"
+            else {}
+        )
+        if persisted_retry:
+            attempt = int(persisted_retry.get("attempt_count") or 0)
+            if (
+                persisted_retry.get("retry_in_progress")
+                and attempt >= self.retry_policy.max_attempts
+            ):
+                state.error = RunError(
+                    type=DEPENDENCY_RETRY_EXHAUSTED,
+                    message="LLM retry allowance exhausted before process recovery",
+                    step="llm",
+                    metadata={
+                        **persisted_retry,
+                        "retryable": False,
+                        "retry_exhausted": True,
+                    },
+                )
+                if fail_run:
+                    state.status = RunStatus.FAILED
+                    await self._save_checkpoint(state, operation="run.failed")
+                    await self._finish_run_trace(state.status)
+                else:
+                    state.strategy_state["current_task_error"] = state.error.message
+                    await self._save_checkpoint(state, operation="plan.step.llm_failed")
+                return state
+            if not persisted_retry.get("retryable"):
+                if fail_run:
+                    state.status = RunStatus.FAILED
+                    await self._save_checkpoint(state, operation="run.failed")
+                    await self._finish_run_trace(state.status)
+                else:
+                    state.strategy_state["current_task_error"] = state.error.message
+                    await self._save_checkpoint(state, operation="plan.step.llm_failed")
+                return state
+            next_retry_at = persisted_retry.get("next_retry_at")
+            if isinstance(next_retry_at, str):
+                pending_delay = _seconds_until(next_retry_at)
+                remaining = await self.budget_manager.ensure_wall_time(state)
+                if remaining is not None and pending_delay >= remaining:
+                    state.error = RunError(
+                        type=DEPENDENCY_DEADLINE_EXCEEDED,
+                        message="LLM retry backoff cannot fit inside the remaining Run deadline",
+                        step="llm",
+                        metadata={
+                            **persisted_retry,
+                            "retryable": False,
+                            "retry_blocked_by_deadline": True,
+                        },
+                    )
+                    if fail_run:
+                        state.status = RunStatus.FAILED
+                        await self._save_checkpoint(state, operation="run.failed")
+                        await self._finish_run_trace(state.status)
+                    else:
+                        state.strategy_state["current_task_error"] = state.error.message
+                        await self._save_checkpoint(state, operation="plan.step.llm_failed")
+                    return state
+                if pending_delay > 0:
+                    await self.retry_sleep(pending_delay)
         while True:
             attempt += 1
+            if attempt > 1 and state.error is not None:
+                state.error.metadata.update(
+                    {
+                        "attempt_count": attempt,
+                        "retry_in_progress": True,
+                    }
+                )
+                state.error.metadata.pop("next_retry_at", None)
+                await self._save_checkpoint(state, operation="llm.retry.started")
             step_index = state.step_index
             step_span = await self._start_span(
                 SpanType.AGENT,
@@ -562,11 +654,27 @@ class DurableAgentRuntime:
                 )
                 model_reserved = True
                 try:
-                    llm_result = await self._collect_llm_response(
-                        state,
-                        call_started=call_started,
-                        system_prompt=effective_system_prompt,
-                        messages=projection.messages,
+                    remaining = await self.budget_manager.ensure_wall_time(state)
+                    deadline = OperationDeadline(self.config.llm.timeout, remaining)
+                    if deadline.exhausted:
+                        raise TimeoutError("LLM operation deadline exhausted")
+                    if self.tracer is not None and llm_span is not None:
+                        await self.tracer.annotate_span(
+                            llm_span.span_id,
+                            **{
+                                "dependency.timeout_ms": round(
+                                    deadline.effective_timeout_seconds * 1000, 3
+                                )
+                            },
+                        )
+                    llm_result = await asyncio.wait_for(
+                        self._collect_llm_response(
+                            state,
+                            call_started=call_started,
+                            system_prompt=effective_system_prompt,
+                            messages=projection.messages,
+                        ),
+                        timeout=deadline.effective_timeout_seconds,
                     )
                 except _LlmStreamError as stream_error:
                     partial_usage = (
@@ -667,28 +775,65 @@ class DurableAgentRuntime:
                         ),
                     },
                 )
-                error_type = (
-                    exc.code
-                    if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError))
-                    else type(exc).__name__
-                )
                 if isinstance(exc, BudgetExceededError):
                     await self.budget_manager.record_hard_limit(state, exc)
+                if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError)):
+                    decision = RetryDecision(
+                        retry=False,
+                        category=DependencyFailureCategory.PERMANENT_ERROR,
+                        reason="outer Runtime control is authoritative",
+                    )
+                else:
+                    category = self.retry_classifier.classify(exc)
+                    try:
+                        remaining = await self.budget_manager.ensure_wall_time(state)
+                    except BudgetExceededError as deadline_error:
+                        await self.budget_manager.record_hard_limit(state, deadline_error)
+                        exc = deadline_error
+                        message = _safe_error(deadline_error)
+                        decision = RetryDecision(
+                            retry=False,
+                            category=category,
+                            reason="outer Runtime wall-time budget is exhausted",
+                        )
+                    else:
+                        decision = self.retry_policy.decide(
+                            category=category,
+                            attempt=attempt,
+                            safety=RetrySafety.SAFE,
+                            error=message,
+                            random_source=self.retry_random,
+                            remaining_seconds=remaining,
+                            retry_after_seconds=self.retry_classifier.retry_after_seconds(exc),
+                        )
+                error_type = self._dependency_error_code(exc, decision)
+                retry_metadata = self._retry_metadata("model", attempt, decision)
+                retry_metadata["retry_in_progress"] = False
+                if decision.retry:
+                    retry_metadata["next_retry_at"] = _after_seconds(decision.delay_seconds)
                 state.error = RunError(
                     type=error_type,
                     message=message,
                     step="llm",
-                    metadata=exc.metadata() if isinstance(exc, BudgetExceededError) else {},
+                    metadata={
+                        **(exc.metadata() if isinstance(exc, BudgetExceededError) else {}),
+                        **retry_metadata,
+                    },
                 )
                 await self._save_checkpoint(
                     state,
                     operation="llm.failed",
                     parent_span_id=_span_id(step_span),
                 )
+                if self.tracer is not None and llm_span is not None:
+                    await self.tracer.annotate_span(
+                        llm_span.span_id,
+                        **self._retry_span_attributes(attempt, decision),
+                    )
                 await self._finish_span(
                     step_span,
                     SpanStatus.FAILED,
-                    attributes={"error": message},
+                    attributes={"error": message, **self._retry_span_attributes(attempt, decision)},
                 )
                 await self._emit(
                     "step.failed",
@@ -698,15 +843,14 @@ class DurableAgentRuntime:
                         "kind": "llm",
                         "attempt": attempt,
                         "error": message,
+                        **self._retry_metadata("model", attempt, decision),
                     },
                 )
                 await self._emit(
                     "agent.step.failed",
                     {"run_id": state.run_id, "step_index": step_index, "error": message},
                 )
-                if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError)) or not (
-                    self.retry_policy.can_retry(message, attempt)
-                ):
+                if not decision.retry:
                     if fail_run:
                         state.status = RunStatus.FAILED
                         await self._save_checkpoint(state, operation="run.failed")
@@ -716,8 +860,8 @@ class DurableAgentRuntime:
                         state.strategy_state["current_task_error"] = message
                         await self._save_checkpoint(state, operation="plan.step.llm_failed")
                     return state
-                if self.retry_policy.backoff_seconds > 0:
-                    await asyncio.sleep(self.retry_policy.backoff_seconds)
+                if decision.delay_seconds > 0:
+                    await self.retry_sleep(decision.delay_seconds)
                 continue
 
             latency_ms = round((time.perf_counter() - call_started) * 1000, 3)
@@ -735,6 +879,8 @@ class DurableAgentRuntime:
                     "latency_ms": latency_ms,
                     "finish_reason": llm_result.stop_reason,
                     "retry_count": attempt - 1,
+                    "dependency.retry_attempt": attempt,
+                    "dependency.retry_count": attempt - 1,
                     **projection.observability_attributes(
                         compaction_count=compaction_count_from_strategy_state(state.strategy_state)
                     ),
@@ -772,9 +918,14 @@ class DurableAgentRuntime:
             state.agent_turn += 1
             state.step_index += 1
             state.total_tokens += llm_result.prompt_tokens + llm_result.completion_tokens
-            if not scoped_tool_calls and llm_result.stop_reason != "tool_use":
+            candidate_completion = not scoped_tool_calls and llm_result.stop_reason != "tool_use"
+            if candidate_completion:
                 if complete_run:
-                    state.status = RunStatus.COMPLETED
+                    await self._apply_completion_verification(
+                        state,
+                        allow_correction=True,
+                        parent_span_id=_span_id(step_span),
+                    )
                 else:
                     state.strategy_state["current_task_complete"] = True
             await self._save_checkpoint(
@@ -810,7 +961,107 @@ class DurableAgentRuntime:
                     "run.completed",
                     {"run_id": state.run_id, "total_tokens": state.total_tokens},
                 )
+            elif state.status == RunStatus.FAILED:
+                await self._finish_run_trace(state.status)
+                await self._emit(
+                    "run.failed",
+                    {
+                        "run_id": state.run_id,
+                        "error": state.error.to_dict() if state.error else None,
+                    },
+                )
             return state
+
+    async def _apply_completion_verification(
+        self,
+        state: Checkpoint,
+        *,
+        allow_correction: bool,
+        parent_span_id: str | None = None,
+    ) -> CompletionVerificationResult | None:
+        if not state.completion_contract:
+            state.status = RunStatus.COMPLETED
+            return None
+        contract = CompletionContract.from_dict(state.completion_contract)
+        state.completion_verification_attempts += 1
+        attempt = state.completion_verification_attempts
+        span = await self._start_span(
+            SpanType.VERIFICATION,
+            "completion.verify",
+            parent_span_id=parent_span_id,
+            attributes={"verification.attempt": attempt},
+        )
+        result = await self.completion_verifier.verify(
+            state,
+            contract,
+            store=self.store,
+            cwd=self.cwd,
+            attempt=attempt,
+        )
+        state.completion_verification = result.to_dict()
+        attributes: dict[str, object] = {
+            "verification.status": result.status.value,
+            "verification.verified": result.verified,
+            "verification.attempt": result.attempt,
+            "verification.check_count": len(result.checks),
+            "verification.failed_check_ids": list(result.failed_check_ids),
+        }
+        if self.tracer is not None:
+            await self.tracer.annotate_span(self.tracer.root_span_id, **attributes)
+        await self._finish_span(
+            span,
+            (
+                SpanStatus.SUCCEEDED
+                if result.status
+                in {
+                    CompletionVerificationStatus.VERIFIED,
+                    CompletionVerificationStatus.NOT_APPLICABLE,
+                }
+                else SpanStatus.FAILED
+            ),
+            attributes=attributes,
+        )
+        await self._emit(
+            "completion.verification.completed",
+            {
+                "run_id": state.run_id,
+                "status": result.status.value,
+                "verified": result.verified,
+                "attempt": result.attempt,
+                "failed_check_ids": list(result.failed_check_ids),
+            },
+        )
+        if result.status in {
+            CompletionVerificationStatus.VERIFIED,
+            CompletionVerificationStatus.NOT_APPLICABLE,
+        }:
+            state.status = RunStatus.COMPLETED
+            state.error = None
+            return result
+        if (
+            result.status == CompletionVerificationStatus.NOT_VERIFIED
+            and allow_correction
+            and attempt <= contract.max_correction_attempts
+        ):
+            state.status = RunStatus.RUNNING
+            state.messages.append(Message(role="user", content=verification_feedback(result)))
+            return result
+        state.status = RunStatus.FAILED
+        state.error = RunError(
+            type=COMPLETION_NOT_VERIFIED,
+            message=(
+                "completion verification did not pass"
+                if result.status == CompletionVerificationStatus.NOT_VERIFIED
+                else "completion verification errored"
+            ),
+            step="completion_verification",
+            metadata={
+                "verification_status": result.status.value,
+                "attempt": result.attempt,
+                "failed_check_ids": list(result.failed_check_ids),
+            },
+        )
+        return result
 
     async def _collect_llm_response(
         self,
@@ -857,6 +1108,8 @@ class DurableAgentRuntime:
                         reasoning_tokens += int(usage.get("reasoning_tokens") or 0)
                 elif event_type == "error":
                     error = event.get("error")
+                    if isinstance(error, BaseException):
+                        raise error
                     raise RuntimeError(str(error or "LLM stream failed"))
         except Exception as exc:
             raise _LlmStreamError(
@@ -997,8 +1250,67 @@ class DurableAgentRuntime:
                 parent_span_id=parent_span_id,
             )
 
+        retry_safety = self._tool_retry_safety(tool)
+
+        if existing and existing.status in {
+            ToolExecutionStatus.FAILED,
+            ToolExecutionStatus.UNKNOWN,
+        } and (
+            existing.retry_exhausted
+            or existing.retry_suppressed_reason is not None
+            or existing.attempt >= self.retry_policy.max_attempts
+        ):
+            tool_span = await self._start_tool_span(
+                invocation_id,
+                name,
+                parent_span_id=parent_span_id,
+                attributes={
+                    "reused_result": True,
+                    "retry_count": max(0, existing.attempt - 1),
+                    "dependency.failure_category": existing.last_failure_category,
+                    "dependency.retry_exhausted": existing.retry_exhausted,
+                    "dependency.unsafe_retry_suppressed": (
+                        existing.retry_suppressed_reason == "unsafe"
+                    ),
+                },
+            )
+            await self._finish_span(tool_span, SpanStatus.FAILED)
+            return await self._apply_tool_result(
+                state,
+                invocation_id,
+                name,
+                ToolResult(
+                    content=existing.result or existing.error or "tool dependency failed",
+                    is_error=True,
+                    tool_use_id=tool_call_id,
+                    metadata={
+                        "failure_category": existing.last_failure_category,
+                        "error_code": existing.last_error_code,
+                        "retry_exhausted": existing.retry_exhausted,
+                        "unsafe_retry_suppressed": (
+                            existing.retry_suppressed_reason == "unsafe"
+                        ),
+                    },
+                ),
+                reused=True,
+                parent_span_id=parent_span_id,
+            )
+
         if existing and existing.status == ToolExecutionStatus.RUNNING:
-            retry_is_safe = bool(tool and (tool.is_read_only or tool.idempotency_key_parameter))
+            if existing.attempt >= self.retry_policy.max_attempts:
+                existing.status = ToolExecutionStatus.FAILED
+                existing.is_error = True
+                existing.result = existing.error or "tool result remained unknown after restart"
+                existing.last_failure_category = DependencyFailureCategory.UNKNOWN.value
+                existing.last_error_code = DEPENDENCY_RETRY_EXHAUSTED
+                existing.retry_exhausted = True
+                existing.completed_at = _now()
+                await self.store.save_tool_execution(existing)
+                return await self._execute_pending_tool_inner(
+                    state,
+                    parent_span_id=parent_span_id,
+                )
+            retry_is_safe = retry_safety != RetrySafety.UNSAFE
             if not retry_is_safe and approval_decision != "approve":
                 tool_span = await self._start_tool_span(
                     invocation_id,
@@ -1129,6 +1441,44 @@ class DurableAgentRuntime:
         )
 
         while True:
+            if record.next_retry_at:
+                pending_delay = _seconds_until(record.next_retry_at)
+                remaining = await self.budget_manager.ensure_wall_time(state)
+                if remaining is not None and pending_delay >= remaining:
+                    record.retry_exhausted = False
+                    record.retry_suppressed_reason = "deadline"
+                    record.last_error_code = DEPENDENCY_DEADLINE_EXCEEDED
+                    record.next_retry_at = None
+                    await self.store.save_tool_execution(record)
+                    await self._finish_span(
+                        tool_span,
+                        SpanStatus.FAILED,
+                        attributes={
+                            "dependency.retry_blocked_by_deadline": True,
+                            "dependency.backoff_ms": round(pending_delay * 1000, 3),
+                        },
+                    )
+                    result = ToolResult(
+                        content=record.result or record.error or "tool retry missed Run deadline",
+                        is_error=True,
+                        tool_use_id=tool_call_id,
+                        metadata={
+                            "error_code": DEPENDENCY_DEADLINE_EXCEEDED,
+                            "failure_category": record.last_failure_category,
+                            "retry_blocked_by_deadline": True,
+                        },
+                    )
+                    return await self._apply_tool_result(
+                        state,
+                        invocation_id,
+                        name,
+                        result,
+                        parent_span_id=parent_span_id,
+                    )
+                if pending_delay > 0:
+                    await self.retry_sleep(pending_delay)
+                record.next_retry_at = None
+                await self.store.save_tool_execution(record)
             next_attempt = record.attempt + 1
             try:
                 await self.budget_manager.consume_tool_call(
@@ -1176,15 +1526,33 @@ class DurableAgentRuntime:
                 execution_backend=self.execution_backend,
             )
             try:
+                remaining = await self.budget_manager.ensure_wall_time(state)
+                configured_timeout = min(
+                    tool.timeout if tool is not None else self.config.tools.timeout,
+                    self.config.tools.timeout,
+                )
+                deadline = OperationDeadline(configured_timeout, remaining)
+                if deadline.exhausted:
+                    raise TimeoutError("Tool operation deadline exhausted")
+                context.operation_timeout_seconds = deadline.effective_timeout_seconds
+                if tool_span is not None and self.tracer is not None:
+                    await self.tracer.annotate_span(
+                        tool_span.span_id,
+                        **{
+                            "dependency.timeout_ms": round(
+                                deadline.effective_timeout_seconds * 1000, 3
+                            )
+                        },
+                    )
                 result = await ToolExecutor(
                     self.tool_registry,
                     execution_backend=self.execution_backend,
                 ).execute_one(execution_call, context)
             except asyncio.CancelledError:
-                record.status = ToolExecutionStatus.FAILED
+                record.status = ToolExecutionStatus.RUNNING
                 record.is_error = True
                 record.error = "tool execution cancelled"
-                record.completed_at = _now()
+                record.completed_at = None
                 await self.store.save_tool_execution(record)
                 cancelled = {
                     **self._execution_start_attributes(tool, payload),
@@ -1213,6 +1581,11 @@ class DurableAgentRuntime:
                 record.is_error = False
                 record.error = None
                 record.completed_at = _now()
+                record.last_failure_category = None
+                record.last_error_code = None
+                record.retry_exhausted = False
+                record.retry_suppressed_reason = None
+                record.next_retry_at = None
                 await self.store.save_tool_execution(record)
                 await self._finish_span(
                     tool_span,
@@ -1220,6 +1593,11 @@ class DurableAgentRuntime:
                     attributes={
                         "attempt": record.attempt,
                         "retry_count": max(0, record.attempt - 1),
+                        "dependency.retry_attempt": record.attempt,
+                        "dependency.retry_count": max(0, record.attempt - 1),
+                        "dependency.backoff_ms": round(
+                            record.retry_backoff_seconds * 1000, 3
+                        ),
                         **result.metadata,
                     },
                 )
@@ -1236,6 +1614,48 @@ class DurableAgentRuntime:
             record.is_error = True
             record.error = result.content
             record.completed_at = _now()
+            category = self.retry_classifier.classify(result.metadata or result.content)
+            remaining = await self.budget_manager.remaining_wall_time(state)
+            decision = self.retry_policy.decide(
+                category=category,
+                attempt=record.attempt,
+                safety=retry_safety,
+                error=result.content,
+                random_source=self.retry_random,
+                remaining_seconds=remaining,
+                retry_after_seconds=self.retry_classifier.retry_after_seconds(result.metadata),
+            )
+            record.last_failure_category = category.value
+            record.last_error_code = self._dependency_error_code(
+                RuntimeError(result.content),
+                decision,
+            )
+            record.retry_exhausted = decision.exhausted
+            record.retry_suppressed_reason = (
+                "unsafe"
+                if decision.unsafe_suppressed
+                else "deadline"
+                if decision.blocked_by_deadline
+                else "not_retryable"
+                if not decision.retry
+                else None
+            )
+            record.status = (
+                ToolExecutionStatus.UNKNOWN
+                if decision.unsafe_suppressed
+                else ToolExecutionStatus.FAILED
+            )
+            result.metadata.update(
+                {
+                    "error_code": record.last_error_code,
+                    **self._retry_metadata("tool", record.attempt, decision),
+                }
+            )
+            if decision.retry:
+                record.retry_backoff_seconds += decision.delay_seconds
+                record.next_retry_at = _after_seconds(decision.delay_seconds)
+            else:
+                record.next_retry_at = None
             await self.store.save_tool_execution(record)
             await self._emit(
                 "tool.failed",
@@ -1248,13 +1668,12 @@ class DurableAgentRuntime:
                     "execution": result.metadata or None,
                 },
             )
-            retry_is_safe = bool(
-                tool and (tool.is_read_only or tool.idempotency_key_parameter is not None)
-            )
-            retryable = retry_is_safe and self.retry_policy.can_retry(
-                result.content, record.attempt
-            )
-            if not retryable:
+            if tool_span is not None and self.tracer is not None:
+                await self.tracer.annotate_span(
+                    tool_span.span_id,
+                    **self._retry_span_attributes(record.attempt, decision),
+                )
+            if not decision.retry:
                 await self._finish_span(
                     tool_span,
                     SpanStatus.FAILED,
@@ -1262,6 +1681,9 @@ class DurableAgentRuntime:
                         "attempt": record.attempt,
                         "retry_count": max(0, record.attempt - 1),
                         "error": result.content,
+                        "dependency.backoff_ms": round(
+                            record.retry_backoff_seconds * 1000, 3
+                        ),
                         **result.metadata,
                     },
                 )
@@ -1272,8 +1694,6 @@ class DurableAgentRuntime:
                     result,
                     parent_span_id=parent_span_id,
                 )
-            if self.retry_policy.backoff_seconds > 0:
-                await asyncio.sleep(self.retry_policy.backoff_seconds)
 
     async def _apply_tool_result(
         self,
@@ -1604,6 +2024,64 @@ class DurableAgentRuntime:
             "timeout_seconds": float(arguments.get("timeout") or self.config.tools.timeout),
         }
 
+    @staticmethod
+    def _dependency_error_code(exc: Exception, decision: RetryDecision) -> str:
+        if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError)):
+            return exc.code
+        if decision.blocked_by_deadline:
+            return DEPENDENCY_DEADLINE_EXCEEDED
+        if decision.exhausted:
+            return DEPENDENCY_RETRY_EXHAUSTED
+        if decision.category == DependencyFailureCategory.TIMEOUT:
+            return DEPENDENCY_TIMEOUT
+        return type(exc).__name__
+
+    @staticmethod
+    def _retry_metadata(
+        dependency_type: str,
+        attempt: int,
+        decision: RetryDecision,
+    ) -> dict[str, Any]:
+        return {
+            "dependency_type": dependency_type,
+            "failure_category": decision.category.value,
+            "attempt_count": attempt,
+            "backoff_ms": round(decision.delay_seconds * 1000, 3),
+            "retryable": decision.retry,
+            "retry_exhausted": decision.exhausted,
+            "retry_blocked_by_deadline": decision.blocked_by_deadline,
+            "unsafe_retry_suppressed": decision.unsafe_suppressed,
+        }
+
+    @staticmethod
+    def _retry_span_attributes(
+        attempt: int,
+        decision: RetryDecision,
+    ) -> dict[str, Any]:
+        return {
+            "dependency.retry_attempt": attempt,
+            "dependency.retry_count": max(0, attempt - 1),
+            "dependency.failure_category": decision.category.value,
+            "dependency.backoff_ms": round(decision.delay_seconds * 1000, 3),
+            "dependency.retryable": decision.retry,
+            "dependency.retry_exhausted": decision.exhausted,
+            "dependency.retry_blocked_by_deadline": decision.blocked_by_deadline,
+            "dependency.unsafe_retry_suppressed": decision.unsafe_suppressed,
+        }
+
+    @staticmethod
+    def _tool_retry_safety(tool: Tool | None) -> RetrySafety:
+        if tool is None:
+            return RetrySafety.UNSAFE
+        if tool.retry_safety is not None:
+            return RetrySafety(str(tool.retry_safety))
+        if tool.is_read_only:
+            return RetrySafety.SAFE
+        key_name = tool.idempotency_key_parameter
+        if key_name:
+            return RetrySafety.IDEMPOTENT
+        return RetrySafety.UNSAFE
+
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         return self._locks.setdefault(run_id, asyncio.Lock())
 
@@ -1835,3 +2313,17 @@ def _safe_error(exc: Exception) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _after_seconds(seconds: float) -> str:
+    return (datetime.now(UTC) + timedelta(seconds=max(0.0, seconds))).isoformat()
+
+
+def _seconds_until(value: str) -> float:
+    try:
+        target = datetime.fromisoformat(value)
+    except ValueError:
+        return 0.0
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    return max(0.0, (target - datetime.now(UTC)).total_seconds())

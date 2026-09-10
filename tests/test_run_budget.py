@@ -503,7 +503,7 @@ def test_partial_stream_usage_and_retry_calls_are_both_accounted(tmp_path):
                         "type": "usage",
                         "usage": {"input_tokens": 4, "output_tokens": 2},
                     },
-                    {"type": "raise", "message": "retry me"},
+                    {"type": "raise", "message": "connection reset by peer"},
                 ],
                 _events(input_tokens=6, output_tokens=3),
             ]
@@ -528,7 +528,13 @@ def test_partial_stream_usage_and_retry_calls_are_both_accounted(tmp_path):
 
 def test_provider_failure_without_usage_does_not_invent_tokens(tmp_path):
     async def scenario():
-        llm = UsageLlm([RuntimeError("no usage")])
+        llm = UsageLlm(
+            [
+                ConnectionError("no usage"),
+                ConnectionError("no usage"),
+                ConnectionError("no usage"),
+            ]
+        )
         store = MemoryCheckpointStore()
         runtime = _runtime(tmp_path, llm, store)
         failed = await runtime.start(thread_id="thread", input="task", run_id="failed")
@@ -575,7 +581,11 @@ def test_tool_failures_and_retries_count_actual_invocations(tmp_path):
         async def handler(_payload, _context):
             nonlocal attempts
             attempts += 1
-            return ToolResult(content="failed" if attempts == 1 else "done", is_error=attempts == 1)
+            return ToolResult(
+                content="failed" if attempts == 1 else "done",
+                is_error=attempts == 1,
+                metadata={"failure_category": "connection_error"} if attempts == 1 else {},
+            )
 
         tool = Tool(
             name="work",

@@ -263,7 +263,7 @@ class RuntimeApiServer:
             self.data_dir / "runtime.db"
         )
         self.observability = ObservabilityService(self.observability_store)
-        self.retry_policy = retry_policy or RetryPolicy()
+        self.retry_policy = retry_policy or RetryPolicy.from_config(config.dependency)
         self.active_run_supervisor = active_run_supervisor or ActiveRunSupervisor()
         self.shutdown_timeout = max(0.0, shutdown_timeout)
         self.task_manager = task_manager or DurableTaskManager(self.data_dir / "tasks.db")
