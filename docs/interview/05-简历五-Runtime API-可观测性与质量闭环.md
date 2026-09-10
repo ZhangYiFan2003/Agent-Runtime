@@ -305,11 +305,11 @@ SQLite Trace 和 JSON/Badcase store 适合本地。共享服务再引入 OpenTel
 
 **典型继续追问：** “怎么避免重复收集？” **回答思路：** 稳定身份和幂等写入。**项目边界：** Badcase store 当前本地，不是企业标注平台。
 
-#### P1-7｜“Regression Gate 拦什么？Token 降了但成功率也降了怎么算？”
+#### P1-7｜“Regression Gate 拦什么？成功率升了但 Cost per Success 翻倍怎么办？”
 
 **为什么会被追到这里：** 你说评测不只看成功。
 
-**30～60 秒回答：** Gate 优先拦功能成功退化，也可限制 trial success drop 和 cost per success 增长。Token 降低不是单独目标；若成功率下降导致每次成功成本更高，通常不是优化。阈值应基于任务风险和 baseline，不设万能值。
+**30～60 秒回答：** Gate 先守 required 功能和显著成功率退化，再按任务价值判断资源变化。成功率小幅上升但每次成功成本翻倍不一定值得上线；高风险任务可能接受，批量低价值任务通常不会。反过来 Token 降低但成功率下降也不是优化。阈值必须按任务等级和 baseline 明确配置，不设万能数字。
 
 **典型继续追问：** “为什么 cost per success 更合理？” **回答思路：** 总成本除以成功次数，同时惩罚失败重试。**项目边界：** 价格未知时不能伪造 0 成本。
 
@@ -367,31 +367,157 @@ SQLite Trace 和 JSON/Badcase store 适合本地。共享服务再引入 OpenTel
 
 ### 追问树 1：Runtime API
 
-简历写 Run 创建/查询 → 追问为什么不是普通 request → 回答执行跨连接持久存在 → 继续追 Thread/Turn/Run → 回答交互容器、用户回合和执行实例 → 再追 Child lineage → 回答 parent/assignment 与独立状态。
+```text
+Agent 为什么要 Run API，普通 HTTP request 不够吗？
+└─ Run 与 request、Thread、Turn 分别是什么？
+   └─ Parent/Child 查询为什么不是一条日志字段？
+      └─ 进程重启后 API 怎么知道当前状态？
+```
+
+- **“这些身份怎么分？”**
+  - **面试官意图：** 检查控制面建模是否过度设计。
+  - **回答思路：** HTTP 是连接交互，Thread 是会话，Turn 是一次用户回合，Run 是可恢复执行。
+  - **30～60 秒口述：** “HTTP request 可能早已断开，Run 仍在等待 Tool 或审批。Thread 容纳会话，Turn 表示一次用户输入到响应，Run 承担状态、预算、取消和 Trace；一个 Turn 可以产生父 Run 和多个 Child，所以不能用 request ID 代替。”
+- **“Child lineage 有什么用？”**
+  - **面试官意图：** 追问多 Agent 查询和恢复。
+  - **回答思路：** Child 有独立 ID/Checkpoint/Trace，通过 parent、task/assignment 对账。
+  - **30～60 秒口述：** “Child 不是父日志中的一段文本，而是独立执行单元。查询要展示 parent_run_id、任务/assignment 和终态；父 Run 恢复时读取 Child Checkpoint 做 reconciliation，判断依赖是否完成，而不是相信旧内存 Task 列表。”
+- **“重启后状态从哪来？”**
+  - **面试官意图：** 区分 durable state 与 ActiveRunSupervisor。
+  - **回答思路：** Checkpoint 是事实，Supervisor registry 消失；resume 显式重建。
+  - **30～60 秒口述：** “进程重启后本地 Task registry 不存在，API 从 SQLite Checkpoint/Run 记录返回 durable 状态。可恢复 Run 由 resume 调用重建依赖后继续；当前没有启动扫描器或多机自动接管，所以不能说数据库里 RUNNING 就一定有活跃 Worker。”
 
 ### 追问树 2：控制语义
 
-简历写 interrupt/cancel/resume → 追问区别 → 回答暂停可恢复、终止和继续 → 继续追重复 cancel → 回答幂等 key、状态校验和 CAS → 再追 Tool 不停 → 回答协作取消与副作用窗口。
+```text
+interrupt / resume / cancel 有何区别？
+└─ 同一个 cancel 或 resume 重复到达怎么办？
+   └─ cancel 正在运行的 Tool 会立即停吗？
+      └─ cancel 与 retry/backoff 谁优先？
+```
+
+- **“重复控制怎么办？”**
+  - **面试官意图：** 从网络重试追到幂等控制。
+  - **回答思路：** operation identity、参数绑定、状态机校验和 Checkpoint CAS。
+  - **30～60 秒口述：** “第一次 cancel 可能成功但响应丢了，所以同一逻辑控制请求要返回已记录结果或当前状态，不能再次推进。幂等键要绑定 Run、操作和参数；合法状态转换先校验，底层 CAS 再防并发旧写。”
+- **“Tool 会立即停吗？”**
+  - **面试官意图：** 检查 asyncio 协作取消和外部副作用边界。
+  - **回答思路：** Task 在 await 点收到 CancelledError；同步阻塞/远端已提交不能回滚。
+  - **30～60 秒口述：** “不保证瞬时停止。异步 Task 通常在下一个可取消 `await` 点收到 `CancelledError`；同步阻塞代码可能延迟，远端写也可能已发生。Runtime 停止后续步骤并保存取消/ToolExecution 状态，但不会承诺回滚外部世界。”
+- **“cancel 与 retry 谁优先？”**
+  - **面试官意图：** 检查控制 precedence。
+  - **回答思路：** 取消最高；backoff/依赖 await 可取消；不转成 exhausted。
+  - **30～60 秒口述：** “显式 cancel 是权威控制。无论在 dependency wait、backoff 还是 attempt 间，`CancelledError` 都向外传播并收敛 durable CANCELLED，retry loop 不再继续，也不会把取消伪装成 `DEPENDENCY_RETRY_EXHAUSTED`。”
 
 ### 追问树 3：Supervisor
 
-你说“通知活跃 Task” → 追问数据库 CANCELLED 为何不够 → 回答事实与即时信号分层 → 继续追跨线程 loop → 回答 `call_soon_threadsafe` → 再追重启后 registry → 回答消失，以 Checkpoint 恢复，非分布式 ownership。
+```text
+数据库写 CANCELLED 为什么还需要 Supervisor？
+└─ asyncio Task 到底怎么停止？
+   └─ 跨线程 / 跨 Event Loop 怎么安全 cancel？
+      └─ 进程重启后 Supervisor 能接管吗？
+```
+
+- **“Task 怎么停止？”**
+  - **面试官意图：** 从业务状态追到执行机制。
+  - **回答思路：** DB 不会自动唤醒 await；task.cancel 注入 CancelledError，Runtime finally/convergence 保存状态。
+  - **30～60 秒口述：** “Checkpoint 的 CANCELLED 是业务事实，但正在网络 `await` 的 Task 不会持续轮询数据库。Supervisor 找到活跃 Task 并调用 cancel，使它在可取消点抛 `CancelledError`；Runtime 不吞掉它，而是执行必要清理并让 durable 状态收敛。”
+- **“跨线程/loop 怎么做？”**
+  - **面试官意图：** 检查线程安全的 Event Loop 操作。
+  - **回答思路：** 保存所属 loop，`call_soon_threadsafe` 投递回调，由 owner loop 执行 `task.cancel()`。
+  - **30～60 秒口述：** “API 请求线程不能直接随意操作另一个 loop 的 Task。Supervisor 记录 Task 所属 Event Loop，用 `call_soon_threadsafe` 把取消回调排入那个 loop，由它自己的线程执行；这解决线程安全，不等于跨进程信号。”
+- **“重启后能接管吗？”**
+  - **面试官意图：** 捕捉 process-local ownership 夸大。
+  - **回答思路：** registry/Task 丢失，Checkpoint 仍在；当前需显式 resume，无 lease/heartbeat。
+  - **30～60 秒口述：** “不能。Supervisor 保存的是内存引用，进程退出就消失。持久 Checkpoint 允许之后重建 Run，但谁有权自动接管需要 lease、heartbeat 和 fencing；当前没有，所以 Supervisor 不是分布式调度器。”
 
 ### 追问树 4：SSE
 
-简历写事件重放 → 追问为何 SSE → 回答单向增量、HTTP 简单 → 继续追断线 → 回答单调 ID/after_id → 再追重复/多实例 → 回答客户端幂等、共享 event log/broker。
+```text
+为什么用 SSE，不用 WebSocket？
+└─ 连接断了怎么续？
+   └─ after_id 能保证不重不漏吗？
+      └─ stored replay 与 live stream 有何区别？
+```
+
+- **“断线怎么续？”**
+  - **面试官意图：** 检查协议选择后是否有可靠性设计。
+  - **回答思路：** 事件先持久化并分配单调 ID，客户端记最后处理 ID 后查询。
+  - **30～60 秒口述：** “SSE 适合服务端向客户端的单向文本事件，控制请求仍走普通 HTTP。Axiom 先保存 Event 并取得单调 ID，客户端断线后带最后处理的 `after_id` 请求后续记录；可靠续看来自持久事件，不是 SSE 连接本身。”
+- **“能保证不重不漏吗？”**
+  - **面试官意图：** 追问投递语义。
+  - **回答思路：** 发送后确认前断线会重放，客户端按 ID 幂等；保留期外可能无法补。
+  - **30～60 秒口述：** “不能声称 UI exactly-once。连接可能在服务端发送后、客户端确认前断开，边界事件会再次收到；客户端应按 Event ID 去重。只要事件已持久化且仍在保留期内可以补历史，保留和分页也是系统契约。”
+- **“stored replay 与 live stream？”**
+  - **面试官意图：** 防止把轮询已存事件包装成分布式实时总线。
+  - **回答思路：** stored replay 强在恢复，live 强在推送；多实例需共享 log/broker。
+  - **30～60 秒口述：** “当前重点是读取已持久化事件的 stored replay，可靠续传优先但可能有查询延迟。真正跨实例 live stream 还需要共享 event log 或 broker、订阅/fan-out 和保留治理。SSE 只是客户端传输，不自动解决这些。”
 
 ### 追问树 5：可观测性
 
-简历写 Trace/Span → 追问和日志区别 → 回答指标发现、Trace 定位、日志解释 → 继续追 TTFT vs 总延迟 → 回答感知与资源占用 → 再追 P99 → 回答按 Span 拆 LLM/Tool/checkpoint/queue。
+```text
+Trace / Span / Metric / Log 有何区别？
+└─ TTFT 与 total latency 为什么要分？
+   └─ P99 上升时如何沿 Span 定位？
+      └─ attribution fingerprint 能证明根因吗？
+```
+
+- **“TTFT 与总延迟？”**
+  - **面试官意图：** 检查 streaming 的感知收益与资源占用。
+  - **回答思路：** TTFT 到首个有效 delta；total 到完成；streaming 未必降低总耗时。
+  - **30～60 秒口述：** “模型 900ms 出首字、5 秒结束，TTFT 是 900ms，总延迟仍是 5 秒。流式改善用户感知，不代表计算、Token、连接占用或成本降低。TTFT 慢多查排队、输入和 provider 调度，总生成慢再看输出长度和速率。”
+- **“P99 怎么定位？”**
+  - **面试官意图：** 从指标追到真实诊断链。
+  - **回答思路：** Metric 定范围，抽慢 Trace，分解 LLM/Tool/checkpoint/步骤，日志解释异常。
+  - **30～60 秒口述：** “先看 P50/P95/P99、错误率和时间范围，再抽 P99 Run。LLM Span TTFT 高且输入 Token 增长就看 Context；单一 Tool Span 慢看依赖；每步正常但总长看步骤/retry；Checkpoint 慢看 SQLite 竞争。不要先猜数据库。”
+- **“fingerprint 能证明根因？”**
+  - **面试官意图：** 检查 correlation 与 causation。
+  - **回答思路：** 只说明模型/Prompt/Tool schema/Context 等输入身份变化；需要控制变量复跑。
+  - **30～60 秒口述：** “哈希能告诉我哪些版本不同并复现实验条件，但若模型、Prompt 和 Tool schema 同时变，不能说某一个一定是根因。要做单变量或消融复跑，必要时 canary/A-B。Attribution 是关联证据，不是因果证明。”
 
 ### 追问树 6：Evaluation
 
-简历写固定任务集 → 追问 Ground Truth/scorer → 回答版本化任务与多维确定性检查 → 继续追随机性 → 回答独立 repeated trials、不是 Pass@k → 再追 baseline 公平性 → 回答固定配置与 attribution，控制变量复跑。
+```text
+固定 Agent Eval 怎么设计？
+└─ 为什么一次运行不够，trial_success_rate 是 Pass@k 吗？
+   └─ baseline / candidate 怎样公平，如何防 leakage？
+      └─ Badcase 为什么人审，Cost per Success 翻倍怎么办？
+```
+
+- **“一次为什么不够？”**
+  - **面试官意图：** 检查随机性和指标命名是否严谨。
+  - **回答思路：** 独立 trial 看稳定性；直接成功率，不冒充 Pass@k。
+  - **30～60 秒口述：** “模型采样、Tool 时序和依赖波动会让一次 pass/fail 方差很大，所以同一 case 用独立 Run/Thread/Trace 重复。`trial_success_rate` 就是成功次数除以试验数，不是根据采样推导的形式化 Pass@k；次数按成本和所需置信度决定。”
+- **“怎么公平、防泄漏？”**
+  - **面试官意图：** 追问实验控制与数据治理。
+  - **回答思路：** 固定 dataset/scorer/tool/strategy；记录版本指纹；dev 调参、holdout 冻结。
+  - **30～60 秒口述：** “Baseline 和 candidate 使用相同任务、scorer、工具与策略配置，记录模型、Prompt、Tool schema、Context policy 和数据版本；每个 trial 隔离状态。公开 development 用于调整，holdout 一旦看结果就不能反复据此改 Prompt，否则已经泄漏。”
+- **“Badcase 和成本如何决策？”**
+  - **面试官意图：** 看质量闭环是否只追一个分数。
+  - **回答思路：** outage/坏标注需人审；功能优先，成本按任务价值和 cost per success 权衡。
+  - **30～60 秒口述：** “失败可能是产品缺陷、Provider outage 或错误 Ground Truth，自动入回归会污染数据，所以先人审再晋升。成功率小幅升但 cost per success 翻倍是否接受取决于任务风险和价值；Token 变少但失败更多同样不是优化。”
 
 ### 追问树 7：完成证明
 
-你说 Run COMPLETED → 追问“模型说完你就信？” → 回答终止提议不等于验证 → 继续追 Completion Contract → 回答持久 Tool/Plan/Child/artifact 证据 → 再追无确定性测试 → 回答 NOT_APPLICABLE、人工 rubric 与边界，明确没有 universal verifier 或 LLM Judge。
+```text
+模型说任务完成，你凭什么相信？
+└─ 测试通过就一定完成吗？
+   └─ 没有 deterministic verifier 怎么办，LLM Judge 可以吗？
+      └─ verifier 自己错怎么办，与 offline Eval 有何区别？
+```
+
+- **“测试通过就一定完成？”**
+  - **面试官意图：** 检查 verifier 的证据边界。
+  - **回答思路：** 测试只覆盖编码断言；组合 Run/Tool/output/artifact/Plan/Child 证据；结果四态。
+  - **30～60 秒口述：** “不一定。测试绿只说明被测试的行为满足断言，可能漏业务需求。Completion Contract 可组合 required Run status、Tool 使用及成功记录、输出约束、workspace artifact、Plan/Child 完成，以及由正常 ToolExecution 提供的命令/测试成功证据；最终是 VERIFIED、NOT_VERIFIED、NOT_APPLICABLE 或 ERROR。”
+- **“没有确定性条件或用 Judge？”**
+  - **面试官意图：** 看系统是否假装所有自然语言任务可验证。
+  - **回答思路：** 无契约保持兼容/NOT_APPLICABLE；人工 rubric 或离线评测；Judge 需校准且 v1 未实现。
+  - **30～60 秒口述：** “开放式建议往往没有机器可判真值，不能伪造 verifier。无 contract 时保持原 completion 行为，但明确 NOT_APPLICABLE；高风险任务可人工审核，离线用 rubric/repeated trials。LLM Judge 可以作为概率信号，但会漂移、偏置和受提示攻击，当前没有实现。”
+- **“verifier 错及与 Eval 区别？”**
+  - **面试官意图：** 检查验证器失误、控制 loop 与离线质量的边界。
+  - **回答思路：** verifier ERROR 不变 success；ReAct 一次普通预算内纠正；Runtime 决定单 Run 终止，Eval 比较版本分布。
+  - **30～60 秒口述：** “Verifier 异常或检查失败不能静默变成功；ReAct 可获得一次结构化反馈，仍受 Budget/Progress/deadline，之后失败为 `COMPLETION_NOT_VERIFIED`。Runtime verification 决定这个 Run 能否结束；offline Eval 在新 trial 上比较版本、成功率、成本和 Badcase，两者不能互相替代。”
 
 ## 11. 面试官攻击面与防守口径
 

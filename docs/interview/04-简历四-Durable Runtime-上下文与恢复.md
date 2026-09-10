@@ -234,35 +234,21 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 
 **项目证据：** `src/axiom/context.py`、`src/axiom/memory/`、`runtime/models.py`。
 
-#### P0-10｜“Map-Reduce Summary 怎么做？为什么不是直接总结全部历史？”
+#### P0-10｜“Map-Reduce Summary 怎么做？哪些内容不能压缩，超大 Tool Result 怎么办？”
 
-**面试官为什么问：** 简历点名 Map-Reduce，面试官会问分段、合并、成本和错误。
+**面试官为什么问：** 简历点名 Map-Reduce，面试官会继续检查分段、协议原子性、超大结果和摘要幻觉。
 
-**先给结论：** Map 阶段分别压缩可管理的历史片段，Reduce 阶段合并为统一摘要；它解决单次输入过长和分段处理问题，但摘要本身可能丢失或幻觉，因此不能成为唯一恢复事实。
+**先给结论：** Map 阶段分别压缩较早历史，Reduce 阶段合并为结构化摘要；系统协议、当前目标/约束、开放任务、关键证据和 pending Tool 协议不能被静默删除。超大 Tool Result 的原始记录留在 durable evidence，只向模型投影有界关键片段。
 
-**60～120 秒完整口语答案：** 长会话先按边界分段，每段提取目标、约束、结论、未完成事项和证据，再合并去重成更短 summary。相比一次把全部历史交给模型，它更适合超过单次窗口的输入，也可复用已有阶段摘要。缺点是多次总结会积累误差，而且压缩本身消耗 Token。Axiom 将 durable state 与 summary 分开；摘要失败不应破坏原 Checkpoint，必要时保留近期原文或返回明确 ContextBudget 错误。
+**60～120 秒完整口语答案：** 长会话先按消息/协议边界分段，每段提取 objective、constraints、decisions、open tasks 和 evidence，再合并去重成较短 summary。Tool Call 与对应 Result 是协议单元，不能只保留一半；近期原文和 pinned state 优先保留。历史 Tool Result 即使十万 Token，也不删除持久原文，而是向 Context 投影名称、状态、关键头尾片段和裁剪标记。摘要可能遗漏或 hallucinate，所以它不是恢复事实；失败时原 Checkpoint 不变，若 pinned 内容仍超过 hard limit，就在 provider 调用前返回明确 ContextBudget 错误。
 
 **第一轮追问：** “摘要 hallucinate 怎么办？”——固定结构字段、保留关键原文引用、确定性规则优先，并通过 retention/任务评测检测；不能把模型摘要当唯一事实。
 
-**第二轮追问：** “什么时候触发？”——按估算 Token 的高水位而非轮数；压缩到目标区间，硬上限仍是最终门禁。
+**第二轮追问：** “为什么不直接保留最后 N 轮？”——轮数不等于 Token，一个 Tool Result 可能比几十轮更大；而旧目标和约束可能比近期噪声更重要，所以要按状态、协议和预算选择。
 
-**常见坑：** “Map-Reduce 能无损压缩”；忽略摘要调用的成本和失败。
+**常见坑：** “Map-Reduce 能无损压缩”；直接截字符串；把 durable Tool evidence 从持久层删除。
 
 **项目证据：** `src/axiom/memory/summarizer.py`、`src/axiom/context.py`、context tests。
-
-#### P0-11｜“什么内容不能随便压缩？Tool Result 有十万 Token 怎么办？”
-
-**面试官为什么问：** 检查 Context 策略是否只追压缩率，而忽略协议和任务语义。
-
-**先给结论：** 系统协议、当前目标/约束、尚未完成任务、关键证据和 Tool Call/Result 配对不能被静默破坏。超大 Tool Result 应保存原始 durable evidence，只向模型投影名称、状态、关键片段和可追溯引用。
-
-**60～120 秒完整口语答案：** Tool Call 与 Result 是一个协议单元，只删一半会让模型消息非法或误解调用是否发生。Axiom 先按 message unit 分组，保留 recent raw 和结构化 summary；历史大 Tool 输出使用有界 projection，并明确标记裁剪。若 pinned 内容本身已超过 hard limit，就在 provider 调用前失败，而不是悄悄删除目标。Token 估算可能不准，所以要预留安全余量，并在 provider 返回真实 usage 后核销 RunBudget。
-
-**第一轮追问：** “pinned context 是什么？”——在当前任务中不能随普通历史淘汰的协议、目标、约束和开放工作；并非所有 system 文本都可无限 pin。
-
-**常见坑：** 直接截字符串；只保留最后 N 轮；把原始 Tool evidence 从持久层删除。
-
-**项目证据：** `context.py:_message_units()`、`_tool_projection()`、hard-limit tests。
 
 ### P1 — 回答后的自然深挖（8 题）
 
@@ -362,45 +348,171 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 
 **如果继续扩展怎么做：** 先迁移共享 durable state，再增加原子 claim，而不是先扩 Worker。
 
-#### P2-4｜“为什么不用进程内存快照，恢复不是更完整吗？”
+#### P2-4｜“模型提出 final，但 Completion Verification 失败时，Budget、Progress 和 deadline 谁说了算？”
 
-**最安全的结论：** 进程快照更耦合运行时和资源对象，业务 Checkpoint 更稳定、可演进和可审计。
+**最安全的结论：** verifier 不能绕过已有控制。ReAct 只在契约允许时获得一次有界结构化纠正，下一轮仍照常消费 step、model call、Token、cost 和 wall time；任何外层预算、deadline、cancel 或 no-progress 先到都保持权威。
 
-**回答主线：** 连接、锁、Task 和库内部状态难以跨版本恢复；显式模型只保存业务最小事实，代价是要认真设计状态机和迁移。
+**回答主线：** 区分 termination proposal、Completion Contract 与最终 Run 状态。通过是 VERIFIED；失败是 NOT_VERIFIED，允许的一次修正会回到普通 loop；再次失败为 `COMPLETION_NOT_VERIFIED`。没有契约的开放任务兼容完成但 verification 为 NOT_APPLICABLE。Plan/Multi-Agent 当前在终止点只验证一次。
 
-**不要说什么：** “内存快照技术上不可能”；它只是当前场景取舍不优。
+**不要说什么：** “verifier 会无限要求模型修正”“为了完成验证可以额外免费调用模型”“没有 contract 也能证明开放任务正确”。
 
-**如果继续扩展怎么做：** 版本化 schema、迁移工具和恢复兼容测试。
+**当前边界：** deterministic checks 只证明已编码的 Run/Tool/output/artifact/Plan/Child 条件，不是通用语义正确性或 LLM Judge。
 
 ## 10. 重点追问树（7 条）
 
 ### 追问树 1：状态模型
 
-简历列 Thread/Turn/Event/Run/Checkpoint → 追问为什么拆 → 回答交互历史 vs 执行恢复 → 继续追 Event 与 Checkpoint 一致性 → 回答恢复以 Checkpoint 为事实，事件负责重放，生产用事务/outbox 缩小窗口。
+```text
+Thread / Turn / Event / Run / Checkpoint 为什么拆？
+└─ Event 和 Checkpoint 有什么本质区别？
+   └─ Memory、Context、Checkpoint 又怎么分？
+      └─ 两类持久记录不一致时信谁？
+```
+
+- **“Event 和 Checkpoint 区别？”**
+  - **面试官意图：** 检查事件历史与恢复快照是否重复建模。
+  - **回答思路：** Event 回答发生过什么、支持重放；Checkpoint 回答下一步从哪里推进。
+  - **30～60 秒口述：** “Event 是追加的交互/可见事实，适合 SSE 按 ID 重放；Checkpoint 是某个 Run 的最新可恢复状态，包含 pending Tool、策略状态、版本和错误。只重放 Event 恢复状态机复杂，只有 Checkpoint 又缺完整历史，所以职责分开。”
+- **“Memory、Context、Checkpoint 怎么分？”**
+  - **面试官意图：** 排除把所有 history 都叫记忆。
+  - **回答思路：** Memory 跨回合检索，Context 是一次模型投影，Checkpoint 是执行事实。
+  - **30～60 秒口述：** “Memory 保存可跨 Turn 使用的事实/摘要；Context 是这一次 LLM 实际看到的有界输入；Checkpoint 保存恢复执行必须的业务状态。Memory 和历史都要经过 Context Budget 才能入模，Context 被压缩也不能删除 Checkpoint 真相。”
+- **“不一致时信谁？”**
+  - **面试官意图：** 追问双写边界。
+  - **回答思路：** 恢复以 Checkpoint 为权威，Event 用于展示；生产可用事务/outbox 缩小窗口。
+  - **30～60 秒口述：** “推进 Run 时以版本化 Checkpoint 为恢复事实，Event 不应反向驱动未验证的状态迁移。若 Checkpoint 已提交而展示事件未写，可能少一条 UI 记录；反过来更危险。当前按实际事务边界处理，服务化可用同事务或 outbox 改善一致性。”
 
 ### 追问树 2：保存边界
 
-你说 LLM/Tool 边界 → 追问为何不每 token 保存 → 回答写放大与半成品语义 → 继续追 LLM 完成但保存失败 → 回答可能重做模型、增加成本但无外部写 → 再追 Tool 完成 → 进入幂等不确定窗口。
+```text
+为什么在 LLM / Tool / interrupt 边界保存？
+└─ 为什么不每个 token 都 checkpoint？
+   ├─ LLM 完成但本地保存失败怎么办？
+   └─ Tool 成功但结果保存失败怎么办？
+```
+
+- **“为什么不每 token 保存？”**
+  - **面试官意图：** 检查 durability 与写放大的取舍。
+  - **回答思路：** 选择语义稳定、昂贵或有副作用的边界；半 token 难续接。
+  - **30～60 秒口述：** “每个 token 写 SQLite 会放大 I/O 和竞争，而且半条生成通常不能安全恢复。LLM 前后、Tool 前后、interrupt/HITL 是语义稳定边界：要么昂贵、要么有副作用、要么改变控制状态，保存它们能最大程度减少重做。”
+- **“LLM 完成但保存失败？”**
+  - **面试官意图：** 检查模型调用 crash window 和成本诚实度。
+  - **回答思路：** 从上个边界恢复可能重做；没有外部写但会重复成本；未知 usage 不伪造。
+  - **30～60 秒口述：** “若响应已返回但 Checkpoint 没落盘，恢复只能看到上个边界，可能重新请求模型。它通常没有外部业务副作用，但会增加调用和成本；Provider 已报告的部分 usage 要保留，未报告的崩溃窗口不能凭空恢复成精确数字。”
+- **“Tool 成功但保存失败？”**
+  - **面试官意图：** 这是 exactly-once 攻击点。
+  - **回答思路：** 外部效果未知；读取/幂等才可自动重试，普通写等待确认。
+  - **30～60 秒口述：** “执行前先写 ToolExecution RUNNING，成功后写 SUCCEEDED。若远端已写成功而本地仍 RUNNING，恢复时结果只能是 unknown。读或服务端幂等操作可重试；普通写需要 operation status、人工确认或补偿，不能把网络 timeout 当作未执行。”
 
 ### 追问树 3：CAS
 
-你说版本号 → 追问 CAS → 回答预期版本防 stale write → 继续追与事务/锁区别 → 回答原子、互斥、乐观前置条件 → 再追两个 Worker双执行 → 回答 CAS 不够，需要 lease/fencing。
+```text
+Checkpoint 为什么需要 CAS？
+└─ 有事务为什么还要版本号？
+   └─ CAS、锁、幂等分别解决什么？
+      └─ CAS 能防两个 Worker 同时执行 Tool 吗？
+```
+
+- **“事务为什么不够？”**
+  - **面试官意图：** 追问 optimistic concurrency 基础。
+  - **回答思路：** 事务保证本次原子，不知道调用者读取版本是否陈旧；CAS 编码前置条件。
+  - **30～60 秒口述：** “两个执行者都读到 v5，各自事务都可以合法写入；若后写者不检查版本，就会覆盖基于旧状态算出的结果。CAS 在更新里要求当前仍是 v5，成功者变 v6，另一个冲突并重载，解决 lost update。”
+- **“CAS、锁、幂等怎么分？”**
+  - **面试官意图：** 检查三个高频词是否混用。
+  - **回答思路：** CAS 拒绝 stale write；锁阻止并发进入；幂等保证重复业务操作同效果。
+  - **30～60 秒口述：** “进程内锁减少同一 Run 同时推进；CAS 在存储层保护版本，即使锁丢失仍能拒绝旧写；幂等处理网络重发或恢复重试，让同一业务操作不重复产生效果。三者可以同时需要，任何一个都不能替代另外两个。”
+- **“能防双执行 Tool 吗？”**
+  - **面试官意图：** 从状态一致性追到所有权。
+  - **回答思路：** CAS 只能让最终状态一个写赢，外部调用可能已发出；多机需 lease/claim/fencing。
+  - **30～60 秒口述：** “不能。两个 Worker 可能都在 CAS 前调用了外部 Tool，之后只有一个 Checkpoint 写成功，也已经产生双副作用。当前用进程内锁/Supervisor 控本地 ownership；多进程需要原子 claim、lease 和 fencing token，CAS 不等于 ownership。”
 
 ### 追问树 4：Tool 恢复
 
-简历写 stable invocation → 追问怎么稳定 → 回答 Run/Tool call 派生并校验参数哈希 → 继续追成功未落库 → 回答 unknown → 再追 exactly-once → 回答服务端幂等/状态查询/补偿。
+```text
+stable invocation ID 解决什么？
+└─ logical Tool invocation 与 Tool attempt 有何区别？
+   └─ retry 第二次后 crash 会不会从零开始？
+      └─ 有 idempotency key 就 exactly-once 吗？
+```
+
+- **“invocation 和 attempt 怎么分？”**
+  - **面试官意图：** 检查 retry 记账和恢复身份。
+  - **回答思路：** 一个模型 Tool Call 是逻辑 invocation；每次真实执行是 attempt，共用稳定 ID。
+  - **30～60 秒口述：** “同一 Tool Call 恢复或重试时逻辑身份不变，参数 hash 也必须一致；attempt 1、2、3 是对依赖的实际执行。ToolExecution 把它们挂在同一 invocation 下。预算的 Tool call 计数按真实 attempt 消耗，retry_count 只数首个之后的尝试。”
+- **“第二次后 crash 呢？”**
+  - **面试官意图：** 追问 durable retry allowance。
+  - **回答思路：** attempt、失败类别、next_retry_at、exhausted/suppressed 持久化。
+  - **30～60 秒口述：** “恢复读取相同 ToolExecution，不会把它当第一次。若 backoff 尚未结束只等剩余时间；额度已耗尽就复用结构化失败；SUCCEEDED 则直接复用且不再收费。取消期间 `CancelledError` 也不会被改成 retry exhausted。”
+- **“幂等键等于 exactly-once？”**
+  - **面试官意图：** 捕捉分布式语义夸大。
+  - **回答思路：** 只有服务端接收、持久化、唯一约束并对同 key 返回同结果才有效。
+  - **30～60 秒口述：** “本地 stable ID 只是提供候选 key。服务端必须把 key 与业务参数绑定并原子去重，客户端还要处理状态查询；即使如此，更准确的说法是重复请求得到同一业务效果，不是网络只投递一次。没有服务端契约仍是 ambiguous。”
 
 ### 追问树 5：Map-Reduce Context
 
-简历写 Map-Reduce → 追问为何两阶段 → 回答分段压缩再合并 → 继续追 hallucination → 回答结构字段、原文引用和 retention eval → 再追摘要失败 → 回答原 Checkpoint 不变、规则投影或明确失败。
+```text
+为什么不直接保留最后 N 轮？
+└─ Token 数与轮数为什么不同？
+   └─ pinned state 和 Tool protocol 怎么保护？
+      └─ summary hallucination / hard limit 怎么办？
+```
+
+- **“轮数为什么不够？”**
+  - **面试官意图：** 看 Context 控制是否理解真实 Token 风险。
+  - **回答思路：** 一轮可能是十万 Token Tool 输出；旧约束比新噪声重要。
+  - **30～60 秒口述：** “最近 10 轮可能包含一个超大日志，远比 100 个短消息贵；旧目标和约束又可能必须保留，所以 round-based window 同时可能过大和丢关键状态。Axiom 每次按估算 Token 重组，而不是机械按轮数截断。”
+- **“pinned 与协议怎么保护？”**
+  - **面试官意图：** 追问哪些状态不能被摘要替代。
+  - **回答思路：** 当前 objective/constraints/open work、system protocol、pending Tool；Tool Call/Result 原子分组。
+  - **30～60 秒口述：** “Pinned state 是当前任务不能随旧历史淘汰的目标、约束、开放任务和协议状态。Tool Call 与对应 Result 必须作为 message unit 一起保留或一起投影，不能只删一半。历史大结果可投影，但 durable 原文不删除。”
+- **“摘要错或仍超限？”**
+  - **面试官意图：** 检查 fail-open 风险。
+  - **回答思路：** 摘要非事实源；结构字段/近期原文兜底；pinned 超 hard limit 时 provider 前失败。
+  - **30～60 秒口述：** “摘要可能遗漏或 hallucinate，所以它不能覆盖原 Checkpoint；保留结构字段、近期原文和关键引用，并用 retention benchmark 检查。压缩后重估，若固定内容本身仍超 hard limit，就返回 `CONTEXT_BUDGET_EXCEEDED`，不能偷偷删目标后调用模型。”
 
 ### 追问树 6：预算与进展
 
-你说 Token Budget → 追问 Context vs Run Budget → 回答单次窗口 vs 累计资源 → 继续追 Child 超卖 → 回答 root ledger 预留/核销 → 再追死循环 → 回答 max_steps 加 ProgressDetector。
+```text
+Context Budget 与 Run Budget 有何区别？
+└─ Child Run 并发如何避免预算超卖？
+   └─ timeout 与 deadline 有何区别，retry 免费吗？
+      └─ completion correction 会绕过 Budget/Progress 吗？
+```
+
+- **“Child 怎么避免超卖？”**
+  - **面试官意图：** 从累计预算追到并发账本。
+  - **回答思路：** Child 本地使用归集 root ledger，调用前原子预留，完成后按 actual usage 核销。
+  - **30～60 秒口述：** “每个 Child 有自身计数，但是否放行要看同一 root owner 的聚合账本。多个 Child 在真实调用前通过版本化更新预留，结束后用 Provider usage 核销，避免每个 Child 都认为自己还有全额 Token 或 cost。”
+- **“timeout/deadline/retry 怎么算？”**
+  - **面试官意图：** 检查依赖控制与外层 lifetime。
+  - **回答思路：** timeout 限单 attempt；deadline 限 Run；effective timeout 取 min；真实 attempt 计费。
+  - **30～60 秒口述：** “Tool 配 10 秒、Run 只剩 2 秒时，有效 timeout 最多约 2 秒。若下一 backoff 要 4 秒就不 retry。每个实际 model request 或 Tool attempt 都占普通调用和 wall/token/cost 账本；只有恢复复用已成功结果不重复收费。”
+- **“completion correction 会绕过吗？”**
+  - **面试官意图：** 验证新增 verifier 没有隐藏无限 loop。
+  - **回答思路：** 一次结构化反馈回到普通 ReAct；下一步照常预算和 no-progress。
+  - **30～60 秒口述：** “不会。Verifier 失败时 ReAct 最多按 contract 给有界反馈，随后仍是普通 step/model call，取消、wall deadline、Token/cost 和 ProgressDetector 都保持权威。再次不通过则 `COMPLETION_NOT_VERIFIED`，Plan/Multi-Agent 当前只做一次终止验证。”
 
 ### 追问树 7：压缩质量攻击
 
-你说“保护结构” → 追问是否证明不变笨 → 回答不能 → 继续追 retention golden set → 回答目标、约束、open task、artifact、证据 → 再追 Token 降而成功也降 → 回答以业务成功和 cost per success 决策，不能只看压缩率。
+```text
+你怎么证明 Context 压缩没让 Agent 变笨？
+└─ 结构测试和 compression ratio 为什么不够？
+   └─ 当前 10-case benchmark 到底测了什么、结果多少？
+      └─ 这些数字能证明通用语义等价吗？
+```
+
+- **“为什么压缩率不够？”**
+  - **面试官意图：** 防止把效率指标冒充质量。
+  - **回答思路：** 压得多可能删错；分开测协议、required state、压缩量和任务结果。
+  - **30～60 秒口述：** “compression ratio 只回答输入缩小多少，完全不说明删掉的是噪声还是约束。Axiom 分四层看：消息/Tool 协议结构、声明的 required-state retention、before/after Token 与 ratio，以及适用于确定性任务的 full/compressed outcome 对照。”
+- **“10-case 测什么、结果多少？”**
+  - **面试官意图：** 要求当前可复现证据而非设计愿景。
+  - **回答思路：** 旧目标、多约束、open/completed、失败证据、超大 Tool、协议、previous summary、噪声、pinned/restart。
+  - **30～60 秒口述：** “固定 10 个合成 case 覆盖旧 objective、多 constraints、开放任务、decision、artifact、关键错误、超大 Tool 投影、Tool pair、已有 summary 与噪声等。当前策略保留 22/22 required items，10/10 protocol-valid，平均 after/before ratio 是 0.5348，也就是估算 Token 减少约 46.5%。”
+- **“能证明通用语义等价吗？”**
+  - **面试官意图：** 检查限制声明。
+  - **回答思路：** 不能；固定 synthetic golden 只证明声明事实和可确定 outcome，无 LLM Judge。
+  - **30～60 秒口述：** “不能。它证明当前固定合成集的 required items 和协议没有丢，并能在少量确定性 probe 对比结果；开放域摘要、隐含语义和真实模型推理仍可能受损。Retention 或协议下降是硬回归，压缩变差只告警，但这仍不是 universal semantic equivalence。”
 
 ## 11. 面试官攻击面与防守口径
 
