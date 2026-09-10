@@ -70,7 +70,7 @@ flowchart TD
 
 - `src/axiom/config.py`
   - Defines config dataclasses such as `LlmConfig`, `AxiomConfig`,
-    `ToolsConfig`, `McpConfig`, `MemoryConfig`, and `PolicyConfig`.
+    `ToolsConfig`, `DependencyConfig`, `McpConfig`, `MemoryConfig`, and `PolicyConfig`.
   - `load_config()` merges defaults, user config, project config, project env
     file values, CLI overrides, and process environment variables.
   - `_apply_env()` maps public environment variable names into config fields.
@@ -234,9 +234,12 @@ flowchart TD
     API errors, child/interrupt summaries, and restart-safe SQLite idempotency records.
 - `src/axiom/runtime/durable.py`
   - Advances the default ReAct loop across LLM and per-tool durable boundaries,
-  persists approval interrupts, resumes after restart, applies bounded retry,
+  persists approval interrupts, resumes after restart, applies deadline-aware bounded retry,
     reuses successful tool invocation records, and registers each executing durable
     Run with the process-local active execution supervisor.
+- `src/axiom/runtime/dependency.py`
+  - Defines deterministic dependency failure categories, timeout/deadline composition,
+    retry safety, exponential full-jitter backoff, and structured retry decisions.
 - `src/axiom/runtime/supervisor.py`
   - Tracks process-local Run ownership by thread, event loop, and `asyncio.Task`;
     provides thread-safe lookup, cross-thread cancellation, safe batch results,
@@ -593,7 +596,39 @@ Existing LLM spans record `context.estimated_tokens_before`,
 5. **How is durable state different from model context?** Durable state is the complete recovery and
    audit record. Model context is a disposable, budgeted view derived from it for one request.
 
-## 9. Evaluation feedback and regression gate
+## 9. Completion verification
+
+`RunStatus.COMPLETED` is no longer the only available completion claim. A model or execution
+strategy first proposes termination; when the Run has a `CompletionContract`, the deterministic
+`CompletionVerifier` checks the proposal against configured evidence before terminal success:
+
+```text
+strategy/model proposes completion
+        ↓
+CompletionVerifier
+        ├── no contract → backward-compatible COMPLETED
+        ├── VERIFIED / NOT_APPLICABLE → COMPLETED
+        └── NOT_VERIFIED / ERROR → correction or FAILED
+```
+
+The v1 check set is deliberately small: candidate Run status, required/forbidden Tool use,
+successful ToolExecution result evidence, output contains/exact match, workspace artifact
+existence, and durable Plan task plus Child Run completion. A command/test check is represented by
+successful evidence from the normal Tool runtime; the verifier never launches a hidden subprocess.
+
+ReAct receives at most one structured verification feedback turn by default. That continuation is
+an ordinary LLM step, so existing step/model/token/cost/wall-time budgets and Progress rules remain
+authoritative. A repeated failure is terminal `FAILED` with `COMPLETION_NOT_VERIFIED`. Plan and
+Multi-Agent terminal proposals are checked once because injecting another planning loop would be a
+larger architecture change.
+
+The contract, latest result, and attempt count are additive Checkpoint fields and therefore survive
+restart without changing the checkpoint schema version. Verification spans/events expose status,
+attempt count, check count, and failed check IDs; they do not log Tool arguments. `RunMetrics` and
+Evaluation results expose `completion_verified`, `verification_status`, attempts, and failed check
+IDs. Open-ended Runs without deterministic criteria remain `NOT_APPLICABLE`, not falsely verified.
+
+## 10. Evaluation feedback and regression gate
 
 Evaluation keeps Runtime self-correction, badcase feedback, and regression evaluation as separate
 layers:
@@ -653,7 +688,16 @@ not a Runtime dependency.
 6. **What fails the gate?** Hard functional/new-required failures, excessive success-rate drops,
    and explicitly enabled resource limits. Default performance drift warns.
 
-## 10. Run Budget and Cost Accounting
+Context quality has a separate offline deterministic harness. The fixed 10-case
+`context-retention-v1` dataset declares required objective, constraints, open tasks, decisions,
+artifact references, critical evidence, and pending protocol state. Reports pair token reduction
+and compression ratio with per-item retention and protocol integrity. Baseline/candidate comparison
+makes any retention or protocol decrease a hard regression; worse compression is only a warning,
+so stronger compression cannot hide lost required state. An optional deterministic outcome probe
+compares the same synthetic task over full and compressed context. Missing stage metadata is
+reported conservatively as `lost_after_compaction`.
+
+## 11. Run Budget and Cost Accounting
 
 Run budgeting is a durable execution guard, separate from request Context budgeting and from
 post-run metrics:
@@ -755,7 +799,52 @@ configuration so secrets are neither required nor fingerprinted.
 10. **How does budget survive resume?** Checkpoints retain ownership/policy and the versioned
     Runtime ledger retains counters, reservations, operation IDs, cost, and original lifetime.
 
-## 11. No-Progress / Loop Degeneration Detection
+### Dependency timeout, deadline, and retry policy
+
+Timeout and deadline are separate controls. `LlmConfig.timeout` and `Tool.timeout` bound one
+attempt. Before each Runtime-visible LLM or Tool attempt, the durable Runtime obtains the remaining
+local/root wall-time budget and uses:
+
+```text
+effective attempt timeout = min(configured attempt timeout, remaining Run lifetime)
+```
+
+A Child Run therefore cannot extend its Parent/root wall deadline. A retry is rejected before
+sleeping when its delay cannot fit in the remaining lifetime. If the wall-time budget is already
+exhausted, the existing `WALL_TIME_BUDGET_EXCEEDED` control remains authoritative.
+
+`RetryClassifier` distinguishes timeout, rate limit, selected transient 5xx, connection,
+validation, authentication, policy, permanent, and unknown failures. Only the first four transient
+categories are retry candidates. Model inference is retry-safe, while Tool retry safety comes from
+explicit metadata: read-only is safe, an explicitly idempotent operation is safe, and an arbitrary
+write is unsafe. An idempotency-key parameter is sufficient only when the invocation actually
+receives the Runtime's stable invocation ID. A timeout does not prove that an external side effect
+did not happen.
+
+Backoff uses bounded exponential full jitter. For failure number `n`, the upper bound is
+`min(max_delay, base_delay * 2^(n-1))`; the actual delay is sampled from zero to that upper bound.
+A provider `Retry-After` value is respected when the surfaced exception exposes it. Random and
+sleep sources are injectable for deterministic tests.
+
+Tool attempts retain one logical `invocation_id`. `ToolExecutionRecord` persists attempt count,
+last failure category/error code, cumulative backoff, pending retry time, exhaustion, and unsafe
+suppression. An ambiguous unsafe transport failure is `UNKNOWN`, not falsely asserted as failed. A
+restart therefore does not reset the allowance, and a persisted successful result is
+still reused without execution or budget charge. Each real model/Tool attempt consumes the normal
+model-call/Tool-call ledger unit. Partial provider usage is retained when reported; unknown usage is
+not invented.
+
+Trace attributes reuse LLM/Tool spans (`dependency.retry_attempt`, `retry_count`,
+`failure_category`, `timeout_ms`, `backoff_ms`, `retryable`, and exhaustion/suppression flags).
+`RunMetrics` aggregates retried model and Tool calls, dependency timeouts, rate limits, retry
+exhaustion, and backoff time. Retry metadata does not contain raw Tool arguments.
+
+This is deliberately per-operation resilience. It does not add a shared circuit breaker, global
+rate limiter, queue, backpressure, or cross-Run dependency-health state. HTTP/MCP SDK internals may
+also have transport behavior that the Runtime cannot observe; duplicate external effects remain
+ambiguous without downstream idempotency or operation-status support.
+
+## 12. No-Progress / Loop Degeneration Detection
 
 `max_steps` bounds how long a Run may work; it cannot tell whether that work remains useful. The
 durable Runtime records a bounded deterministic progress projection at Tool and orchestration
@@ -822,7 +911,7 @@ environment overrides follow normal config precedence; inconsistent bounds are r
 10. **Can it false-positive?** Yes; conservative defaults, complete-cycle requirements, evidence
     resets, and recovery-before-termination mitigate that risk.
 
-## 12. Current limitations
+## 13. Current limitations
 
 - The only concrete LLM client implementation is OpenAI-compatible streaming
   chat completions. Non-compatible providers need new client adapters.
@@ -858,4 +947,72 @@ environment overrides follow normal config precedence; inconsistent bounds are r
   destructive capability.
 - Terminal text in some files appears to contain encoding artifacts, which may
   affect display quality but is separate from the request lifecycle.
+
+## 14. Final control precedence and failure matrix
+
+The controls are layered rather than interchangeable. Explicit cancellation is authoritative and
+`CancelledError` is never converted into a dependency failure. Hard Run/tree budget checks,
+including the wall-time lifetime, stop work before dependency retry policy is considered. Each
+dependency attempt is then bounded by the smaller of its configured timeout and the remaining
+local/root Run lifetime. A safe transient failure may retry only while both attempt allowance and
+outer lifetime remain. Normal progress detection governs completed logical Tool/strategy steps;
+completion verification runs only after a strategy proposes termination and any correction returns
+to the same budgeted loop. Context hard-limit failure occurs before a provider request.
+
+| Failure | Runtime behavior | Durable evidence | Retry? | Result/control |
+| --- | --- | --- | --- | --- |
+| LLM timeout | Classify as transient after one bounded attempt | Checkpoint error, Trace/metrics, retry state | Bounded; each provider attempt is charged | Success, deadline, or structured exhaustion |
+| LLM 429 / selected 5xx / connection error | Classify from surfaced provider evidence; honor numeric `Retry-After` when available | Checkpoint error and Trace/metrics | Bounded | Success, deadline, or structured exhaustion |
+| Read/idempotent Tool timeout | Keep one logical invocation and classify the failed attempt | `ToolExecution` attempts plus Trace/metrics | May retry | Tool result returns to Agent after success/exhaustion |
+| Unsafe write Tool timeout | Treat external outcome as ambiguous | `ToolExecution.UNKNOWN` with suppression metadata | No automatic retry | Structured Tool error; recovery requires explicit approval/status/idempotency evidence |
+| Run/tree budget exhausted | Preserve the specific budget dimension and metadata | Checkpoint and budget ledger | No | `*_BUDGET_EXCEEDED` remains authoritative |
+| Context hard limit exceeded | Fail before the provider request | Checkpoint/Run error and context attributes | No | `CONTEXT_BUDGET_EXCEEDED` |
+| Repeated no-progress | Emit one bounded recovery signal, then stop if stagnation continues | Checkpoint progress state and Trace | Not a dependency retry | `NO_PROGRESS` |
+| Completion check fails | ReAct may receive one configured corrective turn; orchestration terminal checks are one-shot | Contract/result/attempt in Checkpoint and verification Trace | Only normal budgeted continuation | Verified completion or `COMPLETION_NOT_VERIFIED` |
+| Explicit cancel | Signal the process-local owner and converge durable state | Checkpoint and control/Trace events | No | `CANCELLED` |
+
+The retry metrics distinguish one logical model/Tool operation from its actual provider/Tool
+attempts. Model-call and Tool-call budget counters count actual attempts; retry counters count only
+attempts after the first. A restored `SUCCEEDED` Tool execution is reuse, not another attempt.
+
+## 15. Runtime Feature Freeze
+
+The core Runtime capability set is now frozen. Future work should prioritize interview
+preparation, source-code review, real-workload evaluation, bug fixes, and evidence-driven
+hardening. New Runtime subsystems should be added only when a concrete requirement demonstrates a
+gap. Shared circuit breakers, global rate limiting, queues/backpressure, distributed ownership,
+and new Agent/Memory architectures remain explicit future decisions rather than implied features.
+
+## 16. Final interview mental model
+
+```text
+Execution
+---------
+ReAct / Plan / Multi-Agent
+DAG / Child Runs
+
+Durability
+----------
+Run / Checkpoint / CAS
+ToolExecution
+interrupt / resume / cancel
+Supervisor
+
+Harness Governance
+------------------
+Tool Policy / HITL
+Context Budget / Compaction
+Run Budget / Cost
+Progress Detection
+Dependency Timeout / Safe Retry
+
+Quality Evidence
+----------------
+Trace / Span
+Completion Verification
+Context Retention Eval
+Repeated Evaluation
+Badcase / Regression
+Cost per Success
+```
 
