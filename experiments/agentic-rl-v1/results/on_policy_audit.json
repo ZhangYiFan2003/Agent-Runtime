@@ -1,0 +1,9 @@
+{
+  "all_captured_as_exact_by_trainer": true,
+  "boundary": "ArtifactGRPOTrainer records prompt_ids, completion_ids, completion_mask, and the tool mask directly from TRL's generation-and-score output. Reconstructed Axiom trajectory observations remain exact=false and are not used as on-policy input.",
+  "malformed_token_or_mask_rows": [],
+  "passed": true,
+  "reward_trajectory_mismatch_rows": [],
+  "rollouts_checked": 168,
+  "tool_observation_tokens_masked_from_loss": 1065
+}

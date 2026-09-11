@@ -1,0 +1,3 @@
+# Retry behavior for RiverService.
+river_retry_limit = 6
+queue_name = "cinder-river"

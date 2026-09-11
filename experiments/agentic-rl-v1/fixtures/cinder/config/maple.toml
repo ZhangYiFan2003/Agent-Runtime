@@ -1,0 +1,3 @@
+# Retry behavior for MapleService.
+maple_retry_limit = 4
+queue_name = "cinder-maple"

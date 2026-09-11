@@ -1,0 +1,3 @@
+# Retry behavior for QuartzService.
+quartz_retry_limit = 7
+queue_name = "beacon-quartz"

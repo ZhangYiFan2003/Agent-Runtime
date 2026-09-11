@@ -1,0 +1,3 @@
+# Retry behavior for BirchService.
+birch_retry_limit = 3
+queue_name = "atlas-birch"

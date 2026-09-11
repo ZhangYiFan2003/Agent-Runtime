@@ -1,0 +1,3 @@
+# Retry behavior for DuneService.
+dune_retry_limit = 5
+queue_name = "atlas-dune"

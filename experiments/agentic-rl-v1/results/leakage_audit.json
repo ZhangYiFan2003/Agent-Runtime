@@ -1,0 +1,13 @@
+{
+  "completion_contract_ground_truth_leaks": [],
+  "dataset_fingerprint": "sha256:ab1eb876518e94834d6b1e0ded64d26e46c02760b4b1466439e8d8e10d2487d6",
+  "dev_heldout_feature_overlap": [],
+  "expected_answer_embedded_in_tool_metadata": false,
+  "passed_strict_snapshot_isolation": false,
+  "shared_repository_snapshots_across_splits": true,
+  "shared_snapshot_risk": "All feature labels and prompts are disjoint, but each fixture repository exposes source files for every split. Training-time tools could therefore inspect held-out feature files incidentally. This limits any generalization claim.",
+  "task_ids_unique": true,
+  "train_dev_feature_overlap": [],
+  "train_heldout_exact_question_overlap": [],
+  "train_heldout_feature_overlap": []
+}

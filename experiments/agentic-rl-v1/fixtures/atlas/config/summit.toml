@@ -1,0 +1,3 @@
+# Retry behavior for SummitService.
+summit_retry_limit = 9
+queue_name = "atlas-summit"

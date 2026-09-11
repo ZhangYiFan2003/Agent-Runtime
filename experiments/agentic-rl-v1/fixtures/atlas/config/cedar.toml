@@ -1,0 +1,3 @@
+# Retry behavior for CedarService.
+cedar_retry_limit = 4
+queue_name = "atlas-cedar"

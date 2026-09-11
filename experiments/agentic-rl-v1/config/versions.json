@@ -1,0 +1,16 @@
+{
+  "agent_lightning": "1.0.1",
+  "cuda_driver_capability": "13.0",
+  "datasets": "5.0.1",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU, 8188 MiB",
+  "nvidia_driver": "581.29",
+  "operating_system": "Windows 11 10.0.22621",
+  "peft": "0.20.0",
+  "python": "3.12.13",
+  "pytorch": "2.14.0+cu130",
+  "pytorch_cuda_runtime": "13.0",
+  "system_ram_gib": 15.64,
+  "transformers": "5.17.0",
+  "trl": "1.13.0",
+  "wsl": "not installed"
+}

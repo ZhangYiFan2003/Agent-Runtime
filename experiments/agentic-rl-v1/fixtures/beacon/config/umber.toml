@@ -1,0 +1,3 @@
+# Retry behavior for UmberService.
+umber_retry_limit = 9
+queue_name = "beacon-umber"

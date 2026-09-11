@@ -1,0 +1,3 @@
+# Retry behavior for GroveService.
+grove_retry_limit = 3
+queue_name = "beacon-grove"

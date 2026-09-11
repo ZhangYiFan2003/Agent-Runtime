@@ -16,6 +16,8 @@ Axiom is organized around a few core paths:
 - Tool registry and executor for model-requested local tool calls.
 - AST code index, hybrid retrieval, symbol graph, and graph-aware context builder for repository understanding.
 - Layered memory foundation, snapshots, skills, MCP, and Runtime API modules for runtime state and integrations.
+- An RL-ready extension that converts durable Runs into validated trajectories and deterministic
+  reward for external trainers; Axiom remains primarily an Agent Runtime.
 
 The core Agent Runtime paths are covered by offline tests with fake LLM clients. Runtime API localhost lifecycle is covered with live HTTP tests. Some integration surfaces, such as MCP server transport lifecycle and public Runtime API deployment behavior, are intentionally marked as partially verified until they have stable end-to-end transport or deployment tests.
 
@@ -41,6 +43,7 @@ The core Agent Runtime paths are covered by offline tests with fake LLM clients.
 | Active Run Supervisor | Tracks the current process's durable Run Tasks across HTTP and production background-worker threads/event loops, supports durable-first cross-thread cancellation, Child propagation, safe inspection, and bounded shutdown drain. | Threaded multi-loop, worker, race, Child, subprocess, and shutdown paths tested |
 | Observability | Persists Run traces and Agent/LLM/Tool/checkpoint/interrupt spans, including tokens, TTFT, latency, retries, and Run summaries. | SQLite reload, API, CLI, and crash continuity tested |
 | Agent Evaluation | Runs JSON task datasets through the durable Runtime, applies deterministic scorers, writes JSON reports, and compares functional/performance regressions. | Runner, scorer, report, comparison, and CLI tested |
+| Agentic RL Bridge | Converts durable Agent Runs into validated trajectories, decomposed deterministic reward, and trainer-facing rollouts. A real TRL GRPO/LoRA experiment completed verified model updates but did not improve held-out success (0/30 to 0/30). | Bridge smoke-tested; capability gain not achieved |
 | Permission Policy | Evaluates capability, arguments, workspace scope, and Run context before Tool execution; supports durable per-invocation approval and policy audit spans. | Policy, restart approval, denial, audit, and Evaluation compatibility tested |
 | Execution Isolation | Routes approved Shell calls through Local/Restricted backends with filtered environment, bounded output, timeout, and process-tree cleanup. This is not a complete OS sandbox. | Cross-platform backend, approval, restart, trace, and safety regression tests |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
@@ -77,6 +80,8 @@ Key modules:
 - `src/axiom/snapshot/`: workspace snapshot service.
 - `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, shared ReAct/Plan/Multi-Agent execution strategies, tool execution records, and durable task store.
 - `src/axiom/runtime/supervisor.py`: process-local ExecutionHandle registry and cross-thread cancellation bridge; it is not a recovery database.
+- `src/axiom/rl/`: trajectory construction, deterministic reward, rollout export, and the
+  Agent Lightning v1 compatibility boundary. See [`docs/agentic-rl.md`](docs/agentic-rl.md).
 
 ### Durable execution
 

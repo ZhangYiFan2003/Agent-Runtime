@@ -561,3 +561,50 @@ Supervisor 仅拥有本进程 Task；SSE 主要重放持久事件；Trace/指标
 ### 3 个陷阱
 
 不把内存 Supervisor 当分布式；不把 SSE replay 当 Kafka；不把模型 final 当验证结果。
+
+## 14. Agentic RL Bridge v1
+
+### Q1：你的 Agentic RL 实验效果怎么样？
+
+**第一版没有提升成功率。** Qwen3-0.6B 基线和 TRL GRPO + LoRA 训练后的模型在冻结
+held-out 上都是 0/30。工程训练闭环成功，但模型能力增益没有达成。训练确实执行了 168 个
+rollout 和 42 个 optimizer step，参数指纹发生变化，loss/gradient 有限，保存的 adapter 也能
+重新加载；这些证据不能替代任务成功率。
+
+### Q2：0/30 → 0/30，为什么还说实验有效？
+
+这里要区分 **training effectiveness != capability improvement**。前者回答梯度、optimizer、
+checkpoint 和 Axiom 环境到外部 Trainer 的链路是否真实工作；后者必须看冻结 held-out 的任务
+成功。第一项已经用 optimizer step、有限梯度、参数 fingerprint 变化和 checkpoint reload
+证明，第二项明确失败。因此它是有效的负实验，而不是有效的能力提升。
+
+### Q3：为什么 reward 变高了，成功率还是 0？
+
+shaped reward 含小额工具正确性和效率项。模型学会“一次有结果的 search 后停止”，平均输出
+Token 从 52.30 降到 28.90、步骤从 1.50 降到 1.13，但从未完成 read、综合证据和 submit。
+它优化的是更短的失败，即 **reward shaping shortcut**。这说明 proxy reward 不能替代任务
+成功率；outcome-only reward 仍是 -1.0。
+
+### Q4：为什么 GRPO 没学到正确行为？
+
+不能归因于单一因素。0.6B base policy 可能低于多步仓库导航的能力阈值；基线和全部 168 个
+训练 rollout 都没有成功轨迹；终止验证奖励稀疏；组内没有演示完整
+`search -> inspect -> read -> synthesize -> submit` 行为，credit assignment 很弱；小数据和短
+训练进一步限制探索；效率 shaping 又提供了提前停止的代理目标。这不等于声称“GRPO 在零
+成功样本上数学上不可能学习”。
+
+### Q5：下一版你会怎么改？
+
+优先级是：先获得非零 base competence；必要时用成功轨迹做 SFT warm-up 或用 curriculum
+进入可解区域；严格隔离 repository/feature snapshot；先跑 outcome-only reward 基线；有确定
+证据后才加入 process/efficiency reward；最后才做 RL。不是简单增加 epoch。
+
+### Q6：为什么不继续调参把结果调到正数？
+
+因为在这样的小实验上反复调整 learning rate、reward 或 group size，直到 held-out 变好，会
+变成 hyperparameter fishing。第一版已经回答了工程链路问题，并暴露了更根本的策略能力、
+探索和奖励代理问题。保留负结果比把 held-out 当调参集更可信。
+
+**项目定位：** Axiom 仍是 Agent Runtime。它负责 Run、ToolExecution、trajectory、确定性
+verification 和 reward；Agent Lightning 1.0.1 仅完成 `EventCreate` 兼容烟测，实际训练使用
+TRL GRPO。Agentic RL v1 已冻结，v2 只作为未来工作。

@@ -1,0 +1,3 @@
+# Retry behavior for IrisService.
+iris_retry_limit = 5
+queue_name = "beacon-iris"

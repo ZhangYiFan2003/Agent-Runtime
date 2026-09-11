@@ -1,0 +1,3 @@
+# Retry behavior for VelvetService.
+velvet_retry_limit = 7
+queue_name = "cinder-velvet"

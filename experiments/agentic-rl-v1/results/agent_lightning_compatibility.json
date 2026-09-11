@@ -1,0 +1,26 @@
+{
+  "agent_lightning": "1.0.1",
+  "aggregated_response_mask": [
+    1,
+    0,
+    0,
+    1
+  ],
+  "aggregated_response_token_ids": [
+    20,
+    30,
+    31,
+    21
+  ],
+  "event_types": [
+    "model_request",
+    "model_request",
+    "reward"
+  ],
+  "native_event_class": "EventCreate",
+  "observation_token_count": 2,
+  "passed": true,
+  "policy_token_count": 2,
+  "public_triplet": false,
+  "reward": 1.0
+}

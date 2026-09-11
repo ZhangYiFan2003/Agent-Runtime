@@ -1014,5 +1014,24 @@ Context Retention Eval
 Repeated Evaluation
 Badcase / Regression
 Cost per Success
+RL Trajectory / Reward / Rollout
 ```
+
+## 17. Agentic RL bridge
+
+The Runtime feature freeze remains in effect for ordinary Agent functionality. The deliberately
+opened RL direction is an adapter over existing evidence, not another execution path:
+
+```text
+Run / Checkpoint / ToolExecution / Trace / Verification / Metrics
+    -> AgentTrajectory -> RewardPipeline -> RolloutDataset -> external trainer
+```
+
+One durable Run maps to one episode. Child Runs remain linked sub-episodes. Checkpoint is durable
+environment truth, while an observation is only the projection shown to the model. The bridge
+marks compacted projections as lossy, validates tool/action relationships and terminal state,
+redacts common credential forms, and stores decomposed reward plus safe provenance fingerprints.
+Agent Lightning 1.0.1 compatibility is smoke-tested; the real v1 update used TRL GRPO + LoRA and
+produced no held-out success gain (0/30 to 0/30). See
+[Agentic RL Bridge v1](agentic-rl.md) for schema, trainer selection, claims, and limitations.
 

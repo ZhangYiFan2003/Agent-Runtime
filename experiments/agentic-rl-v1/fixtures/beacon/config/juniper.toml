@@ -1,0 +1,3 @@
+# Retry behavior for JuniperService.
+juniper_retry_limit = 6
+queue_name = "beacon-juniper"

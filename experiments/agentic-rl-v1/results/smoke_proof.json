@@ -1,0 +1,113 @@
+{
+  "checkpoint": "checkpoints/smoke-adapter",
+  "checkpoint_files": [
+    "README.md",
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "chat_template.jinja",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "training_args.bin"
+  ],
+  "checkpoint_reload_succeeded": true,
+  "config": {
+    "algorithm": "GRPO",
+    "beta": 0.0,
+    "dataset_fingerprint": "sha256:ab1eb876518e94834d6b1e0ded64d26e46c02760b4b1466439e8d8e10d2487d6",
+    "eval_num_generations": 2,
+    "eval_temperature": 0.7,
+    "gradient_accumulation_steps": 4,
+    "gradient_checkpointing": true,
+    "learning_rate": 5e-06,
+    "loss_type": "dapo",
+    "max_completion_length": 384,
+    "max_steps": 3,
+    "max_tool_calling_iterations": 4,
+    "model": "Qwen/Qwen3-0.6B",
+    "peft": {
+      "alpha": 16,
+      "dropout": 0.0,
+      "r": 8,
+      "target_modules": [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj"
+      ],
+      "type": "LoRA"
+    },
+    "per_device_train_batch_size": 1,
+    "precision": "bfloat16",
+    "reward_config": "outcome_efficiency",
+    "scale_rewards": "group",
+    "seed": 20260911,
+    "top_p": 0.9,
+    "train_num_generations": 4,
+    "train_temperature": 1.0,
+    "trainer": "TRL"
+  },
+  "final_total_parameters": 598343680,
+  "final_trainable_fingerprint": "sha256:d08616da431a2d4dea3071bb90ee9e68b2fa7556c59903f4a40dc3412d431c8a",
+  "final_trainable_parameters": 2293760,
+  "finite_train_loss": true,
+  "gradient_tensors_checked": 672,
+  "initial_trainable_fingerprint": "sha256:33cd6b0200af9cc1d45ccd85104975631d2bb0e1e7ea19f87d2c8f25095a7911",
+  "nonfinite_gradient_tensors": 0,
+  "optimizer_global_steps": 3,
+  "parameters_changed": true,
+  "peak_allocated_mib": 1499.2,
+  "peak_reserved_mib": 1842.0,
+  "pre_optimizer_callback_steps": 3,
+  "rollouts": {
+    "failure_categories": {
+      "no_submission": 12
+    },
+    "mean_input_tokens": 549.0,
+    "mean_output_tokens": 35.583333333333336,
+    "mean_policy_tokens": 30.833333333333332,
+    "mean_reward": -0.9674999999999999,
+    "mean_steps": 1.25,
+    "mean_tool_attempts": 1.0,
+    "no_progress_count": 12,
+    "reward_ablation": {
+      "outcome_efficiency": -0.9674999999999999,
+      "outcome_only": -1.0
+    },
+    "reward_hacking_checks": {
+      "avoided_all_evidence_tools": 0,
+      "correct_without_required_evidence": 0,
+      "premature_submission": 0
+    },
+    "rollouts": 12,
+    "success_count": 0,
+    "success_rate": 0.0,
+    "unique_tasks": 3,
+    "verified_count": 0,
+    "verified_rate": 0.0
+  },
+  "runtime": {
+    "accelerate": "1.15.0",
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_total_mib": 8187.5,
+    "peft": "0.20.0",
+    "platform": "Windows-11-10.0.22621-SP0",
+    "python": "3.12.13",
+    "torch": "2.14.0+cu130",
+    "torch_cuda_runtime": "13.0",
+    "transformers": "5.17.0",
+    "trl": "1.13.0"
+  },
+  "stage": "smoke",
+  "total_parameters": 598343680,
+  "train_loss": 0.09222350517908733,
+  "train_metrics": {
+    "epoch": 1.0,
+    "total_flos": 0.0,
+    "train_loss": 0.09222350517908733,
+    "train_runtime": 9.7449,
+    "train_samples_per_second": 1.231,
+    "train_steps_per_second": 0.308
+  },
+  "trainable_parameters": 2293760
+}

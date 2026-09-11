@@ -1,0 +1,37 @@
+{
+  "algorithm": "GRPO",
+  "base_model": "Qwen/Qwen3-0.6B",
+  "beta": 0.0,
+  "dataset_fingerprint": "sha256:ab1eb876518e94834d6b1e0ded64d26e46c02760b4b1466439e8d8e10d2487d6",
+  "eval": {
+    "heldout_tasks": 15,
+    "max_completion_length": 384,
+    "max_tool_calling_iterations": 4,
+    "num_generations": 2,
+    "seed": 20260911,
+    "temperature": 0.7,
+    "top_p": 0.9
+  },
+  "gradient_accumulation_steps": 4,
+  "gradient_checkpointing": true,
+  "learning_rate": 5e-06,
+  "lora": {
+    "alpha": 16,
+    "dropout": 0.0,
+    "r": 8,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]
+  },
+  "loss_type": "dapo",
+  "precision": "bfloat16",
+  "reward_config": "outcome_efficiency",
+  "scale_rewards": "group",
+  "train": {
+    "epochs": 1,
+    "max_steps": 42,
+    "num_generations": 4,
+    "per_device_batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 0.9
+  },
+  "trainer": "TRL 1.13.0"
+}

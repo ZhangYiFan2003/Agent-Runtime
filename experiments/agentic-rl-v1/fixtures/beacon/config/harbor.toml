@@ -1,0 +1,3 @@
+# Retry behavior for HarborService.
+harbor_retry_limit = 4
+queue_name = "beacon-harbor"

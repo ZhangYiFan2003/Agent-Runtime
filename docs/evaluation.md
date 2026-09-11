@@ -374,6 +374,18 @@ judge, automatic prompt rewriting, or automatic dataset promotion.
 - Hidden transport-layer retries below the observable LLM client cannot be counted separately;
   Runtime-owned retries are counted. Pricing is local configuration and is never fetched live.
 
+## Evaluation reuse for RL rollout
+
+Evaluation and RL rollout share execution infrastructure but not purpose or lifecycle. Evaluation
+compares quality and gates regressions. `RLRolloutRunner` reuses the same reviewed
+`EvaluationDataset`, repeated trials, durable Run evidence, completion verifier, and scorers to
+collect policy interaction trajectories with reward. It then exports validated JSONL rather than
+an `EvaluationSuiteResult` report.
+
+Badcases are never converted automatically. Training splits and reward configuration are explicit
+provenance, and a held-out split remains marked in every episode. See
+[Agentic RL Bridge v1](agentic-rl.md).
+
 ## Evidence benchmarks
 
 The maintained evidence pack lives under `benchmarks/`: repository-grounded

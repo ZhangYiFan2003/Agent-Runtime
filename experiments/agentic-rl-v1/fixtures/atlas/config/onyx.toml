@@ -1,0 +1,3 @@
+# Retry behavior for OnyxService.
+onyx_retry_limit = 7
+queue_name = "atlas-onyx"

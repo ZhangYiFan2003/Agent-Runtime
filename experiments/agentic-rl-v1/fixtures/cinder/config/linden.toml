@@ -1,0 +1,3 @@
+# Retry behavior for LindenService.
+linden_retry_limit = 3
+queue_name = "cinder-linden"

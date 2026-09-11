@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "dev": 12,
+    "heldout": 15,
+    "train": 42
+  },
+  "dataset_fingerprint": "sha256:ab1eb876518e94834d6b1e0ded64d26e46c02760b4b1466439e8d8e10d2487d6",
+  "name": "agentic-rl-experiment-v1",
+  "schema_version": 1,
+  "snapshot_fingerprints": {
+    "atlas": "sha256:39f7a2a85b6d22d35fa2e46157ca59da494223648034a3c529b256f3b037d209",
+    "beacon": "sha256:d0ae60e1a7bebd05e37f8342cd80e790f1306afb39260d9bf77daeb22740be1a",
+    "cinder": "sha256:611156a1d782d794ded51ec10b1657cb813f9b1ddeb2280caf2f62038de58e78"
+  },
+  "split_unit": "feature",
+  "task_kinds": [
+    "definition",
+    "config",
+    "test"
+  ]
+}

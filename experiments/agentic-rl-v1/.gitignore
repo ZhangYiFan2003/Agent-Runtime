@@ -1,0 +1,9 @@
+checkpoints/
+cache/
+*.pt
+*.bin
+*.safetensors
+results/*_trajectories.jsonl
+results/*_pre_reward_fix*
+results/*_rescore_env_bug*
+results/pilot_invalid_path_*

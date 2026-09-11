@@ -1,0 +1,3 @@
+# Retry behavior for TimberService.
+timber_retry_limit = 8
+queue_name = "beacon-timber"
