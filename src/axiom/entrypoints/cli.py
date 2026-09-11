@@ -35,6 +35,7 @@ from axiom.evaluation import (
 )
 from axiom.llm import create_llm_client
 from axiom.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
+from axiom.rl import RewardConfig, RewardPipeline, RLRolloutRunner, RolloutDataset
 from axiom.runtime import (
     ObservabilityService,
     RuntimeApiServer,
@@ -53,10 +54,12 @@ app = typer.Typer(
 mcp_app = typer.Typer(help="MCP server management")
 runs_app = typer.Typer(help="Inspect persisted Runtime runs")
 eval_app = typer.Typer(help="Run and compare Agent evaluation datasets")
+rl_app = typer.Typer(help="Collect RL trajectories from the durable Runtime")
 badcase_app = typer.Typer(help="Collect, review, and promote evaluation badcases")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(runs_app, name="runs")
 app.add_typer(eval_app, name="eval")
+app.add_typer(rl_app, name="rl")
 eval_app.add_typer(badcase_app, name="badcase")
 console = Console()
 
@@ -223,6 +226,51 @@ def eval_run(
     if output is not None:
         target = save_result(result, output)
         typer.echo(f"Result: {target}")
+
+
+@rl_app.command("export")
+def rl_export(
+    dataset: Annotated[Path, typer.Argument(help="Evaluation dataset JSON file")],
+    output: Annotated[Path, typer.Option("--output", help="Trajectory JSONL output")],
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Agent working directory")] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Runtime data directory"),
+    ] = None,
+    trials: Annotated[
+        int,
+        typer.Option("--trials", min=1, help="Independent executions per case"),
+    ] = 1,
+    split: Annotated[str, typer.Option(help="Dataset split provenance")] = "train",
+    reward_config: Annotated[
+        Path | None,
+        typer.Option("--reward-config", help="Optional RewardConfig JSON object"),
+    ] = None,
+) -> None:
+    root = (cwd or Path.cwd()).resolve()
+    try:
+        reward = RewardConfig()
+        if reward_config is not None:
+            raw_reward = json.loads(reward_config.read_text(encoding="utf-8"))
+            if not isinstance(raw_reward, dict):
+                raise ValueError("reward configuration must be a JSON object")
+            reward = RewardConfig(**raw_reward)
+        rollout = asyncio.run(
+            _execute_rl_dataset(
+                dataset,
+                cwd=root,
+                data_dir=data_dir,
+                trials=trials,
+                split=split,
+                reward_pipeline=RewardPipeline(reward),
+            )
+        )
+        rollout.export_jsonl(output)
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        typer.echo(f"RL rollout export failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(rollout.summary(), ensure_ascii=False, indent=2))
+    typer.echo(f"Trajectories: {output.resolve()}")
 
 
 @eval_app.command("compare")
@@ -547,6 +595,52 @@ async def _execute_evaluation_dataset(
         observability_store=SQLiteObservabilityStore(database),
     )
     return await EvaluationRunner(executor).run(dataset, trials=trials)
+
+
+async def _execute_rl_dataset(
+    dataset_path: Path,
+    *,
+    cwd: Path,
+    data_dir: Path | None,
+    trials: int,
+    split: str,
+    reward_pipeline: RewardPipeline,
+) -> RolloutDataset:
+    dataset = load_dataset(dataset_path)
+    config = load_config(project_root=cwd)
+    config.render_mode = "plain"
+    if not config.llm.api_key:
+        raise ValueError("AXIOM_API_KEY is not configured")
+    registry, manager = await build_tool_registry(config=config, cwd=str(cwd))
+    if manager and manager.last_errors:
+        for name, error in manager.last_errors.items():
+            typer.echo(f"MCP server {name} failed to load: {error}", err=True)
+    llm_client = create_llm_client(config.llm)
+
+    def engine_factory(_case):
+        return QueryEngine(
+            llm_client=llm_client,
+            tool_registry=registry,
+            config=config,
+            cwd=str(cwd),
+        )
+
+    database = _runtime_db(data_dir)
+    runtime_store = SQLiteCheckpointStore(database)
+    observability_store = SQLiteObservabilityStore(database)
+    evaluator = EvaluationRunner(
+        DurableEvaluationExecutor(
+            engine_factory=engine_factory,
+            checkpoint_store=runtime_store,
+            observability_store=observability_store,
+        )
+    )
+    return await RLRolloutRunner(
+        evaluator,
+        runtime_store=runtime_store,
+        observability_store=observability_store,
+        reward_pipeline=reward_pipeline,
+    ).collect(dataset, trials=trials, split=split)
 
 
 def _version_of(command: str) -> str:
