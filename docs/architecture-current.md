@@ -18,7 +18,10 @@ Core runtime choices:
 - Terminal UI: Rich and prompt-toolkit.
 - HTTP client: httpx.
 - MCP integration: the official `mcp` Python SDK.
-- Local persistence: SQLite files under user-level Axiom Agent Runtime state directories.
+- Durable Runtime persistence: SQLite by default for local/single-node use, with an optional
+  PostgreSQL shared-store backend (`psycopg` + bounded pool) for cross-process durable truth.
+  SQLite is locally verified; the PostgreSQL implementation and contract tests exist, but the
+  real-database integration gate has not yet run in the current task environment.
 
 The default LLM provider is `deepseek`, the default model is
 `deepseek-v4-flash`, and the default provider base URL is
@@ -229,9 +232,34 @@ flowchart TD
   - Defines the async-compatible checkpoint/tool execution store protocols and
     Memory/SQLite implementations. SQLite appends checkpoint sequences and uses
     optimistic sequence checks to reject stale workers.
+- `src/axiom/runtime/events.py`
+  - Defines the thread/event repository contract, event envelope, and backward-compatible
+    SQLite event implementation with monotonic replay IDs.
+- `src/axiom/runtime/storage.py`
+  - Selects one coherent durable backend bundle for Run/Checkpoint, ToolExecution, budget
+    ledger, Event, and control-idempotency truth. SQLite remains the default.
+- `src/axiom/runtime/postgres.py`
+  - Implements the optional shared PostgreSQL backend with a bounded synchronous connection
+    pool. Existing Runtime async methods keep using bounded thread offload rather than forcing
+    an async database rewrite.
+  - Stores a current `runs` head plus append-only `checkpoints`. Head advancement is one
+    `UPDATE ... WHERE run_id = ... AND current_sequence = expected RETURNING ...`; the matching
+    history insert commits in the same short transaction. Initial creation uses
+    `INSERT ... ON CONFLICT DO NOTHING RETURNING ...`.
+  - Uses `JSONB` for domain payloads, `TIMESTAMPTZ` for persistent deadlines/timestamps,
+    identity-backed `BIGINT` Event IDs, and database uniqueness for `ToolExecution.invocation_id`.
+    Event IDs are monotonic for replay but are intentionally not gapless.
+  - Transaction boundaries remain narrow: Run head CAS and its Checkpoint history row are atomic;
+    each ToolExecution mutation, budget-ledger CAS, Event append, and control transition is atomic
+    within its own repository call. Checkpoints and Events intentionally do not form one giant
+    event-sourcing transaction because recovery state and replay history have different roles.
+  - Schema metadata rejects an incompatible future Runtime schema. The PostgreSQL driver is an
+    optional dependency, and configured credentials are neither returned by public config nor
+    copied into Trace/Event metadata.
 - `src/axiom/runtime/control_plane.py`
   - Defines the stable public Run projection, allowed control operations, structured
-    API errors, child/interrupt summaries, and restart-safe SQLite idempotency records.
+    API errors, child/interrupt summaries, a control-store contract, and restart-safe
+    idempotency records.
 - `src/axiom/runtime/durable.py`
   - Advances the default ReAct loop across LLM and per-tool durable boundaries,
   persists approval interrupts, resumes after restart, applies deadline-aware bounded retry,
@@ -827,9 +855,10 @@ A provider `Retry-After` value is respected when the surfaced exception exposes 
 sleep sources are injectable for deterministic tests.
 
 Tool attempts retain one logical `invocation_id`. `ToolExecutionRecord` persists attempt count,
-last failure category/error code, cumulative backoff, pending retry time, exhaustion, and unsafe
-suppression. An ambiguous unsafe transport failure is `UNKNOWN`, not falsely asserted as failed. A
-restart therefore does not reset the allowance, and a persisted successful result is
+last failure category/error code, cumulative backoff, UTC pending-retry deadline, suppression
+reason, and an explicit `NONE / RETRY_PENDING / RETRY_SUPPRESSED / RETRY_EXHAUSTED` state. An
+ambiguous unsafe transport failure is `UNKNOWN`, not falsely asserted as failed. A restart
+therefore does not reset the allowance or erase a conservative stop, and a persisted successful result is
 still reused without execution or budget charge. Each real model/Tool attempt consumes the normal
 model-call/Tool-call ledger unit. Partial provider usage is retained when reported; unknown usage is
 not invented.
@@ -923,9 +952,10 @@ environment overrides follow normal config precedence; inconsistent bounds are r
 - Project/user configuration can contain secrets; architecture tools and reports
   should treat these files as sensitive and avoid reading their contents unless
   explicitly requested.
-- Runtime API persistence is local SQLite and bound to localhost; it is not a
-  distributed service, public deployment validation, load-tested API, or
-  distributed queue.
+- Runtime API durable truth can use local SQLite or shared PostgreSQL. The HTTP server remains
+  bound to localhost by default and is not a distributed scheduler, public deployment
+  validation, load-tested API, or distributed queue. PostgreSQL unavailability fails visibly;
+  it never silently falls back to SQLite and splits truth.
 - The durable Runtime covers ReAct plus bounded local Plan DAG and Multi-Agent scheduling.
   Plan Tasks and tool-capable Multi-Agent Workers use stable React Child Runs; Parent state is
   checkpointed with stable lineage and CAS-safe terminal reconciliation. There is no distributed
@@ -934,6 +964,10 @@ environment overrides follow normal config precedence; inconsistent bounds are r
   every handle; a persisted `RUNNING` Run can therefore have no active owner until a client
   explicitly resumes it. There is no startup recovery scanner, lease, heartbeat, fencing token,
   cross-process cancellation, or automatic abandoned-Run takeover.
+- Parent cancellation is the durable authority. Cancellation persists the Parent first and then
+  best-effort cancels non-terminal descendants. If a crash lands between those steps, explicit
+  Child resume/execution preflight walks durable ancestors and reconciles the Child to `CANCELLED`;
+  completed Children remain completed. This is targeted reconciliation, not a background scanner.
 - Runtime tool records provide best-effort deduplication after a persisted
   success, not exactly-once semantics for arbitrary external side effects.
 - Observability is local and unsampled. There is no distributed trace context,
@@ -950,8 +984,9 @@ environment overrides follow normal config precedence; inconsistent bounds are r
 
 ## 14. Final control precedence and failure matrix
 
-The controls are layered rather than interchangeable. Explicit cancellation is authoritative and
-`CancelledError` is never converted into a dependency failure. Hard Run/tree budget checks,
+The controls are layered rather than interchangeable. Explicit cancellation is authoritative.
+Cancellation of an unsafe in-flight Tool leaves `UNKNOWN` Tool evidence with retry suppression,
+because stopping the local Task cannot prove that an external effect did not occur. Hard Run/tree budget checks,
 including the wall-time lifetime, stop work before dependency retry policy is considered. Each
 dependency attempt is then bounded by the smaller of its configured timeout and the remaining
 local/root Run lifetime. A safe transient failure may retry only while both attempt allowance and
@@ -969,7 +1004,7 @@ to the same budgeted loop. Context hard-limit failure occurs before a provider r
 | Context hard limit exceeded | Fail before the provider request | Checkpoint/Run error and context attributes | No | `CONTEXT_BUDGET_EXCEEDED` |
 | Repeated no-progress | Emit one bounded recovery signal, then stop if stagnation continues | Checkpoint progress state and Trace | Not a dependency retry | `NO_PROGRESS` |
 | Completion check fails | ReAct may receive one configured corrective turn; orchestration terminal checks are one-shot | Contract/result/attempt in Checkpoint and verification Trace | Only normal budgeted continuation | Verified completion or `COMPLETION_NOT_VERIFIED` |
-| Explicit cancel | Signal the process-local owner and converge durable state | Checkpoint and control/Trace events | No | `CANCELLED` |
+| Explicit cancel | Persist durable control, then signal the process-local owner; descendant resume reconciles cancelled ancestors | Checkpoint, ToolExecution, and control/Trace events | No | `CANCELLED`; unsafe in-flight Tool evidence may remain `UNKNOWN` |
 
 The retry metrics distinguish one logical model/Tool operation from its actual provider/Tool
 attempts. Model-call and Tool-call budget counters count actual attempts; retry counters count only
@@ -980,8 +1015,11 @@ attempts after the first. A restored `SUCCEEDED` Tool execution is reuse, not an
 The core Runtime capability set is now frozen. Future work should prioritize interview
 preparation, source-code review, real-workload evaluation, bug fixes, and evidence-driven
 hardening. New Runtime subsystems should be added only when a concrete requirement demonstrates a
-gap. Shared circuit breakers, global rate limiting, queues/backpressure, distributed ownership,
-and new Agent/Memory architectures remain explicit future decisions rather than implied features.
+gap. A shared PostgreSQL durable store is now implemented, but an automatic Recovery Scanner,
+distributed Worker ownership, lease/heartbeat/fencing, Durable Run Queue, global Admission Control,
+backpressure, task-level DLQ,
+shared circuit breakers, and global rate limiting remain explicit future decisions rather than
+implied features.
 
 ## 16. Final interview mental model
 

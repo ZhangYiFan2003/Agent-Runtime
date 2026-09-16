@@ -4,7 +4,9 @@
 
 ## 0. 简历原句
 
-> 基于 SQLite 持久化 Thread / Turn / Event、Run / Checkpoint 与 ToolExecution，在 LLM / Tool / interrupt 边界保存状态，支持 ReAct Run 进程重启恢复并通过稳定 invocation ID 复用已完成 Tool 结果，结合 Map-Reduce 摘要与 Token Budget 管理长上下文。
+> 基于 SQLite 持久化 Run / Checkpoint 与工具执行记录，在模型调用与工具执行边界保存状态；通过 CAS 避免并发冲突，并记录工具调用标识防止重复执行，结合执行次数与超时限制支持断点恢复与幂等重试；通过 40 个故障注入场景验证中断后的状态恢复能力。
+
+> **源码审计后的安全口径：** “记录工具调用标识防止重复执行”只对已经持久化为 `SUCCEEDED` 的同一逻辑调用成立；“幂等重试”依赖只读语义或下游幂等契约。SQLite 现在持久化显式 retry state、attempt、失败分类、suppression reason、UTC `next_retry_at` 和累计 backoff，因此 unsafe `UNKNOWN` 的保守停止可跨重启保持；它仍不等于外部副作用 exactly-once。故障注入数字必须按 runner 的命名场景数、重复执行数、recovered、expected-safe-stop 和 failed 分开报告，不能把执行次数写成独立场景数。
 
 ## 1. 这条经历解决了什么问题
 
@@ -16,15 +18,15 @@ Agent 任务比普通 HTTP 请求更长，也更有状态。一次任务可能�
 
 我把 durable Run 看成一个持久化状态机。Runtime 在 LLM、Tool、interrupt 等关键边界保存带版本号的 Checkpoint，并用 CAS 拒绝旧版本覆盖新状态；Tool 调用使用稳定 invocation ID，成功结果写入 ToolExecution，恢复时相同调用可直接复用。
 
-长上下文由 ContextManager 在每次模型调用前重新估算：保留系统协议、当前目标、近期原始消息和结构化任务状态，对较早内容做摘要，对过大的历史 Tool 输出做投影，并在硬上限前 fail closed。RunBudget 同时限制步骤、模型/工具调用、Token、时间和成本；ProgressDetector 检查重复动作、重复错误、短循环和状态停滞。当前保证的是本地 SQLite 上的恢复和治理，不是外部写操作的 exactly-once，也不是分布式 Worker 接管。
+长上下文由 ContextManager 在每次模型调用前重新估算：保留系统协议、当前目标、近期原始消息和结构化任务状态，对较早内容做摘要，对过大的历史 Tool 输出做投影，并在硬上限前 fail closed。RunBudget 同时限制步骤、模型/工具调用、Token、时间和成本；ProgressDetector 检查重复动作、重复错误、短循环和状态停滞。当前 durable truth 可选本地 SQLite 或共享 PostgreSQL，但共享存储不等于分布式 Worker 接管，也不提供外部写 exactly-once。
 
 ## 3. 2～3 分钟完整故事
 
 我先把会话和执行状态分开。Thread/Turn/Event 是用户交互与事件历史；Run/Checkpoint 是可恢复执行状态；ToolExecution 是外部调用账本。这样 SSE 重放、对话恢复和 Agent 执行恢复不会混成一个表，也能分别定义一致性边界。
 
-每个 Checkpoint 有版本号。保存时使用 compare-and-swap（CAS，比较并交换）：只有数据库中的版本等于调用方预期版本，才允许写入新版本。SQLite 实现用事务和 `BEGIN IMMEDIATE` 限制写竞争。它能拒绝过期执行者的旧状态，但在单进程内还配合 Run 锁；到了多进程，还要新增租约和 fencing token，CAS 本身不等于所有权。
+每个 Checkpoint 有版本号。保存时使用 compare-and-swap（CAS，比较并交换）：只有数据库中的版本等于调用方预期版本，才允许写入新版本。SQLite 用 `BEGIN IMMEDIATE` 比较最新 sequence 后追加版本；PostgreSQL 用单条 `UPDATE runs ... WHERE current_sequence = expected RETURNING` 原子推进 head，并在同一短事务追加 Checkpoint 历史。两种实现都能拒绝 stale write，但 CAS 本身不等于持续执行所有权；多 Worker 仍需 lease 和 fencing token。
 
-Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool call 身份派生，并保存参数哈希。若记录已是 `SUCCEEDED`，恢复时可以复用结果；若进程在 Tool 外部副作用成功后、写成功记录前崩溃，数据库里可能仍是 `RUNNING`，此时结果未知。读操作或带幂等键的 Tool 可以安全重试，其他写操作需要查询服务端状态、人工处理或补偿。
+Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool call 身份派生，并保存参数哈希。若记录已是 `SUCCEEDED`，恢复时可以复用结果；若进程在 Tool 外部副作用成功后、写成功记录前崩溃，数据库里可能仍是 `RUNNING`，此时结果未知。已分类的 unsafe timeout 会持久化为 `UNKNOWN + RETRY_SUPPRESSED`，重启不会重新执行；读操作或带下游幂等契约的 Tool 才适合按剩余 attempt 和 UTC backoff deadline 自动重试。这里说“Tool 结果成功持久化”，不要把它叫成 Kafka/Redis Streams 的消息 ACK。
 
 上下文管理不是简单“超过长度就 summary”。ContextManager 先组成消息单元，保护 tool_call/tool_result 配对与最新用户目标，复用已有结构化摘要，将历史超大 Tool 输出投影为名称、状态和裁剪内容。达到高水位才压缩到目标区间；若固定内容本身超过硬上限，在调用 LLM 之前就失败。Map-Reduce 摘要也用于长会话记忆，但执行态摘要和长期事实不能混为一谈。
 
@@ -33,23 +35,37 @@ Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool c
 ## 4. 架构与调用链
 
 ```text
-Thread → Turn → Event（交互与重放）
-                 │
-                 ↓
-Run → versioned Checkpoint ← CAS
- │       │      │
- │       │      └─ strategy/context/progress/budget state
- │       └─ LLM / Tool / interrupt 边界保存
- └─ ToolExecution(invocation_id, args_hash, status, result)
-
-每次 LLM 前：加载状态 → ContextManager 投影 → Budget 预检
-执行后：实际用量核销 → ProgressDetector → 保存新 Checkpoint
+                    Durable truth
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+       Run          Checkpoint      ToolExecution
+        │                │                │
+        └──── Durable Store contracts ────┘
+                    │            │
+             SQLite(default)  PostgreSQL(shared)
+                         │ restart
+                         ▼
+                reconstruct execution
+                         │
+                         ▼
+               process-local execution
+                         │
+                 asyncio Task / loop
+                         │
+                         ▼
+               ActiveRunSupervisor
 ```
+
+必须反复强调：**shared durable state != live process ownership**。SQLite 或 PostgreSQL 里的状态能让进程重建执行；`asyncio.Task` 和 `ActiveRunSupervisor` 只代表当前进程里谁正在跑。PostgreSQL 让多个进程看到同一真相，但不能阻止它们同时决定执行；当前没有 lease、heartbeat、fencing 或自动接管。
 
 ## 5. 最新源码实现
 
 - `src/axiom/runtime/models.py`：`RunStatus`、`Checkpoint`、`ToolExecutionRecord`、`BudgetLedgerRecord`。
 - `src/axiom/runtime/checkpoints.py`：Memory/SQLite store、Checkpoint CAS、ToolExecution 和版本化 budget ledger；SQLite 开 WAL、`busy_timeout=30s`。
+- `src/axiom/runtime/storage.py`：把 RuntimeStore、EventRepository 和 ControlOperationStore 组合成同一 backend，默认 SQLite，配置 PostgreSQL 时不静默降级。
+- `src/axiom/runtime/postgres.py`：psycopg 3 bounded pool、PostgreSQL schema/version、Run head CAS、Checkpoint history、ToolExecution、budget ledger、Event 与 control idempotency。
+- `src/axiom/runtime/events.py`：EventRepository contract 与 SQLite event backend；PostgreSQL Event ID 使用 identity/BIGINT，保证 replay 顺序但不追求无空洞。
 - `src/axiom/runtime/durable.py`：`start/resume/interrupt/cancel`、LLM/Tool 边界、稳定 invocation、恢复和错误状态。
 - `src/axiom/context.py`：`ContextBudgetPolicy`、`RuntimeContextSummary`、`ContextManager`、Tool 投影和硬上限。
 - `src/axiom/runtime/budget.py`：策略、Decimal 定价、预留/核销、root Run 聚合。
@@ -96,9 +112,28 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
   外层 wall deadline 优先。
 - 价格表未知：成本可用性标记为 unknown，不能把未知成本当 0。
 
-## 9. 分级面试题库（22 题）
+### 8.1 Crash-window matrix
 
-### P0 — 简历直击题（10 题）
+| 崩溃点 | 当前 durable evidence | 当前恢复行为 | 风险/边界 |
+| --- | --- | --- | --- |
+| Tool 开始前 | 没有成功记录；可能只有 pending Checkpoint | 正常执行该逻辑调用 | 低，但仍受权限/预算约束 |
+| `ToolExecution=RUNNING` 已保存、Tool 尚未真正执行 | `RUNNING` | 只读/显式幂等调用可重试；普通写进入歧义处理 | 本地无法证明远端没执行 |
+| 远端 Tool 成功、本地 `SUCCEEDED` 未保存 | 若进程直接崩溃，通常仍是 `RUNNING` | 不安全写等待显式 recovery decision | 重复副作用风险最高 |
+| timeout 被分类为 `UNKNOWN` 并抑制 unsafe retry，随后在父 Checkpoint 前崩溃 | SQLite 有 `UNKNOWN/attempt/category/retry_state/suppression` | 重载后复用错误证据，不自动执行 Tool | 外部结果仍未知；需要 status query、幂等证据、人工或补偿 |
+| `ToolExecution=SUCCEEDED` 已保存、父 Checkpoint 未推进 | 成功结果和参数哈希存在 | 同一 invocation 复用结果，再推进 Checkpoint | 避免再次收费/再次调用 |
+| 父 Checkpoint 已保存 | 完整可恢复状态 | 从最新 sequence 继续 | 正常恢复路径 |
+| LLM 请求已发出、响应未写 Checkpoint | 只有上一个语义边界 | 可能重放模型请求 | 重复成本；不能凭空还原响应 |
+| Parent `CANCELLED` 已保存、Child cancel 尚未完成 | Parent 已终止，Child 可能仍非终态 | 显式 Child resume/执行 preflight 检查全部 durable ancestors，并把非终态 Child 收敛为 `CANCELLED` | 没有自动后台 Recovery Scanner；无人 resume 时不会主动扫描 |
+
+边界 checkpointing 只是把窗口变清楚、变小，不会消灭所有窗口。尤其是 SQLite 与外部系统之间没有共同事务，不能用“Checkpoint 可以恢复”概括所有情况。
+
+### 8.2 故障注入证据到底是多少
+
+不要背固定数字。运行 `benchmarks/recovery/scenarios.json` 对应 runner 后，分别报告命名场景数、重复次数形成的 execution count、`recovered`、`expected-safe-stop` 和 `failed`。本轮 Durable Semantics Closure 的 pytest 矩阵单独覆盖 retry pending/attempt/backoff/exhaustion/UNKNOWN、成功复用、取消/deadline，以及 Parent/Child crash window、显式 resume、CAS race、完成 Child 和 live cancellation；它不应被包装成旧 runner 的新 baseline。
+
+## 9. 分级面试题库（28 题）
+
+### P0 — 简历直击题（16 题）
 
 #### P0-1｜“为什么分 Thread、Turn、Event、Run、Checkpoint 这么多对象？”
 
@@ -198,13 +233,13 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 
 #### P0-7｜“进程在 retry 第二次后挂了，恢复会不会从零开始？”
 
-**先给结论：** Tool retry 不会。一次逻辑调用沿用稳定 `invocation_id`；`ToolExecutionRecord` 持久化 attempt、最后失败类别、累计 backoff、`next_retry_at` 和 exhausted/suppressed 状态。
+**先给结论：** SQLite 路径不会把 attempt 重置为 0：同一逻辑调用沿用稳定 `invocation_id`，表中持久化 attempt、失败分类、显式 retry state、suppression reason、UTC `next_retry_at` 和累计 backoff。第二次后 crash，恢复最多只剩第三次机会。
 
-**60～120 秒完整口语答案：** 每次真实 Tool attempt 之前先在预算账本消费 Tool call，再把递增后的 attempt 与 RUNNING 状态落库。暂态失败后，Runtime 持久化失败类别和下一次允许重试时间，再进入可取消 backoff。若进程在等待期间退出，恢复读取同一 ToolExecution，等待尚未结束的剩余时间，然后从下一个 attempt 继续；若额度已用完则复用结构化失败，不会偷偷再执行。已经 `SUCCEEDED` 的结果仍直接复用且不重复收费。LLM 请求也会逐次计入 model-call 与可观测 Span，但供应商未报告的崩溃窗口 usage 无法凭空恢复，这是当前限制。
+**60～120 秒完整口语答案：** 每次真实 Tool attempt 之前先在预算账本消费 Tool call，再把递增后的 attempt 与 RUNNING 状态落库。暂态失败会把 `RETRY_PENDING` 和 UTC deadline 一起保存；重启前 deadline 未到就继续等待，到期才消费下一次 attempt。`RETRY_EXHAUSTED` 和 `RETRY_SUPPRESSED` 都是终止型 durable decision；unsafe timeout 的 `UNKNOWN + RETRY_SUPPRESSED` 不会在 restart 后重新执行。`SUCCEEDED` 结果复用仍然不收费、不重跑。
 
 **第一轮追问：** “父 Run 只剩两秒怎么办？”——先算 root/local 剩余 wall time；若 backoff 或下一 attempt 放不下，就不再 retry，外层 deadline 优先。
 
-**第二轮追问：** “取消时正在 sleep？”——backoff 使用可取消的 async wait，`CancelledError` 不被吞掉，也不会伪装成 `DEPENDENCY_RETRY_EXHAUSTED`。
+**第二轮追问：** “取消时正在 sleep？”——backoff 使用可取消的 async wait；Run 的 durable `CANCELLED` 优先于 pending retry。若整个进程死亡，恢复按 UTC `next_retry_at` 重算剩余等待，不复用跨进程无意义的 monotonic 值。
 
 #### P0-8｜“at-least-once、at-most-once、exactly-once 放到 Tool 上怎么理解？”
 
@@ -249,6 +284,106 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 **常见坑：** “Map-Reduce 能无损压缩”；直接截字符串；把 durable Tool evidence 从持久层删除。
 
 **项目证据：** `src/axiom/memory/summarizer.py`、`src/axiom/context.py`、context tests。
+
+#### P0-11｜“Run 到底有哪些状态？从 RUNNING 到 COMPLETED 谁决定？”
+
+**面试官想看什么：** 状态是否来自源码；终止提议与状态提交是否分开；非法转换怎样处理。
+
+**先说结论：** 当前 `RunStatus` 是 `RUNNING / INTERRUPTED / WAITING_APPROVAL / WAITING_CHILD / COMPLETED / FAILED / CANCELLED`，没有持久化 `PENDING`。新 Checkpoint 直接从 `RUNNING` 开始；执行策略提出完成后，Runtime 还可能经过 Completion Verification，最后由版本化 Checkpoint 提交终态。
+
+**60～120 秒完整口语答案：** “我会把状态机和协程分开讲。Run 一创建就是 `RUNNING`，遇到人工暂停是 `INTERRUPTED`，敏感 Tool 等批准是 `WAITING_APPROVAL`，父 Run 等 Child 是 `WAITING_CHILD`；`COMPLETED/FAILED/CANCELLED` 是终态。模型说 final 只是终止提议，如果配置了 Completion Contract，还要验证通过才提交 `COMPLETED`。API 先用 `allowed_operations` 做转换校验，Runtime 再用 sequence CAS 防旧状态覆盖新状态；所以最终依据是 durable transition，不是某个 Task 内存里的布尔值。”
+
+**追问 1：resume 一个 COMPLETED Run？**
+
+- **为什么问：** 看终态是否可逆。
+- **30～60 秒回答：** “拒绝，API 返回 `invalid_run_transition`。`FAILED` 和 `CANCELLED` 也不能 resume；当前没有把 retry-failed-run 设计成原 Run 复活。”
+
+**追问 2：cancel 一个 CANCELLED Run？**
+
+- **为什么问：** 看控制幂等。
+- **30～60 秒回答：** “Runtime 直接返回现有 CANCELLED，API 也允许 cancel；同 idempotency key 会重放原结果，不会再次执行取消副作用。”
+
+**当前边界：** 状态校验与 CAS 已实现；没有通用外部工作流引擎，也没有 `PENDING/CANCELLING` 中间态。
+
+#### P0-12｜“Checkpoint 为什么选语义边界，而不是每 token 或每 N 秒？”
+
+**面试官想看什么：** 写放大、恢复价值和外部副作用窗口的真实取舍。
+
+**先说结论：** 每 token 写入成本高且保存的是难以重放的半语义状态；固定定时器可能截在无意义中间态，也仍解决不了远端 Tool 歧义。LLM、Tool、interrupt、retry 等边界上的状态可重建、频率有界、恢复语义更容易解释。
+
+**60～120 秒完整口语答案：** “每个 token checkpoint 会产生严重 write amplification 和存储量，而且半条 assistant message 通常不能从中间安全续写；定时 snapshot 看似均匀，但可能正好截在 JSON 参数、并发聚合或远端写操作中间，还需要和状态更新协调。语义边界的价值是：请求前后、Tool 状态、人工等待和终态都能定义下一步。但我不会说它消灭 crash window。LLM 响应返回后落盘前仍可能重请求；远端写成功、本地 `SUCCEEDED` 前仍是 unknown。”
+
+**追问 1：那 checkpoint 越少越好吗？**
+
+- **为什么问：** 看是否只会讲写放大。
+- **30～60 秒回答：** “也不是。边界太稀会放大重做和成本，还可能重复副作用。选择标准是恢复价值，不是固定频率：昂贵请求、外部效果和控制状态最值得提交。”
+
+**当前边界：** 当前源码在 Run start、LLM success/failure/retry、Tool result、interrupt/resume/cancel 等操作保存；没有增量 token checkpoint。
+
+#### P0-13｜“你是不是通过 invocation ID 实现了 exactly-once Tool execution？”
+
+**面试官想看什么：** 能否明确说 No，并区分身份、结果复用和下游幂等。
+
+**先说结论：** No。稳定 invocation ID 只提供 logical invocation identity；`SUCCEEDED` 记录提供 Runtime-side completed-result reuse；只有下游接受幂等键、原子去重并可查询状态时，才能进一步约束重复业务效果。
+
+**60～120 秒完整口语答案：** “Runtime 能保证的是：同一个 `run_id + tool_call_id` 得到稳定 invocation ID，同 ID 还要匹配参数哈希；如果 `SUCCEEDED` 已经持久化，恢复直接复用结果，不再调用 Tool。但是远端写成功以后、本地成功记录还没落盘就挂了，恢复只看到 `RUNNING`，结果是 UNKNOWN。invocation ID 不会自动跑到下游，也不会让两个系统原子提交，所以不能宣称 exactly-once side effect。”
+
+**追问 1：Tool 成功但 ACK 丢了？**
+
+- **为什么问：** 检查术语精度。
+- **30～60 秒回答：** “这里要区分消息队列 ACK 和本地记录。Axiom 没用 Kafka/Redis Streams；准确说法是‘远端成功，但 Tool 结果成功持久化没有完成’。此时查下游 operation status；查不到且不是幂等写就人工确认或补偿。”
+
+**追问 2：下游支持 idempotency key 和 status query 呢？**
+
+- **为什么问：** 看生产协议如何闭环。
+- **30～60 秒回答：** “把稳定业务 key 传给下游，下游用唯一约束绑定参数并对重复 key 返回同一 operation；timeout 后先查状态，再决定是否重发。这约束重复请求的业务效果，但仍不是网络只发送一次。”
+
+**当前边界：** stable ID、参数哈希、成功结果复用和进程内 unsafe retry 停顿已实现；SQLite 重载会丢失 suppression reason，因此该停顿并非完整 restart-safe。通用下游状态查询/补偿协议也未实现。
+
+#### P0-14｜“Run=INTERRUPTED 时 resume 和 cancel 同时发生，谁赢？”
+
+**面试官想看什么：** race 的最终状态、CAS、live Task 与 durable transition 的顺序。
+
+**先说结论：** 谁先成功提交合法的 durable transition，谁取得权威结果；另一方应看到冲突或终态。当前测试允许最终为 `COMPLETED` 或 `CANCELLED`，但不允许 stale writer 在取消后写回旧终态。
+
+**60～120 秒完整口语答案：** “这不是固定规定 cancel 永远赢，而是竞争合法提交。resume 会把 `INTERRUPTED` 推到 `RUNNING` 并继续执行，cancel 会提交 `CANCELLED`。Checkpoint sequence CAS 防止双方都基于旧版本覆盖；执行循环也会 refresh 最新状态。若 resume 先完整完成，之后 cancel 对 COMPLETED 返回冲突；若 cancel 先提交，resume 的旧写失败或收敛到 CANCELLED。Supervisor 负责通知已经创建的本地 Task，但 Task 必须服从 durable 结果。”
+
+**追问 1：会不会已经 resume 出 Task，又把 DB 写回 RUNNING？**
+
+- **为什么问：** 看 Task 注册和状态 claim 的间隙。
+- **30～60 秒回答：** “Task 注册不等于获得 durable ownership。后续保存仍带旧 sequence；如果 cancel 已写入新版本，resume claim 会冲突，supervise 路径读取到 CANCELLED 并返回，不允许 stale terminal overwrite。”
+
+**当前边界：** 单进程锁、Supervisor、API conflict 与 SQLite CAS 已实现；不同控制意图仍是竞争语义，不是分布式优先级协议。
+
+#### P0-15｜“父 Run cancel 后 Child Run 怎么处理？进程中途又挂了呢？”
+
+**面试官想看什么：** lineage、传播顺序、已完成 Child、运行中 Tool 和 crash gap。
+
+**先说结论：** Plan/Multi-Agent 当前先把父策略状态和父 Run 持久化为 CANCELLED，再遍历未终态 Child 调用 cancel；已完成 Child 保持终态。这个传播不是跨父子的一次原子事务，父落库后进程崩溃可能留下未取消 Child。
+
+**60～120 秒完整口语答案：** “父 cancel 时，策略先把未完成 task/assignment 标成 cancelled，父 Checkpoint 落库，然后 `after_cancel` 读取每个 Child：终态的不改，非终态调用 Child Runtime cancel。本地活跃 Child 的 Task 会收到 Supervisor 信号；如果 Child 正在外部 Tool 中，只能阻止后续步骤，unsafe 外部副作用证据保持 UNKNOWN。若服务在父写完、子传播前崩溃，显式 Child resume/执行 preflight 会遍历 durable ancestors，发现 CANCELLED 后先把 Child 收敛为 CANCELLED，而不是运行。它不是原子级联，也不是后台扫描。”
+
+**追问 1：子任务失败一定让父失败？**
+
+- **为什么问：** 防止套用泛化 structured concurrency。
+- **30～60 秒回答：** “不能一概而论，要看 Plan/Multi-Agent 策略如何记录 task/assignment、是否 replan/review、以及汇合规则。Child 独立失败是证据，父策略决定重试、重规划还是失败，不是 Python TaskGroup 的固定传播语义。”
+
+**当前边界：** lineage、策略内传播、本地 Task cancel 和 resume/preflight 定点 reconciliation 已实现；自动 Recovery Scanner 与分布式级联事务未实现。
+
+#### P0-16｜“服务重启后，谁知道哪些 RUNNING Run 要恢复？谁来接管？”
+
+**面试官想看什么：** durable recovery capability 与 automatic ownership/failover 的边界。
+
+**先说结论：** 当前 SQLite 保存 Run/Checkpoint/ToolExecution，API 能识别 `RUNNING` 为 recovery 状态并由显式 resume 重建；`ActiveRunSupervisor` 不跨进程，也没有自动扫描、lease、heartbeat 或 fencing。
+
+**60～120 秒完整口语答案：** “服务重启后可以查到哪些 Checkpoint 仍是 RUNNING，但数据库记录不会自己执行。当前由客户端/API resume 触发，Runtime 先写一个 no-op claim checkpoint，让同一 sequence 的第二个恢复者冲突，再重建 LLM、Tool 和策略依赖。这个 claim 能减少双推进，却不是长期 owner lease，也不能保证两个 Worker 在 claim 前没调用外部 Tool。生产化我会用共享 PostgreSQL，原子抢 owner lease，heartbeat 续租，过期后 recovery scanner 接管，并用递增 fencing token 让旧 owner 的写失效。”
+
+**追问 1：为什么 ActiveRunSupervisor 不是分布式调度器？**
+
+- **为什么问：** 检查内存 registry 的作用域。
+- **30～60 秒回答：** “它保存本进程 Task 和 Event Loop 引用，用于线程安全 cancel 和 drain；进程一死引用全没，也没有跨节点共识或租约。所以它是 live execution registry，不是 durable ownership service。”
+
+**当前边界：** restart recovery capability 和本地 supervisor 已实现；自动 failover/lease/fencing 是未来设计。
 
 ### P1 — 回答后的自然深挖（8 题）
 
@@ -358,7 +493,7 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 
 **当前边界：** deterministic checks 只证明已编码的 Run/Tool/output/artifact/Plan/Child 条件，不是通用语义正确性或 LLM Judge。
 
-## 10. 重点追问树（7 条）
+## 10. 重点追问树（11 条）
 
 ### 追问树 1：状态模型
 
@@ -441,8 +576,8 @@ stable invocation ID 解决什么？
   - **30～60 秒口述：** “同一 Tool Call 恢复或重试时逻辑身份不变，参数 hash 也必须一致；attempt 1、2、3 是对依赖的实际执行。ToolExecution 把它们挂在同一 invocation 下。预算的 Tool call 计数按真实 attempt 消耗，retry_count 只数首个之后的尝试。”
 - **“第二次后 crash 呢？”**
   - **面试官意图：** 追问 durable retry allowance。
-  - **回答思路：** attempt、失败类别、next_retry_at、exhausted/suppressed 持久化。
-  - **30～60 秒口述：** “恢复读取相同 ToolExecution，不会把它当第一次。若 backoff 尚未结束只等剩余时间；额度已耗尽就复用结构化失败；SUCCEEDED 则直接复用且不再收费。取消期间 `CancelledError` 也不会被改成 retry exhausted。”
+  - **回答思路：** SQLite 已持久化 attempt、显式 retry state 与 UTC deadline。
+  - **30～60 秒口述：** “恢复读取同一 ToolExecution，attempt 不会回到 0，达到最大次数会保持 RETRY_EXHAUSTED，SUCCEEDED 直接复用；RETRY_PENDING 会按 UTC `next_retry_at` 继续等待，unsafe UNKNOWN 保持 RETRY_SUPPRESSED。”
 - **“幂等键等于 exactly-once？”**
   - **面试官意图：** 捕捉分布式语义夸大。
   - **回答思路：** 只有服务端接收、持久化、唯一约束并对同 key 返回同结果才有效。
@@ -514,6 +649,73 @@ Context Budget 与 Run Budget 有何区别？
   - **回答思路：** 不能；固定 synthetic golden 只证明声明事实和可确定 outcome，无 LLM Judge。
   - **30～60 秒口述：** “不能。它证明当前固定合成集的 required items 和协议没有丢，并能在少量确定性 probe 对比结果；开放域摘要、隐含语义和真实模型推理仍可能受损。Retention 或协议下降是硬回归，压缩变差只告警，但这仍不是 universal semantic equivalence。”
 
+### 追问树 8：Run 状态与控制竞争
+
+```text
+Run 有哪些真实状态？
+└─ resume COMPLETED / CANCELLED 为什么拒绝？
+   └─ INTERRUPTED 上 resume 与 cancel 同时来，谁赢？
+      └─ live Task 已创建后，怎样避免把 DB 写回旧状态？
+```
+
+- **“resume 与 cancel 谁赢？”**
+  - **为什么问：** 看状态机、API 幂等、CAS 和 Task 是否形成一套语义。
+  - **30～60 秒回答：** “没有硬编码永远谁优先。谁先提交合法 durable transition 谁生效；另一方拿到冲突或最新终态。当前测试允许最终 COMPLETED 或 CANCELLED，但 sequence CAS 和 refresh 不允许取消之后再被 stale completion 覆盖。”
+- **“Task 已经启动呢？”**
+  - **为什么问：** 检查 durable truth 与 live execution 分离。
+  - **30～60 秒回答：** “注册 Supervisor 只表示本地有 Task，不表示拿到永久所有权。cancel 先落库后会通知 Task；Task 下一次 checkpoint 若还是旧 sequence 会冲突并读取 CANCELLED。durable state 权威，Task 跟随它。”
+
+### 追问树 9：Crash window 与 exactly-once
+
+```text
+Tool 成功但 Checkpoint 前挂了怎么办？
+└─ SUCCEEDED 已落库和仍 RUNNING 有何不同？
+   └─ invocation ID 为什么仍不够？
+      └─ status query / idempotency key / 人工介入怎么选？
+```
+
+- **“SUCCEEDED 已落库？”**
+  - **为什么问：** 区分 ToolExecution 与父 Checkpoint 两层证据。
+  - **30～60 秒回答：** “如果 ToolExecution 已是 SUCCEEDED，即使父 Checkpoint 还没推进，也能用 invocation ID 和参数哈希复用结果；如果仍是 RUNNING，远端可能成功也可能没执行，不能自动当失败。”
+- **“什么时候人工介入？”**
+  - **为什么问：** 看未知副作用是否被安全收敛。
+  - **30～60 秒回答：** “普通外部写既没有幂等 key，也不能查询 operation status，又无法可靠补偿时，Runtime 只能停在 WAITING_APPROVAL 让人确认。自动重试是在制造重复，不是恢复。”
+
+### 追问树 10：Parent / Child 取消
+
+```text
+父 Run cancel 后 Child 怎么办？
+└─ 已完成 Child 与活跃 Child 分别怎样处理？
+   └─ Child 正在外部 Tool 中怎么办？
+      └─ 父已 CANCELLED、传播前 crash 怎么收敛？
+```
+
+- **“当前传播顺序？”**
+  - **为什么问：** 检查源码而不是套用 structured concurrency。
+  - **30～60 秒回答：** “Plan/Multi-Agent 先更新父策略状态并保存父 CANCELLED，再遍历非终态 Child 调用 cancel；已完成 Child 不回滚。活跃本地 Task 会收到 Supervisor 信号，外部副作用不保证撤销。”
+- **“传播中 crash？”**
+  - **为什么问：** 暴露跨 Run 原子性边界。
+  - **30～60 秒回答：** “父和所有 Child 不在一个事务里，所以会出现父已取消、部分 Child 未取消。当前显式 Child resume/执行 preflight 会检查 durable ancestors 并收敛取消；没有后台 Scanner，因此无人触发的遗留 Child 不会自动被扫描。”
+
+### 追问树 11：重启接管与 SQLite
+
+```text
+服务重启后谁接管 RUNNING Run？
+└─ resume.claim 是否就是分布式锁？
+   └─ SQLite WAL 能否支撑多实例？
+      └─ PostgreSQL + lease + heartbeat + fencing 怎样分工？
+```
+
+- **“resume.claim 是锁吗？”**
+  - **为什么问：** 防止把一次 CAS 外推成持续 ownership。
+  - **30～60 秒回答：** “它是对当前 checkpoint sequence 的乐观 claim，只能让两个恢复者不能都从同一版本继续写；它没有租期、续租和 owner identity，也不能阻止 claim 前的外部调用，所以不是分布式锁。”
+- **“SQLite 为什么现在合适、何时迁 PostgreSQL？”**
+  - **为什么问：** 简历明确写 SQLite。
+  - **30～60 秒回答：** “项目先服务本地 Runtime，SQLite 零运维、事务和 WAL 适合小写并发与快速迭代，所以保留为默认。现在已增加 PostgreSQL backend，让多个进程共享 Run/Checkpoint/ToolExecution/Event 真相，并用跨进程原子 CAS；但尚未增加 claim、lease 和 fencing，因此两个 Worker 仍可能执行同一个 Run。”
+- **“为什么 durable truth 不只放 Redis？”**
+  - **为什么问：** 区分正确性真相与临时协调缓存。
+  - **30～60 秒回答：** “Run、Checkpoint 和 ToolExecution 决定崩溃后能否安全恢复，需要事务、约束、可查询历史和明确 schema；PostgreSQL 是 durable correctness truth。Redis 以后可以辅助通知或协调，但不能在当前设计里成为唯一真相源。”
+
 ## 11. 面试官攻击面与防守口径
 
 1. **“对象太多是过度设计？”** 用交互、重放、执行和恢复职责拆分回答。
@@ -529,15 +731,15 @@ Context Budget 与 Run Budget 有何区别？
 
 ### 【当前已实现】
 
-SQLite/Memory Runtime store、Checkpoint CAS、LLM/Tool/interrupt 边界、stable invocation、ToolExecution 成功复用和 durable retry state、分层 timeout/deadline、安全 retry 与 full jitter、ReAct 进程重启恢复、上下文高水位/目标/硬上限、Tool 投影、Map-Reduce 会话摘要、10-case Context Retention 离线评测、根 Run 预算账本、无进展检测。
+SQLite/Memory Runtime store、可选 PostgreSQL shared durable store 与 bounded pool、两后端 Checkpoint CAS/ToolExecution/Event/control schema parity、LLM/Tool/interrupt 边界、stable invocation、ToolExecution 成功复用、attempt/retry state 持久化、分层 timeout/deadline、安全 retry 与 full jitter、ReAct 进程重启恢复、上下文高水位/目标/硬上限、Tool 投影、Map-Reduce 会话摘要、10-case Context Retention 离线评测、根 Run 预算账本、无进展检测。
 
 ### 【当前部分支持】
 
-外部写副作用只能在有幂等契约时安全重试；SQLite 适合单 Runtime；Context retention 能验证声明事实但没有证明开放域语义等价；模型价格可能未知；本地 supervisor 不能做多进程接管。
+外部写副作用只能在有幂等契约时安全重试；两种 durable backend 都持久化显式 retry state、`next_retry_at`、失败分类和 suppression reason，但 ToolExecution 唯一约束仍不能证明外部 exactly-once；PostgreSQL 真库集成仍必须在发布前通过；Context retention 能验证声明事实但没有证明开放域语义等价；模型价格可能未知；本地 supervisor 不能做多进程接管，也没有自动 Recovery Scanner。
 
 ### 【未来可扩展】
 
-PostgreSQL 共享状态、Run lease/heartbeat/fencing、幂等 Tool contract、语义级 Context 质量评测、按租户全局预算、自动 Worker 接管和跨实例事件总线。
+Durable Run Queue、Run lease/heartbeat/fencing、幂等 Tool contract、语义级 Context 质量评测、按租户全局预算、自动 Recovery Scanner/Worker 接管和跨实例事件总线。
 
 ## 13. 面试前 5 分钟速背
 
