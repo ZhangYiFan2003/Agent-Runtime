@@ -80,10 +80,25 @@ def test_storage_configuration_reads_environment_without_changing_defaults(tmp_p
     assert config.storage.pool_max_size == 7
 
 
-def test_postgres_connection_failure_is_visible_and_never_falls_back(tmp_path):
-    from axiom.runtime.postgres import PostgresUnavailableError
+def test_postgres_connection_failure_is_visible_and_never_falls_back(
+    tmp_path, monkeypatch
+):
+    from axiom.runtime import postgres
 
-    with pytest.raises(PostgresUnavailableError, match="durable store is unavailable"):
+    class FailingPoolModule:
+        class ConnectionPool:
+            def __init__(self, **_kwargs):
+                raise OSError("connection refused")
+
+    monkeypatch.setattr(
+        postgres.importlib,
+        "import_module",
+        lambda _name: FailingPoolModule,
+    )
+
+    with pytest.raises(
+        postgres.PostgresUnavailableError, match="durable store is unavailable"
+    ):
         create_durable_storage(
             StorageConfig(
                 backend="postgres",
