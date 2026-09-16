@@ -277,7 +277,12 @@ def test_runtime_api_live_http_lifecycle_auth_threads_events_and_tasks(tmp_path)
         with httpx.Client(base_url=base_url, timeout=5.0) as client:
             health = client.get("/health")
             assert health.status_code == 200
-            assert health.json() == {"status": "ok", "workers": 0, "database": "ok"}
+            assert health.json() == {
+                "status": "ok",
+                "workers": 0,
+                "database": "ok",
+                "storage_backend": "sqlite",
+            }
 
             assert client.get("/v1/tasks").status_code == 401
             assert client.get("/v1/tasks", headers={"x-api-key": "wrong"}).status_code == 401

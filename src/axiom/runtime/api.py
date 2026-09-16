@@ -5,7 +5,6 @@ import contextlib
 import inspect
 import json
 import os
-import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -31,12 +30,14 @@ from axiom.runtime.control_plane import (
     ApiError,
     ControlOperationName,
     ControlOperationStatus,
+    ControlOperationStore,
     SQLiteControlOperationStore,
     allowed_operations,
     child_view,
     run_view,
 )
 from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
+from axiom.runtime.events import EventRepository, RuntimeEvent, ThreadEventRepository
 from axiom.runtime.models import Checkpoint, Interrupt, RunError, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType
 from axiom.runtime.observability_store import (
@@ -48,20 +49,6 @@ from axiom.runtime.observability_store import (
 from axiom.runtime.supervisor import ActiveRunSupervisor
 from axiom.runtime.tasks import DurableTaskManager
 from axiom.types import Message
-
-
-@dataclass(slots=True)
-class RuntimeEvent:
-    id: int
-    thread_id: str
-    type: str
-    payload: dict[str, Any]
-    created_at: str
-    turn_id: str | None = None
-    run_id: str | None = None
-    parent_run_id: str | None = None
-    parent_step_id: str | None = None
-    assignment_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -79,152 +66,6 @@ EngineFactory = Callable[[RuntimeTurnContext], Any]
 ToolRegistryFactory = Callable[[AxiomConfig, str], Any]
 
 
-class ThreadEventRepository:
-    def __init__(self, db_path: str | Path):
-        self.db_path = Path(db_path).expanduser()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_schema()
-
-    def create_thread(self) -> str:
-        thread_id = f"thread_{uuid4().hex}"
-        now = _now()
-        with self._connect() as conn:
-            conn.execute(
-                "insert into threads(id, created_at) values (?, ?)",
-                (thread_id, now),
-            )
-        self.append_event(thread_id, "thread.created", {"id": thread_id})
-        return thread_id
-
-    def thread_exists(self, thread_id: str) -> bool:
-        with self._connect() as conn:
-            row = conn.execute("select 1 from threads where id = ?", (thread_id,)).fetchone()
-        return row is not None
-
-    def list_threads(self) -> list[str]:
-        with self._connect() as conn:
-            rows = conn.execute("select id from threads order by created_at, id").fetchall()
-        return [str(row[0]) for row in rows]
-
-    def append_event(self, thread_id: str, event_type: str, payload: dict[str, Any]) -> int:
-        if not self.thread_exists(thread_id):
-            raise ValueError("thread not found")
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                insert into events(
-                    thread_id, turn_id, run_id, parent_run_id, parent_step_id,
-                    assignment_id, type, payload, created_at
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    thread_id,
-                    _optional_text(payload.get("turn_id")),
-                    _optional_text(payload.get("run_id")),
-                    _optional_text(payload.get("parent_run_id")),
-                    _optional_text(payload.get("parent_step_id")),
-                    _optional_text(payload.get("assignment_id")),
-                    event_type,
-                    json.dumps(_jsonable(payload), ensure_ascii=False),
-                    _now(),
-                ),
-            )
-            return int(cursor.lastrowid)
-
-    def list_events(
-        self,
-        thread_id: str,
-        after_id: int | None = None,
-        *,
-        run_id: str | None = None,
-    ) -> list[RuntimeEvent]:
-        if not self.thread_exists(thread_id):
-            return []
-        clause = "thread_id = ?"
-        params: list[object] = [thread_id]
-        if after_id is not None:
-            clause += " and id > ?"
-            params.append(after_id)
-        if run_id is not None:
-            clause += " and run_id = ?"
-            params.append(run_id)
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                select id, thread_id, type, payload, created_at,
-                       turn_id, run_id, parent_run_id, parent_step_id, assignment_id
-                from events
-                where {clause}
-                order by id
-                """,
-                tuple(params),
-            ).fetchall()
-        return [
-            RuntimeEvent(
-                id=int(row[0]),
-                thread_id=str(row[1]),
-                type=str(row[2]),
-                payload=_decode_payload(str(row[3])),
-                created_at=str(row[4]),
-                turn_id=_optional_text(row[5]),
-                run_id=_optional_text(row[6]),
-                parent_run_id=_optional_text(row[7]),
-                parent_step_id=_optional_text(row[8]),
-                assignment_id=_optional_text(row[9]),
-            )
-            for row in rows
-        ]
-
-    def database_ok(self) -> bool:
-        try:
-            with self._connect() as conn:
-                conn.execute("select 1").fetchone()
-            return True
-        except sqlite3.DatabaseError:
-            return False
-
-    def _ensure_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                create table if not exists threads (
-                    id text primary key,
-                    created_at text not null
-                )
-                """
-            )
-            conn.execute(
-                """
-                create table if not exists events (
-                    id integer primary key autoincrement,
-                    thread_id text not null references threads(id) on delete cascade,
-                    type text not null,
-                    payload text not null,
-                    created_at text not null
-                )
-                """
-            )
-            for name in (
-                "turn_id",
-                "run_id",
-                "parent_run_id",
-                "parent_step_id",
-                "assignment_id",
-            ):
-                _ensure_sqlite_column(conn, "events", name, "text")
-            conn.execute("create index if not exists idx_events_thread_id on events(thread_id, id)")
-            conn.execute(
-                "create index if not exists idx_events_run_id on events(thread_id, run_id, id)"
-            )
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("pragma journal_mode = wal")
-        conn.execute("pragma busy_timeout = 30000")
-        conn.execute("pragma foreign_keys = on")
-        return conn
-
-
 class RuntimeApiServer:
     def __init__(
         self,
@@ -240,6 +81,9 @@ class RuntimeApiServer:
         tool_registry_factory: ToolRegistryFactory | None = None,
         memory_service: MemoryService | None = None,
         checkpoint_store: RuntimeStore | None = None,
+        event_repository: EventRepository | None = None,
+        control_operation_store: ControlOperationStore | None = None,
+        durable_storage=None,
         observability_store: ObservabilityStore | None = None,
         retry_policy: RetryPolicy | None = None,
         active_run_supervisor: ActiveRunSupervisor | None = None,
@@ -254,11 +98,41 @@ class RuntimeApiServer:
             Path(data_dir).expanduser() if data_dir else Path.home() / ".axiom" / "runtime"
         )
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.repository = ThreadEventRepository(self.data_dir / "runtime.db")
-        self.control_operations = SQLiteControlOperationStore(self.data_dir / "runtime.db")
-        self.checkpoint_store = checkpoint_store or SQLiteCheckpointStore(
-            self.data_dir / "runtime.db"
+        runtime_db = self.data_dir / "runtime.db"
+        self._durable_storage = durable_storage
+        self._owns_durable_storage = durable_storage is None and not any(
+            (checkpoint_store, event_repository, control_operation_store)
         )
+        injected = (checkpoint_store, event_repository, control_operation_store)
+        if self._durable_storage is None and not any(injected):
+            from axiom.runtime.storage import create_durable_storage
+
+            self._durable_storage = create_durable_storage(
+                config.storage,
+                default_sqlite_path=runtime_db,
+            )
+        if self._durable_storage is not None:
+            self.repository = self._durable_storage.events
+            self.control_operations = self._durable_storage.controls
+            self.checkpoint_store = self._durable_storage.runtime
+            self.storage_backend = self._durable_storage.backend
+        else:
+            if config.storage.backend.strip().lower() == "postgres" and not all(injected):
+                raise ValueError(
+                    "PostgreSQL Runtime repository injection must provide checkpoint, event, "
+                    "and control stores together"
+                )
+            self.repository = event_repository or ThreadEventRepository(runtime_db)
+            self.control_operations = control_operation_store or SQLiteControlOperationStore(
+                runtime_db
+            )
+            self.checkpoint_store = checkpoint_store or SQLiteCheckpointStore(runtime_db)
+            backends = {
+                self.repository.backend,
+                self.control_operations.backend,
+                self.checkpoint_store.backend,
+            }
+            self.storage_backend = backends.pop() if len(backends) == 1 else "custom"
         self.observability_store = observability_store or SQLiteObservabilityStore(
             self.data_dir / "runtime.db"
         )
@@ -326,6 +200,7 @@ class RuntimeApiServer:
                     worker.join(timeout=5)
             self._httpd = None
             self._worker_threads = []
+            self._close_durable_storage()
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -344,6 +219,14 @@ class RuntimeApiServer:
         self._httpd = None
         self._server_thread = None
         self._worker_threads = []
+        self._close_durable_storage()
+
+    def _close_durable_storage(self) -> None:
+        storage = self._durable_storage
+        if storage is None or not self._owns_durable_storage:
+            return
+        self._durable_storage = None
+        storage.close()
 
     def _shutdown_active_executions(self) -> None:
         handles = self.active_run_supervisor.list_active()
@@ -446,6 +329,7 @@ class RuntimeApiServer:
                     "status": "ok",
                     "workers": self.workers,
                     "database": "ok" if self.repository.database_ok() else "error",
+                    "storage_backend": self.storage_backend,
                 },
             )
             return
@@ -620,7 +504,7 @@ class RuntimeApiServer:
             _send_json(request, 500, {"error": _safe_error(exc)})
 
     async def _run_turn(self, thread_id: str, message: str) -> dict[str, Any]:
-        history_events = self.repository.list_events(thread_id)
+        history_events = await self._list_events_async(thread_id)
         history = self.memory_service.history_from_runtime_events(history_events)
         turn_id = f"turn_{uuid4().hex}"
         run_id = f"run_{uuid4().hex}"
@@ -633,12 +517,14 @@ class RuntimeApiServer:
             turn_id=turn_id,
             run_id=run_id,
         )
-        self.repository.append_event(
+        await self._append_event_async(
             thread_id,
             "turn.started",
             {"turn_id": turn_id, "run_id": run_id, "message_chars": len(message)},
         )
-        user_event_id = self.repository.append_event(thread_id, "user.message", {"text": message})
+        user_event_id = await self._append_event_async(
+            thread_id, "user.message", {"text": message}
+        )
         self._derive_conversation_memory(
             thread_id,
             role="user",
@@ -699,7 +585,7 @@ class RuntimeApiServer:
             attributes={"durable_internal_steps": False},
         )
         await self.checkpoint_store.save(state)
-        self.repository.append_event(
+        await self._append_event_async(
             thread_id,
             "run.started",
             {"run_id": state.run_id, "turn_id": state.turn_id, "legacy_engine": True},
@@ -713,9 +599,9 @@ class RuntimeApiServer:
                     delta = str(event.get("text") or "")
                     text += delta
                 elif event_type == "tool_call":
-                    self.repository.append_event(thread_id, "tool_call", _jsonable(event))
+                    await self._append_event_async(thread_id, "tool_call", _jsonable(event))
                 elif event_type == "tool_result":
-                    event_id = self.repository.append_event(
+                    event_id = await self._append_event_async(
                         thread_id,
                         "tool_result",
                         _jsonable(event),
@@ -728,11 +614,11 @@ class RuntimeApiServer:
                         source_event_id=event_id,
                     )
                 elif event_type == "error":
-                    self.repository.append_event(thread_id, "error", _jsonable(event))
+                    await self._append_event_async(thread_id, "error", _jsonable(event))
                 elif event_type == "done":
                     done_payload = _jsonable(event)
         except Exception as exc:
-            self.repository.append_event(thread_id, "error", {"error": _safe_error(exc)})
+            await self._append_event_async(thread_id, "error", {"error": _safe_error(exc)})
             state.status = RunStatus.FAILED
             state.error = RunError(type=type(exc).__name__, message=_safe_error(exc), step="engine")
             await self.checkpoint_store.save(state)
@@ -742,7 +628,7 @@ class RuntimeApiServer:
                 attributes={"error": _safe_error(exc)},
             )
             await tracer.update_run(state.status, terminal=True)
-            self.repository.append_event(
+            await self._append_event_async(
                 thread_id,
                 "run.failed",
                 {"run_id": state.run_id, "error": state.error.to_dict()},
@@ -756,12 +642,12 @@ class RuntimeApiServer:
         await self.checkpoint_store.save(state)
         await tracer.finish_span(engine_span, SpanStatus.SUCCEEDED)
         await tracer.update_run(state.status, terminal=True)
-        self.repository.append_event(
+        await self._append_event_async(
             thread_id,
             "run.completed",
             {"run_id": state.run_id, "legacy_engine": True},
         )
-        assistant_event_id = self.repository.append_event(
+        assistant_event_id = await self._append_event_async(
             thread_id,
             "assistant.message",
             {"text": text},
@@ -772,7 +658,7 @@ class RuntimeApiServer:
             content=text,
             event_id=assistant_event_id,
         )
-        self.repository.append_event(
+        await self._append_event_async(
             thread_id,
             "turn.completed",
             {**done_payload, "turn_id": state.turn_id, "run_id": state.run_id},
@@ -1151,10 +1037,10 @@ class RuntimeApiServer:
             }
         if state.status == RunStatus.FAILED:
             message = state.error.message if state.error else "run failed"
-            self.repository.append_event(state.thread_id, "error", {"error": message})
+            await self._append_event_async(state.thread_id, "error", {"error": message})
             raise RuntimeError(message)
 
-        assistant_event_id = self.repository.append_event(
+        assistant_event_id = await self._append_event_async(
             state.thread_id,
             "assistant.message",
             {"text": state.output_text},
@@ -1165,7 +1051,7 @@ class RuntimeApiServer:
             content=state.output_text,
             event_id=assistant_event_id,
         )
-        self.repository.append_event(
+        await self._append_event_async(
             state.thread_id,
             "turn.completed",
             {
@@ -1203,7 +1089,7 @@ class RuntimeApiServer:
     def _runtime_event_sink(self, thread_id: str):
         async def emit(event_type: str, payload: dict[str, Any]) -> None:
             enriched = await self._enrich_runtime_event(thread_id, payload)
-            self.repository.append_event(thread_id, event_type, enriched)
+            await self._append_event_async(thread_id, event_type, enriched)
             hierarchy = {
                 key: enriched.get(key)
                 for key in (
@@ -1216,7 +1102,7 @@ class RuntimeApiServer:
                 )
             }
             if event_type == "tool.started":
-                self.repository.append_event(
+                await self._append_event_async(
                     thread_id,
                     "tool_call",
                     {
@@ -1228,7 +1114,7 @@ class RuntimeApiServer:
                     },
                 )
             elif event_type == "tool.completed":
-                event_id = self.repository.append_event(
+                event_id = await self._append_event_async(
                     thread_id,
                     "tool_result",
                     {
@@ -1339,7 +1225,7 @@ class RuntimeApiServer:
         else:
             await tracer.update_run(status, terminal=True)
         event_type = "run.interrupted" if status == RunStatus.INTERRUPTED else "run.cancelled"
-        self.repository.append_event(
+        await self._append_event_async(
             state.thread_id,
             event_type,
             {"run_id": state.run_id, "status": state.status.value, "reason": reason},
@@ -1361,7 +1247,7 @@ class RuntimeApiServer:
             if not lock.acquire(blocking=False):
                 continue
             try:
-                self.repository.append_event(
+                await self._append_event_async(
                     state.thread_id,
                     "run.recovery.started",
                     {
@@ -1372,7 +1258,7 @@ class RuntimeApiServer:
                     },
                 )
                 result = await self._resume_run(state.run_id, decision=None)
-                self.repository.append_event(
+                await self._append_event_async(
                     state.thread_id,
                     "run.recovery.completed",
                     {
@@ -1383,7 +1269,7 @@ class RuntimeApiServer:
                     },
                 )
             except Exception as exc:  # noqa: BLE001 - startup recovery is best effort
-                self.repository.append_event(
+                await self._append_event_async(
                     state.thread_id,
                     "run.recovery.failed",
                     {
@@ -1493,6 +1379,23 @@ class RuntimeApiServer:
     def _append_event(self, thread_id: str, event_type: str, payload: dict[str, Any]) -> None:
         self.repository.append_event(thread_id, event_type, payload)
 
+    async def _append_event_async(
+        self,
+        thread_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> int:
+        if self.storage_backend == "postgres":
+            return await asyncio.to_thread(
+                self.repository.append_event, thread_id, event_type, payload
+            )
+        return self.repository.append_event(thread_id, event_type, payload)
+
+    async def _list_events_async(self, thread_id: str) -> list[RuntimeEvent]:
+        if self.storage_backend == "postgres":
+            return await asyncio.to_thread(self.repository.list_events, thread_id)
+        return self.repository.list_events(thread_id)
+
     def _thread_lock(self, thread_id: str) -> threading.Lock:
         with self._thread_locks_guard:
             lock = self._thread_locks.get(thread_id)
@@ -1571,7 +1474,7 @@ class RuntimeApiServer:
         if extract is None:
             return
         try:
-            result = extract(thread_id, self.repository.list_events(thread_id))
+            result = extract(thread_id, await self._list_events_async(thread_id))
             if inspect.isawaitable(result):
                 await result
         except Exception:
@@ -1596,13 +1499,6 @@ class RuntimeApiServer:
         request.send_header("content-length", str(len(body)))
         request.end_headers()
         request.wfile.write(body)
-
-    def _ensure_schema(self) -> None:
-        self.repository._ensure_schema()
-
-    def _connect(self) -> sqlite3.Connection:
-        return self.repository._connect()
-
 
 class _RunningRuntimeServer:
     def __init__(self, server: RuntimeApiServer):
@@ -1703,17 +1599,6 @@ def _event_envelope(event: RuntimeEvent) -> dict[str, Any]:
     }
 
 
-def _ensure_sqlite_column(
-    conn: sqlite3.Connection,
-    table: str,
-    column: str,
-    definition: str,
-) -> None:
-    columns = {str(row[1]) for row in conn.execute(f"pragma table_info({table})").fetchall()}
-    if column not in columns:
-        conn.execute(f"alter table {table} add column {column} {definition}")
-
-
 def _jsonable(event: dict[str, Any]) -> dict[str, Any]:
     return {str(key): _json_value(value) for key, value in event.items()}
 
@@ -1726,14 +1611,6 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_value(item) for key, item in value.items()}
     return str(value)
-
-
-def _decode_payload(payload: str) -> dict[str, Any]:
-    try:
-        decoded = json.loads(payload)
-    except json.JSONDecodeError:
-        return {}
-    return decoded if isinstance(decoded, dict) else {}
 
 
 def _first_int(values: list[str] | None) -> int | None:

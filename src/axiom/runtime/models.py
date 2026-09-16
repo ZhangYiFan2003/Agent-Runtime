@@ -29,6 +29,13 @@ class ToolExecutionStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class ToolRetryState(StrEnum):
+    NONE = "NONE"
+    RETRY_PENDING = "RETRY_PENDING"
+    RETRY_SUPPRESSED = "RETRY_SUPPRESSED"
+    RETRY_EXHAUSTED = "RETRY_EXHAUSTED"
+
+
 @dataclass(slots=True)
 class Interrupt:
     kind: str
@@ -291,13 +298,24 @@ class ToolExecutionRecord:
     error: str | None = None
     last_failure_category: str | None = None
     last_error_code: str | None = None
-    retry_exhausted: bool = False
+    retry_state: ToolRetryState = ToolRetryState.NONE
     retry_suppressed_reason: str | None = None
     next_retry_at: str | None = None
     retry_backoff_seconds: float = 0.0
     started_at: str | None = None
     completed_at: str | None = None
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+    @property
+    def retry_exhausted(self) -> bool:
+        return self.retry_state == ToolRetryState.RETRY_EXHAUSTED
+
+    @retry_exhausted.setter
+    def retry_exhausted(self, value: bool) -> None:
+        if value:
+            self.retry_state = ToolRetryState.RETRY_EXHAUSTED
+        elif self.retry_state == ToolRetryState.RETRY_EXHAUSTED:
+            self.retry_state = ToolRetryState.NONE
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -313,7 +331,7 @@ class ToolExecutionRecord:
             "error": self.error,
             "last_failure_category": self.last_failure_category,
             "last_error_code": self.last_error_code,
-            "retry_exhausted": self.retry_exhausted,
+            "retry_state": self.retry_state.value,
             "retry_suppressed_reason": self.retry_suppressed_reason,
             "next_retry_at": self.next_retry_at,
             "retry_backoff_seconds": self.retry_backoff_seconds,
@@ -324,21 +342,37 @@ class ToolExecutionRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ToolExecutionRecord:
+        status = ToolExecutionStatus(str(data["status"]))
+        retry_suppressed_reason = _optional_str(data.get("retry_suppressed_reason"))
+        retry_state = _tool_retry_state(
+            data.get("retry_state"),
+            retry_exhausted=bool(data.get("retry_exhausted")),
+            retry_suppressed_reason=retry_suppressed_reason,
+            next_retry_at=_optional_str(data.get("next_retry_at")),
+            status=status,
+            attempt=int(data.get("attempt") or 0),
+        )
+        if retry_state == ToolRetryState.RETRY_SUPPRESSED and retry_suppressed_reason is None:
+            retry_suppressed_reason = (
+                "unknown_outcome"
+                if status == ToolExecutionStatus.UNKNOWN
+                else "legacy_failure"
+            )
         return cls(
             invocation_id=str(data["invocation_id"]),
             run_id=str(data["run_id"]),
             tool_call_id=str(data.get("tool_call_id") or ""),
             tool_name=str(data["tool_name"]),
             arguments_hash=str(data["arguments_hash"]),
-            status=ToolExecutionStatus(str(data["status"])),
+            status=status,
             attempt=int(data.get("attempt") or 0),
             result=_optional_str(data.get("result")),
             is_error=bool(data.get("is_error")),
             error=_optional_str(data.get("error")),
             last_failure_category=_optional_str(data.get("last_failure_category")),
             last_error_code=_optional_str(data.get("last_error_code")),
-            retry_exhausted=bool(data.get("retry_exhausted")),
-            retry_suppressed_reason=_optional_str(data.get("retry_suppressed_reason")),
+            retry_state=retry_state,
+            retry_suppressed_reason=retry_suppressed_reason,
             next_retry_at=_optional_str(data.get("next_retry_at")),
             retry_backoff_seconds=float(data.get("retry_backoff_seconds") or 0.0),
             started_at=_optional_str(data.get("started_at")),
@@ -406,6 +440,36 @@ def _dict(value: Any) -> dict[str, Any]:
 
 def _optional_str(value: Any) -> str | None:
     return str(value) if value is not None else None
+
+
+def _tool_retry_state(
+    value: Any,
+    *,
+    retry_exhausted: bool,
+    retry_suppressed_reason: str | None,
+    next_retry_at: str | None,
+    status: ToolExecutionStatus,
+    attempt: int,
+) -> ToolRetryState:
+    if value is not None:
+        try:
+            parsed = ToolRetryState(str(value))
+        except ValueError:
+            parsed = ToolRetryState.NONE
+        else:
+            if parsed != ToolRetryState.NONE:
+                return parsed
+    if retry_exhausted:
+        return ToolRetryState.RETRY_EXHAUSTED
+    if retry_suppressed_reason is not None:
+        return ToolRetryState.RETRY_SUPPRESSED
+    if next_retry_at is not None:
+        return ToolRetryState.RETRY_PENDING
+    if attempt > 0 and status in {ToolExecutionStatus.FAILED, ToolExecutionStatus.UNKNOWN}:
+        # Legacy SQLite rows omitted retry-decision metadata. A safe stop is
+        # preferable to inventing retry permission after restart.
+        return ToolRetryState.RETRY_SUPPRESSED
+    return ToolRetryState.NONE
 
 
 def _new_id(prefix: str) -> str:

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from axiom.runtime.models import Checkpoint, RunStatus
@@ -83,7 +83,34 @@ class ControlOperationRecord:
     schema_version: int = CONTROL_OPERATION_SCHEMA_VERSION
 
 
+class ControlOperationStore(Protocol):
+    backend: str
+
+    def lookup(self, run_id: str, idempotency_key: str) -> ControlOperationRecord | None: ...
+
+    def begin(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        operation: ControlOperationName,
+        request: dict[str, Any],
+    ) -> tuple[ControlOperationRecord, bool]: ...
+
+    def complete(self, operation_id: str, result: dict[str, Any]) -> ControlOperationRecord: ...
+
+    def fail(self, operation_id: str, error: ApiError) -> ControlOperationRecord: ...
+
+    def find_interrupt_resolution(
+        self,
+        run_id: str,
+        invocation_id: str,
+    ) -> ControlOperationRecord | None: ...
+
+
 class SQLiteControlOperationStore:
+    backend = "sqlite"
+
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

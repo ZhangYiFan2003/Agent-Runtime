@@ -66,6 +66,7 @@ from axiom.runtime.models import (
     RunStatus,
     ToolExecutionRecord,
     ToolExecutionStatus,
+    ToolRetryState,
 )
 from axiom.runtime.observability import Span, SpanStatus, SpanType, now, tool_span_id
 from axiom.runtime.observability_store import RunTracer
@@ -252,7 +253,10 @@ class DurableAgentRuntime:
             )
 
         async def execute() -> Checkpoint:
-            return await self._advance(state)
+            current = await self.reconcile_run_control_state(state.run_id)
+            if current.status == RunStatus.CANCELLED:
+                return current
+            return await self._advance(current)
 
         return await self._supervise(state, execute)
 
@@ -263,6 +267,9 @@ class DurableAgentRuntime:
         state = await self._require(run_id)
 
         async def execute() -> Checkpoint:
+            reconciled = await self.reconcile_run_control_state(run_id)
+            if reconciled.status == RunStatus.CANCELLED and state.status != RunStatus.CANCELLED:
+                return reconciled
             return await self._resume_inner(run_id, decision=decision)
 
         return await self._supervise(state, execute)
@@ -381,6 +388,39 @@ class DurableAgentRuntime:
     async def cancel(self, run_id: str) -> Checkpoint:
         return await self._cancel_durable(run_id, signal_owner=True)
 
+    async def reconcile_run_control_state(self, run_id: str) -> Checkpoint:
+        """Conservatively reconcile one Run against durable ancestor cancellation."""
+        state = await self._require(run_id)
+        if state.finished or state.parent_run_id is None:
+            return state
+        ancestor_id = state.parent_run_id
+        visited = {state.run_id}
+        cancelled_ancestor_id: str | None = None
+        while ancestor_id is not None:
+            if ancestor_id in visited:
+                raise ValueError(f"run lineage cycle detected at {ancestor_id}")
+            visited.add(ancestor_id)
+            ancestor = await self.store.load(ancestor_id)
+            if ancestor is None:
+                break
+            if ancestor.status == RunStatus.CANCELLED:
+                cancelled_ancestor_id = ancestor.run_id
+                break
+            ancestor_id = ancestor.parent_run_id
+        if cancelled_ancestor_id is None:
+            return state
+        reconciled = await self._cancel_durable(run_id)
+        await self._emit(
+            "run.control_reconciled",
+            {
+                "run_id": run_id,
+                "status": reconciled.status.value,
+                "reason": "ancestor_cancelled",
+                "cancelled_ancestor_run_id": cancelled_ancestor_id,
+            },
+        )
+        return reconciled
+
     async def _cancel_durable(self, run_id: str, *, signal_owner: bool = False) -> Checkpoint:
         async with self._run_lock(run_id):
             state = await self._require(run_id)
@@ -444,6 +484,10 @@ class DurableAgentRuntime:
         return await self._cancel_durable(run_id)
 
     async def _advance(self, state: Checkpoint) -> Checkpoint:
+        reconciled = await self.reconcile_run_control_state(state.run_id)
+        if reconciled.status == RunStatus.CANCELLED:
+            return reconciled
+        state = reconciled
         if state.execution_strategy != self.execution_strategy.name:
             raise ValueError(
                 "runtime execution strategy does not match persisted checkpoint: "
@@ -1256,8 +1300,8 @@ class DurableAgentRuntime:
             ToolExecutionStatus.FAILED,
             ToolExecutionStatus.UNKNOWN,
         } and (
-            existing.retry_exhausted
-            or existing.retry_suppressed_reason is not None
+            existing.retry_state
+            in {ToolRetryState.RETRY_SUPPRESSED, ToolRetryState.RETRY_EXHAUSTED}
             or existing.attempt >= self.retry_policy.max_attempts
         ):
             tool_span = await self._start_tool_span(
@@ -1303,7 +1347,7 @@ class DurableAgentRuntime:
                 existing.result = existing.error or "tool result remained unknown after restart"
                 existing.last_failure_category = DependencyFailureCategory.UNKNOWN.value
                 existing.last_error_code = DEPENDENCY_RETRY_EXHAUSTED
-                existing.retry_exhausted = True
+                existing.retry_state = ToolRetryState.RETRY_EXHAUSTED
                 existing.completed_at = _now()
                 await self.store.save_tool_execution(existing)
                 return await self._execute_pending_tool_inner(
@@ -1445,7 +1489,7 @@ class DurableAgentRuntime:
                 pending_delay = _seconds_until(record.next_retry_at)
                 remaining = await self.budget_manager.ensure_wall_time(state)
                 if remaining is not None and pending_delay >= remaining:
-                    record.retry_exhausted = False
+                    record.retry_state = ToolRetryState.RETRY_SUPPRESSED
                     record.retry_suppressed_reason = "deadline"
                     record.last_error_code = DEPENDENCY_DEADLINE_EXCEEDED
                     record.next_retry_at = None
@@ -1478,6 +1522,7 @@ class DurableAgentRuntime:
                 if pending_delay > 0:
                     await self.retry_sleep(pending_delay)
                 record.next_retry_at = None
+                record.retry_state = ToolRetryState.NONE
                 await self.store.save_tool_execution(record)
             next_attempt = record.attempt + 1
             try:
@@ -1549,9 +1594,19 @@ class DurableAgentRuntime:
                     execution_backend=self.execution_backend,
                 ).execute_one(execution_call, context)
             except asyncio.CancelledError:
-                record.status = ToolExecutionStatus.FAILED
+                unsafe_outcome = retry_safety == RetrySafety.UNSAFE
+                record.status = (
+                    ToolExecutionStatus.UNKNOWN
+                    if unsafe_outcome
+                    else ToolExecutionStatus.FAILED
+                )
                 record.is_error = True
                 record.error = "tool execution cancelled"
+                record.last_failure_category = DependencyFailureCategory.UNKNOWN.value
+                record.last_error_code = "CancelledError"
+                record.retry_state = ToolRetryState.RETRY_SUPPRESSED
+                record.retry_suppressed_reason = "unsafe" if unsafe_outcome else "cancelled"
+                record.next_retry_at = None
                 record.completed_at = _now()
                 await self.store.save_tool_execution(record)
                 cancelled = {
@@ -1583,7 +1638,7 @@ class DurableAgentRuntime:
                 record.completed_at = _now()
                 record.last_failure_category = None
                 record.last_error_code = None
-                record.retry_exhausted = False
+                record.retry_state = ToolRetryState.NONE
                 record.retry_suppressed_reason = None
                 record.next_retry_at = None
                 await self.store.save_tool_execution(record)
@@ -1630,9 +1685,10 @@ class DurableAgentRuntime:
                 RuntimeError(result.content),
                 decision,
             )
-            record.retry_exhausted = decision.exhausted
             record.retry_suppressed_reason = (
-                "unsafe"
+                None
+                if decision.exhausted
+                else "unsafe"
                 if decision.unsafe_suppressed
                 else "deadline"
                 if decision.blocked_by_deadline
@@ -1652,9 +1708,15 @@ class DurableAgentRuntime:
                 }
             )
             if decision.retry:
+                record.retry_state = ToolRetryState.RETRY_PENDING
                 record.retry_backoff_seconds += decision.delay_seconds
                 record.next_retry_at = _after_seconds(decision.delay_seconds)
             else:
+                record.retry_state = (
+                    ToolRetryState.RETRY_EXHAUSTED
+                    if decision.exhausted
+                    else ToolRetryState.RETRY_SUPPRESSED
+                )
                 record.next_retry_at = None
             await self.store.save_tool_execution(record)
             await self._emit(

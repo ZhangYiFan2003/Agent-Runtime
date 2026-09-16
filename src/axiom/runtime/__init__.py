@@ -20,9 +20,11 @@ from axiom.runtime.budget import (
     RunBudgetUsage,
 )
 from axiom.runtime.checkpoints import (
+    BudgetLedgerConflictError,
     CheckpointConflictError,
     CheckpointStore,
     MemoryCheckpointStore,
+    RuntimeStore,
     SQLiteCheckpointStore,
 )
 from axiom.runtime.completion import (
@@ -55,11 +57,13 @@ from axiom.runtime.dependency import (
     RetrySafety,
 )
 from axiom.runtime.durable import DurableAgentRuntime
+from axiom.runtime.events import EventRepository, RuntimeEvent, ThreadEventRepository
 from axiom.runtime.models import (
     Checkpoint,
     RunStatus,
     ToolExecutionRecord,
     ToolExecutionStatus,
+    ToolRetryState,
 )
 from axiom.runtime.multi_agent_strategy import (
     AssignmentStatus,
@@ -90,6 +94,15 @@ from axiom.runtime.plan_strategy import (
     PlanSchedulerSnapshot,
     plan_task_child_run_id,
 )
+from axiom.runtime.postgres import (
+    PostgresConnectionPool,
+    PostgresControlOperationStore,
+    PostgresDependencyError,
+    PostgresEventRepository,
+    PostgresRuntimeStore,
+    PostgresSchemaError,
+    PostgresUnavailableError,
+)
 from axiom.runtime.progress import (
     NO_PROGRESS,
     NoProgressError,
@@ -104,6 +117,7 @@ from axiom.runtime.progress import (
     error_fingerprint,
     state_fingerprint,
 )
+from axiom.runtime.storage import DurableStorage, create_durable_storage
 from axiom.runtime.strategies import ReactExecutionStrategy, RuntimeExecutionStrategy
 from axiom.runtime.supervisor import (
     ActiveRunRegistrationError,
@@ -116,8 +130,10 @@ from axiom.runtime.tasks import DurableTaskManager, TaskRecord
 
 __all__ = [
     "Checkpoint",
+    "BudgetLedgerConflictError",
     "CheckpointConflictError",
     "CheckpointStore",
+    "RuntimeStore",
     "ApiError",
     "ControlOperationName",
     "ControlOperationRecord",
@@ -178,6 +194,18 @@ __all__ = [
     "child_run_id",
     "SQLiteCheckpointStore",
     "SQLiteControlOperationStore",
+    "ThreadEventRepository",
+    "RuntimeEvent",
+    "EventRepository",
+    "DurableStorage",
+    "create_durable_storage",
+    "PostgresConnectionPool",
+    "PostgresRuntimeStore",
+    "PostgresEventRepository",
+    "PostgresControlOperationStore",
+    "PostgresDependencyError",
+    "PostgresUnavailableError",
+    "PostgresSchemaError",
     "SQLiteObservabilityStore",
     "Span",
     "SpanStatus",
@@ -185,6 +213,7 @@ __all__ = [
     "TaskRecord",
     "ToolExecutionRecord",
     "ToolExecutionStatus",
+    "ToolRetryState",
     "Trace",
     "TraceBundle",
     "TokenEstimator",

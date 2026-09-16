@@ -37,12 +37,16 @@ class ToolExecutionStore(Protocol):
 
 
 class RuntimeStore(CheckpointStore, ToolExecutionStore, Protocol):
+    backend: str
+
     async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None: ...
 
     async def save_budget_ledger(self, record: BudgetLedgerRecord) -> None: ...
 
 
 class MemoryCheckpointStore:
+    backend = "memory"
+
     def __init__(self) -> None:
         self._checkpoints: dict[str, list[dict[str, object]]] = {}
         self._tool_executions: dict[str, dict[str, object]] = {}
@@ -126,6 +130,8 @@ class MemoryCheckpointStore:
 
 
 class SQLiteCheckpointStore:
+    backend = "sqlite"
+
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,6 +247,12 @@ class SQLiteCheckpointStore:
                 record.result,
                 int(record.is_error),
                 record.error,
+                record.last_failure_category,
+                record.last_error_code,
+                record.retry_state.value,
+                record.retry_suppressed_reason,
+                record.next_retry_at,
+                record.retry_backoff_seconds,
                 record.started_at,
                 record.completed_at,
                 record.updated_at,
@@ -249,15 +261,22 @@ class SQLiteCheckpointStore:
                 """
                 insert into tool_executions(
                     invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
-                    status, attempt, result, is_error, error, started_at,
-                    completed_at, updated_at
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, attempt, result, is_error, error, last_failure_category,
+                    last_error_code, retry_state, retry_suppressed_reason,
+                    next_retry_at, retry_backoff_seconds, started_at, completed_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(invocation_id) do update set
                     status = excluded.status,
                     attempt = excluded.attempt,
                     result = excluded.result,
                     is_error = excluded.is_error,
                     error = excluded.error,
+                    last_failure_category = excluded.last_failure_category,
+                    last_error_code = excluded.last_error_code,
+                    retry_state = excluded.retry_state,
+                    retry_suppressed_reason = excluded.retry_suppressed_reason,
+                    next_retry_at = excluded.next_retry_at,
+                    retry_backoff_seconds = excluded.retry_backoff_seconds,
                     started_at = excluded.started_at,
                     completed_at = excluded.completed_at,
                     updated_at = excluded.updated_at
@@ -270,8 +289,9 @@ class SQLiteCheckpointStore:
             row = conn.execute(
                 """
                 select invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
-                       status, attempt, result, is_error, error, started_at,
-                       completed_at, updated_at
+                       status, attempt, result, is_error, error, last_failure_category,
+                       last_error_code, retry_state, retry_suppressed_reason,
+                       next_retry_at, retry_backoff_seconds, started_at, completed_at, updated_at
                 from tool_executions where invocation_id = ?
                 """,
                 (invocation_id,),
@@ -290,9 +310,15 @@ class SQLiteCheckpointStore:
                 "result": row[7],
                 "is_error": bool(row[8]),
                 "error": row[9],
-                "started_at": row[10],
-                "completed_at": row[11],
-                "updated_at": row[12],
+                "last_failure_category": row[10],
+                "last_error_code": row[11],
+                "retry_state": row[12],
+                "retry_suppressed_reason": row[13],
+                "next_retry_at": row[14],
+                "retry_backoff_seconds": row[15],
+                "started_at": row[16],
+                "completed_at": row[17],
+                "updated_at": row[18],
             }
         )
 
@@ -301,8 +327,9 @@ class SQLiteCheckpointStore:
             rows = conn.execute(
                 """
                 select invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
-                       status, attempt, result, is_error, error, started_at,
-                       completed_at, updated_at
+                       status, attempt, result, is_error, error, last_failure_category,
+                       last_error_code, retry_state, retry_suppressed_reason,
+                       next_retry_at, retry_backoff_seconds, started_at, completed_at, updated_at
                 from tool_executions where run_id = ? order by invocation_id
                 """,
                 (run_id,),
@@ -320,9 +347,15 @@ class SQLiteCheckpointStore:
                     "result": row[7],
                     "is_error": bool(row[8]),
                     "error": row[9],
-                    "started_at": row[10],
-                    "completed_at": row[11],
-                    "updated_at": row[12],
+                    "last_failure_category": row[10],
+                    "last_error_code": row[11],
+                    "retry_state": row[12],
+                    "retry_suppressed_reason": row[13],
+                    "next_retry_at": row[14],
+                    "retry_backoff_seconds": row[15],
+                    "started_at": row[16],
+                    "completed_at": row[17],
+                    "updated_at": row[18],
                 }
             )
             for row in rows
@@ -404,12 +437,19 @@ class SQLiteCheckpointStore:
                     result text,
                     is_error integer not null,
                     error text,
+                    last_failure_category text,
+                    last_error_code text,
+                    retry_state text not null default 'NONE',
+                    retry_suppressed_reason text,
+                    next_retry_at text,
+                    retry_backoff_seconds real not null default 0,
                     started_at text,
                     completed_at text,
                     updated_at text not null
                 )
                 """
             )
+            self._migrate_tool_execution_retry_columns(conn)
             conn.execute(
                 """
                 create index if not exists idx_tool_executions_run
@@ -425,6 +465,37 @@ class SQLiteCheckpointStore:
                 )
                 """
             )
+
+    @staticmethod
+    def _migrate_tool_execution_retry_columns(conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in conn.execute("pragma table_info(tool_executions)").fetchall()
+        }
+        additions = {
+            "last_failure_category": "text",
+            "last_error_code": "text",
+            "retry_state": "text not null default 'NONE'",
+            "retry_suppressed_reason": "text",
+            "next_retry_at": "text",
+            "retry_backoff_seconds": "real not null default 0",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                conn.execute(f"alter table tool_executions add column {name} {declaration}")
+        conn.execute(
+            """
+            update tool_executions
+            set retry_state = 'RETRY_SUPPRESSED',
+                retry_suppressed_reason = case
+                    when status = 'UNKNOWN' then 'unknown_outcome'
+                    else 'legacy_failure'
+                end
+            where retry_state = 'NONE'
+              and attempt > 0
+              and status in ('FAILED', 'UNKNOWN')
+            """
+        )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)

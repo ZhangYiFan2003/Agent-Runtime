@@ -19,10 +19,15 @@ from axiom.runtime import (
     Checkpoint,
     DurableAgentRuntime,
     ExecutionHandle,
+    MultiAgentExecutionStrategy,
+    MultiAgentState,
+    MultiAgentStatus,
     RunStatus,
     SQLiteCheckpointStore,
+    WorkerAssignment,
 )
 from axiom.runtime.api import RuntimeApiServer, RuntimeTurnContext
+from axiom.runtime.models import Interrupt
 from axiom.tools import ToolRegistry
 
 
@@ -58,6 +63,19 @@ class FailingClient(CompletingClient):
         yield {"type": "error", "error": RuntimeError("expected failure")}
 
 
+class CrashAfterParentCheckpointStrategy:
+    name = "crash_after_parent_checkpoint"
+
+    async def advance(self, _runtime, state):
+        return state
+
+    async def on_cancel(self, _runtime, _state):
+        return None
+
+    async def after_cancel(self, _runtime, _state):
+        raise RuntimeError("simulated crash before child cancellation")
+
+
 class CompletionBarrierStore(SQLiteCheckpointStore):
     def __init__(self, db_path: Path) -> None:
         super().__init__(db_path)
@@ -71,6 +89,27 @@ class CompletionBarrierStore(SQLiteCheckpointStore):
             self._blocked_once = True
             self.completion_ready.set()
             self.release_completion.wait(3)
+            try:
+                super()._save(checkpoint)
+            finally:
+                self.stale_save_finished.set()
+            return
+        super()._save(checkpoint)
+
+
+class ResumeBarrierStore(SQLiteCheckpointStore):
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(db_path)
+        self.resume_ready = threading.Event()
+        self.release_resume = threading.Event()
+        self.stale_save_finished = threading.Event()
+        self._blocked_once = False
+
+    def _save(self, checkpoint: Checkpoint) -> None:
+        if checkpoint.status == RunStatus.RUNNING and not self._blocked_once:
+            self._blocked_once = True
+            self.resume_ready.set()
+            self.release_resume.wait(3)
             try:
                 super()._save(checkpoint)
             finally:
@@ -159,6 +198,18 @@ def _run_in_thread(
         results[run_id] = asyncio.run(
             runtime.start(thread_id=f"thread-{run_id}", run_id=run_id, input="block")
         )
+    except BaseException as exc:  # test thread must report cancellation bugs
+        errors[run_id] = exc
+
+
+def _resume_in_thread(
+    runtime: DurableAgentRuntime,
+    run_id: str,
+    results: dict[str, Checkpoint],
+    errors: dict[str, BaseException],
+) -> None:
+    try:
+        results[run_id] = asyncio.run(runtime.resume(run_id))
     except BaseException as exc:  # test thread must report cancellation bugs
         errors[run_id] = exc
 
@@ -361,6 +412,226 @@ def test_cancel_wins_completion_race_without_stale_terminal_overwrite(tmp_path):
     assert results["run-race"].status == RunStatus.CANCELLED
     assert final is not None and final.status == RunStatus.CANCELLED
     assert terminal_rows == [(RunStatus.CANCELLED.value,)]
+
+
+def test_stale_resume_cannot_overwrite_newer_cancel(tmp_path):
+    store = ResumeBarrierStore(tmp_path / "runtime.db")
+    supervisor = ActiveRunSupervisor()
+    state = Checkpoint.create(
+        thread_id="thread-resume-race",
+        run_id="run-resume-race",
+        input="resume",
+    )
+    state.status = RunStatus.INTERRUPTED
+    state.interrupt = Interrupt(kind="manual", reason="pause")
+    asyncio.run(store.save(state))
+    client = CompletingClient()
+    runtime = _runtime(tmp_path, store, client, supervisor)  # type: ignore[arg-type]
+    results: dict[str, Checkpoint] = {}
+    errors: dict[str, BaseException] = {}
+    thread = threading.Thread(
+        target=_resume_in_thread,
+        args=(runtime, state.run_id, results, errors),
+    )
+    thread.start()
+    assert store.resume_ready.wait(2)
+
+    canceller = _runtime(tmp_path, store, client, supervisor)  # type: ignore[arg-type]
+    cancelled = asyncio.run(canceller.cancel(state.run_id))
+    store.release_resume.set()
+    assert store.stale_save_finished.wait(2)
+    thread.join(timeout=3)
+    final = asyncio.run(store.load(state.run_id))
+
+    assert not thread.is_alive()
+    assert not errors
+    assert cancelled.status == RunStatus.CANCELLED
+    assert results[state.run_id].status == RunStatus.CANCELLED
+    assert final is not None and final.status == RunStatus.CANCELLED
+
+
+def test_cancelled_ancestor_reconciles_child_resume_without_live_supervisor(tmp_path):
+    store = SQLiteCheckpointStore(tmp_path / "runtime.db")
+    parent = Checkpoint.create(
+        thread_id="thread-lineage",
+        run_id="parent-cancelled",
+        input="parent",
+    )
+    parent.status = RunStatus.CANCELLED
+    child = Checkpoint.create(
+        thread_id=parent.thread_id,
+        turn_id=parent.turn_id,
+        run_id="child-orphaned",
+        input="child",
+        parent_run_id=parent.run_id,
+    )
+    child.status = RunStatus.INTERRUPTED
+    child.interrupt = Interrupt(kind="manual", reason="pause")
+    asyncio.run(store.save(parent))
+    asyncio.run(store.save(child))
+    supervisor = ActiveRunSupervisor()
+    runtime = _runtime(tmp_path, store, CompletingClient(), supervisor)  # type: ignore[arg-type]
+
+    reconciled = asyncio.run(runtime.resume(child.run_id))
+    persisted = asyncio.run(SQLiteCheckpointStore(store.db_path).load(child.run_id))
+
+    assert supervisor.list_active() == ()
+    assert reconciled.status == RunStatus.CANCELLED
+    assert persisted is not None and persisted.status == RunStatus.CANCELLED
+
+
+def test_parent_cancel_crash_after_checkpoint_reconciles_child_on_restart(tmp_path):
+    store = SQLiteCheckpointStore(tmp_path / "runtime.db")
+    parent = Checkpoint.create(
+        thread_id="thread-cancel-crash",
+        run_id="parent-crash",
+        input="parent",
+        execution_strategy="crash_after_parent_checkpoint",
+    )
+    child = Checkpoint.create(
+        thread_id=parent.thread_id,
+        turn_id=parent.turn_id,
+        run_id="child-before-propagation",
+        input="child",
+        parent_run_id=parent.run_id,
+    )
+    child.status = RunStatus.INTERRUPTED
+    child.interrupt = Interrupt(kind="manual", reason="pause")
+    asyncio.run(store.save(parent))
+    asyncio.run(store.save(child))
+    crashing_parent = DurableAgentRuntime(
+        llm_client=CompletingClient(),
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=_config(tmp_path),
+        store=store,
+        execution_strategy=CrashAfterParentCheckpointStrategy(),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        asyncio.run(crashing_parent.cancel(parent.run_id))
+    durable_parent = asyncio.run(store.load(parent.run_id))
+    stranded_child = asyncio.run(store.load(child.run_id))
+    assert durable_parent is not None and durable_parent.status == RunStatus.CANCELLED
+    assert stranded_child is not None and stranded_child.status == RunStatus.INTERRUPTED
+
+    restarted = _runtime(
+        tmp_path,
+        SQLiteCheckpointStore(store.db_path),
+        CompletingClient(),  # type: ignore[arg-type]
+        ActiveRunSupervisor(),
+    )
+    reconciled = asyncio.run(restarted.resume(child.run_id))
+    assert reconciled.status == RunStatus.CANCELLED
+
+
+def test_cancelled_grandparent_reconciles_descendant_but_not_completed_child(tmp_path):
+    store = SQLiteCheckpointStore(tmp_path / "runtime.db")
+    grandparent = Checkpoint.create(
+        thread_id="thread-deep-lineage",
+        run_id="grandparent",
+        input="grandparent",
+    )
+    grandparent.status = RunStatus.CANCELLED
+    parent = Checkpoint.create(
+        thread_id=grandparent.thread_id,
+        turn_id=grandparent.turn_id,
+        run_id="parent",
+        input="parent",
+        parent_run_id=grandparent.run_id,
+    )
+    parent.status = RunStatus.INTERRUPTED
+    completed = Checkpoint.create(
+        thread_id=grandparent.thread_id,
+        turn_id=grandparent.turn_id,
+        run_id="completed-child",
+        input="child",
+        parent_run_id=parent.run_id,
+    )
+    completed.status = RunStatus.COMPLETED
+    for state in (grandparent, parent, completed):
+        asyncio.run(store.save(state))
+    runtime = _runtime(
+        tmp_path,
+        store,
+        CompletingClient(),  # type: ignore[arg-type]
+        ActiveRunSupervisor(),
+    )
+
+    reconciled_parent = asyncio.run(runtime.reconcile_run_control_state(parent.run_id))
+    truthful_child = asyncio.run(runtime.reconcile_run_control_state(completed.run_id))
+
+    assert reconciled_parent.status == RunStatus.CANCELLED
+    assert truthful_child.status == RunStatus.COMPLETED
+
+
+def test_parent_cancel_signals_live_child_task(tmp_path):
+    store = SQLiteCheckpointStore(tmp_path / "runtime.db")
+    supervisor = ActiveRunSupervisor()
+    client = BlockingClient()
+    assignment = WorkerAssignment(
+        "assignment",
+        "worker",
+        "work",
+        child_run_id="live-child",
+    )
+    orchestration = MultiAgentState(
+        orchestration_goal="goal",
+        status=MultiAgentStatus.WAITING_CHILD,
+        assignments=[assignment],
+        active_assignment_ids=[assignment.assignment_id],
+        current_assignment_id=assignment.assignment_id,
+    )
+    parent = Checkpoint.create(
+        thread_id="thread-live-child",
+        run_id="live-parent",
+        input="parent",
+        execution_strategy="multi_agent",
+        run_kind="orchestrator",
+    )
+    parent.strategy_state["multi_agent"] = orchestration.to_dict()
+    child = Checkpoint.create(
+        thread_id=parent.thread_id,
+        turn_id=parent.turn_id,
+        run_id="live-child",
+        input="child",
+        parent_run_id=parent.run_id,
+        run_kind="worker",
+    )
+    child.status = RunStatus.INTERRUPTED
+    child.interrupt = Interrupt(kind="manual", reason="pause")
+    asyncio.run(store.save(parent))
+    asyncio.run(store.save(child))
+    child_runtime = _runtime(tmp_path, store, client, supervisor)
+    results: dict[str, Checkpoint] = {}
+    errors: dict[str, BaseException] = {}
+    thread = threading.Thread(
+        target=_resume_in_thread,
+        args=(child_runtime, child.run_id, results, errors),
+    )
+    thread.start()
+    assert client.started.wait(2)
+    parent_runtime = DurableAgentRuntime(
+        llm_client=client,
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=_config(tmp_path),
+        store=store,
+        execution_strategy=MultiAgentExecutionStrategy(),
+        active_run_supervisor=supervisor,
+    )
+
+    cancelled_parent = asyncio.run(parent_runtime.cancel(parent.run_id))
+    thread.join(timeout=3)
+    persisted_child = asyncio.run(store.load(child.run_id))
+
+    assert not thread.is_alive()
+    assert not errors
+    assert cancelled_parent.status == RunStatus.CANCELLED
+    assert results[child.run_id].status == RunStatus.CANCELLED
+    assert persisted_child is not None and persisted_child.status == RunStatus.CANCELLED
 
 
 def test_waiting_approval_cancel_is_durable_when_not_active(tmp_path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -25,8 +26,10 @@ from axiom.runtime import (
     RetrySafety,
     RunStatus,
     SpanType,
+    SQLiteCheckpointStore,
     ToolExecutionRecord,
     ToolExecutionStatus,
+    ToolRetryState,
 )
 from axiom.runtime.models import RunError
 from axiom.runtime.observability_store import RunTracer
@@ -109,6 +112,7 @@ def _runtime(
     policy: RetryPolicy | None = None,
     config: AxiomConfig | None = None,
     retry_sleep=None,
+    event_sink=None,
 ) -> DurableAgentRuntime:
     registry = ToolRegistry()
     registry.register_all(tools or [])
@@ -129,6 +133,7 @@ def _runtime(
         ),
         retry_random=lambda: 0.5,
         retry_sleep=retry_sleep,
+        event_sink=event_sink,
     )
 
 
@@ -148,6 +153,51 @@ def _tool(
         is_read_only=read_only,
         timeout=timeout,
         retry_safety=retry_safety,
+    )
+
+
+async def _seed_pending_tool_run(
+    store,
+    *,
+    run_id: str,
+    tool_name: str,
+    status: ToolExecutionStatus,
+    attempt: int,
+    retry_state: ToolRetryState,
+    next_retry_at: str | None = None,
+    retry_suppressed_reason: str | None = None,
+) -> None:
+    state = Checkpoint.create(thread_id="thread", input="resume", run_id=run_id)
+    call = {
+        "id": f"call_{tool_name}",
+        "function": {
+            "name": tool_name,
+            "arguments": json.dumps({"secret": "do-not-log"}),
+        },
+    }
+    state.messages.append(Message(role="assistant", content="", tool_calls=[call]))
+    state.pending_tool_calls = [call]
+    await store.save(state)
+    payload_hash = hashlib.sha256(
+        json.dumps({"secret": "do-not-log"}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    await store.save_tool_execution(
+        ToolExecutionRecord(
+            invocation_id=f"{run_id}:call_{tool_name}",
+            run_id=run_id,
+            tool_call_id=f"call_{tool_name}",
+            tool_name=tool_name,
+            arguments_hash=payload_hash,
+            status=status,
+            attempt=attempt,
+            result="recovered" if status == ToolExecutionStatus.SUCCEEDED else "temporary",
+            is_error=status != ToolExecutionStatus.SUCCEEDED,
+            error=None if status == ToolExecutionStatus.SUCCEEDED else "temporary",
+            last_failure_category=DependencyFailureCategory.CONNECTION_ERROR.value,
+            retry_state=retry_state,
+            retry_suppressed_reason=retry_suppressed_reason,
+            next_retry_at=next_retry_at,
+        )
     )
 
 
@@ -470,6 +520,360 @@ def test_cancel_during_backoff_stops_retry_loop(tmp_path):
         assert attempts == 1
 
     asyncio.run(scenario())
+
+
+def test_transient_failure_persists_retry_pending_in_sqlite(tmp_path):
+    async def scenario():
+        sleeping = asyncio.Event()
+        never = asyncio.Event()
+
+        async def handler(_payload, _context):
+            raise ConnectionError("temporary")
+
+        async def blocked_sleep(_delay):
+            sleeping.set()
+            await never.wait()
+
+        db_path = tmp_path / "runtime.db"
+        store = SQLiteCheckpointStore(db_path)
+        runtime = _runtime(
+            tmp_path,
+            llm=ToolLlm("read"),
+            tools=[_tool("read", handler)],
+            store=store,
+            policy=RetryPolicy(
+                max_attempts=3,
+                base_backoff_seconds=10,
+                max_backoff_seconds=10,
+                jitter_enabled=False,
+            ),
+            retry_sleep=blocked_sleep,
+        )
+        task = asyncio.create_task(
+            runtime.start(thread_id="thread", input="retry", run_id="pending")
+        )
+        await asyncio.wait_for(sleeping.wait(), timeout=1)
+        restored = await SQLiteCheckpointStore(db_path).load_tool_execution(
+            "pending:call_read"
+        )
+        assert restored is not None
+        assert restored.retry_state == ToolRetryState.RETRY_PENDING
+        assert restored.attempt == 1
+        assert restored.next_retry_at is not None
+        await runtime.cancel("pending")
+        assert (await task).status == RunStatus.CANCELLED
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_restart_before_retry_deadline_does_not_retry_early(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "runtime.db"
+        store = SQLiteCheckpointStore(db_path)
+        retry_at = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+        await _seed_pending_tool_run(
+            store,
+            run_id="before-deadline",
+            tool_name="read",
+            status=ToolExecutionStatus.FAILED,
+            attempt=1,
+            retry_state=ToolRetryState.RETRY_PENDING,
+            next_retry_at=retry_at,
+        )
+        attempts = 0
+        sleeps: list[float] = []
+
+        async def handler(_payload, _context):
+            nonlocal attempts
+            attempts += 1
+            return ToolResult("unexpected")
+
+        async def crash_during_restored_sleep(delay):
+            sleeps.append(delay)
+            raise RuntimeError("simulated second crash")
+
+        restarted = _runtime(
+            tmp_path,
+            llm=ToolLlm("read"),
+            tools=[_tool("read", handler)],
+            store=SQLiteCheckpointStore(db_path),
+            retry_sleep=crash_during_restored_sleep,
+        )
+        with pytest.raises(RuntimeError, match="simulated second crash"):
+            await restarted.resume("before-deadline")
+        assert attempts == 0
+        assert sleeps and sleeps[0] > 20
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_restart_after_retry_deadline_uses_remaining_attempt(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "runtime.db"
+        await _seed_pending_tool_run(
+            SQLiteCheckpointStore(db_path),
+            run_id="after-deadline",
+            tool_name="read",
+            status=ToolExecutionStatus.FAILED,
+            attempt=2,
+            retry_state=ToolRetryState.RETRY_PENDING,
+            next_retry_at=(datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+        )
+        attempts = 0
+
+        async def handler(_payload, _context):
+            nonlocal attempts
+            attempts += 1
+            return ToolResult("recovered")
+
+        store = SQLiteCheckpointStore(db_path)
+        completed = await _runtime(
+            tmp_path,
+            llm=ToolLlm("read"),
+            tools=[_tool("read", handler)],
+            store=store,
+        ).resume("after-deadline")
+        record = await store.load_tool_execution("after-deadline:call_read")
+        assert completed.status == RunStatus.COMPLETED
+        assert attempts == 1
+        assert record is not None and record.attempt == 3
+        assert record.retry_state == ToolRetryState.NONE
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_restart_keeps_retry_exhausted_terminal(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "runtime.db"
+        await _seed_pending_tool_run(
+            SQLiteCheckpointStore(db_path),
+            run_id="exhausted",
+            tool_name="read",
+            status=ToolExecutionStatus.FAILED,
+            attempt=3,
+            retry_state=ToolRetryState.RETRY_EXHAUSTED,
+        )
+        attempts = 0
+
+        async def handler(_payload, _context):
+            nonlocal attempts
+            attempts += 1
+            return ToolResult("unexpected")
+
+        store = SQLiteCheckpointStore(db_path)
+        completed = await _runtime(
+            tmp_path,
+            llm=ToolLlm("read"),
+            tools=[_tool("read", handler)],
+            store=store,
+        ).resume("exhausted")
+        record = await store.load_tool_execution("exhausted:call_read")
+        assert completed.status == RunStatus.COMPLETED
+        assert attempts == 0
+        assert record is not None
+        assert record.retry_state == ToolRetryState.RETRY_EXHAUSTED
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_restart_keeps_unsafe_unknown_retry_suppressed(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "runtime.db"
+        attempts = 0
+
+        async def handler(_payload, _context):
+            nonlocal attempts
+            attempts += 1
+            raise TimeoutError("ambiguous timeout")
+
+        def crash_after_unknown(event_type, _payload):
+            if event_type == "tool.failed":
+                raise RuntimeError("simulated crash after UNKNOWN persistence")
+
+        first = _runtime(
+            tmp_path,
+            llm=ToolLlm("write"),
+            tools=[_tool("write", handler, read_only=False)],
+            store=SQLiteCheckpointStore(db_path),
+            event_sink=crash_after_unknown,
+        )
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await first.start(thread_id="thread", input="write", run_id="unsafe-unknown")
+        persisted = await SQLiteCheckpointStore(db_path).load_tool_execution(
+            "unsafe-unknown:call_write"
+        )
+        assert persisted is not None
+        assert persisted.status == ToolExecutionStatus.UNKNOWN
+        assert persisted.retry_state == ToolRetryState.RETRY_SUPPRESSED
+        assert persisted.retry_suppressed_reason == "unsafe"
+
+        store = SQLiteCheckpointStore(db_path)
+        completed = await _runtime(
+            tmp_path,
+            llm=ToolLlm("write"),
+            tools=[_tool("write", handler, read_only=False)],
+            store=store,
+        ).resume("unsafe-unknown")
+        record = await store.load_tool_execution("unsafe-unknown:call_write")
+        assert completed.status == RunStatus.COMPLETED
+        assert attempts == 1
+        assert record is not None and record.status == ToolExecutionStatus.UNKNOWN
+        assert record.retry_state == ToolRetryState.RETRY_SUPPRESSED
+        assert record.retry_suppressed_reason == "unsafe"
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_restart_reuses_success_without_attempt_or_budget_charge(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "runtime.db"
+        await _seed_pending_tool_run(
+            SQLiteCheckpointStore(db_path),
+            run_id="reuse-success",
+            tool_name="read",
+            status=ToolExecutionStatus.SUCCEEDED,
+            attempt=1,
+            retry_state=ToolRetryState.NONE,
+        )
+        attempts = 0
+
+        async def handler(_payload, _context):
+            nonlocal attempts
+            attempts += 1
+            return ToolResult("unexpected")
+
+        store = SQLiteCheckpointStore(db_path)
+        restarted = _runtime(
+            tmp_path,
+            llm=ToolLlm("read"),
+            tools=[_tool("read", handler)],
+            store=store,
+        )
+        completed = await restarted.resume("reuse-success")
+        budget = await restarted.budget_snapshot(completed)
+        record = await store.load_tool_execution("reuse-success:call_read")
+        assert completed.status == RunStatus.COMPLETED
+        assert attempts == 0
+        assert record is not None and record.attempt == 1
+        assert budget.local_usage.tool_calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_run_blocks_persisted_pending_retry_after_restart(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "runtime.db"
+        store = SQLiteCheckpointStore(db_path)
+        await _seed_pending_tool_run(
+            store,
+            run_id="cancelled-pending",
+            tool_name="read",
+            status=ToolExecutionStatus.FAILED,
+            attempt=1,
+            retry_state=ToolRetryState.RETRY_PENDING,
+            next_retry_at=(datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+        )
+        state = await store.load("cancelled-pending")
+        assert state is not None
+        state.status = RunStatus.CANCELLED
+        await store.save(state)
+        attempts = 0
+
+        async def handler(_payload, _context):
+            nonlocal attempts
+            attempts += 1
+            return ToolResult("unexpected")
+
+        restarted = _runtime(
+            tmp_path,
+            llm=ToolLlm("read"),
+            tools=[_tool("read", handler)],
+            store=SQLiteCheckpointStore(db_path),
+        )
+        with pytest.raises(ValueError, match="cancelled run cannot be resumed"):
+            await restarted.resume("cancelled-pending")
+        assert attempts == 0
+
+    asyncio.run(scenario())
+
+
+def test_outer_deadline_blocks_restored_retry(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "runtime.db"
+        store = SQLiteCheckpointStore(db_path)
+        await _seed_pending_tool_run(
+            store,
+            run_id="expired-deadline",
+            tool_name="read",
+            status=ToolExecutionStatus.FAILED,
+            attempt=1,
+            retry_state=ToolRetryState.RETRY_PENDING,
+            next_retry_at=(datetime.now(UTC) + timedelta(seconds=30)).isoformat(),
+        )
+        state = await store.load("expired-deadline")
+        assert state is not None
+        state.created_at = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
+        await store.save(state)
+        attempts = 0
+
+        async def handler(_payload, _context):
+            nonlocal attempts
+            attempts += 1
+            return ToolResult("unexpected")
+
+        completed = await _runtime(
+            tmp_path,
+            llm=ToolLlm("read"),
+            tools=[_tool("read", handler)],
+            store=SQLiteCheckpointStore(db_path),
+            config=_config(wall_time=1),
+        ).resume("expired-deadline")
+        record = await SQLiteCheckpointStore(db_path).load_tool_execution(
+            "expired-deadline:call_read"
+        )
+        assert completed.status == RunStatus.FAILED
+        assert attempts == 0
+        assert record is not None
+        assert record.retry_state == ToolRetryState.RETRY_PENDING
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_additive_migration_safely_suppresses_legacy_unknown(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            create table tool_executions (
+                invocation_id text primary key,
+                run_id text not null,
+                tool_call_id text not null,
+                tool_name text not null,
+                arguments_hash text not null,
+                status text not null,
+                attempt integer not null,
+                result text,
+                is_error integer not null,
+                error text,
+                started_at text,
+                completed_at text,
+                updated_at text not null
+            )
+            """
+        )
+        conn.execute(
+            """
+            insert into tool_executions values (
+                'legacy:call_write', 'legacy', 'call_write', 'write', 'hash',
+                'UNKNOWN', 1, null, 1, 'timeout', null, null, '2026-01-01T00:00:00+00:00'
+            )
+            """
+        )
+    store = SQLiteCheckpointStore(db_path)
+    record = asyncio.run(store.load_tool_execution("legacy:call_write"))
+    assert record is not None
+    assert record.retry_state == ToolRetryState.RETRY_SUPPRESSED
+    assert record.retry_suppressed_reason == "unknown_outcome"
 
 
 def test_restart_preserves_tool_attempt_count(tmp_path):

@@ -35,6 +35,7 @@ from axiom.runtime import (
     SpanType,
     SQLiteCheckpointStore,
     ToolExecutionStatus,
+    ToolRetryState,
 )
 from axiom.runtime.observability_store import RunTracer
 from axiom.tools import ToolRegistry, get_builtin_tools
@@ -562,7 +563,9 @@ def test_runtime_task_cancellation_updates_tool_record_and_span(tmp_path):
         trace = await ObservabilityService(observations).trace("run-cancelled")
         tool_span = next(span for span in trace.spans if span.span_type == SpanType.TOOL)
         assert record is not None
-        assert record.status == ToolExecutionStatus.FAILED
+        assert record.status == ToolExecutionStatus.UNKNOWN
+        assert record.retry_state == ToolRetryState.RETRY_SUPPRESSED
+        assert record.retry_suppressed_reason == "unsafe"
         assert record.error == "tool execution cancelled"
         assert tool_span.status == SpanStatus.CANCELLED
         assert tool_span.attributes["cancelled"] is True
@@ -617,7 +620,9 @@ def test_supervisor_cancellation_reaches_restricted_process_tree_cleanup(tmp_pat
         assert signal_result.status == "signalled"
         assert state.status == RunStatus.CANCELLED
         assert record is not None
-        assert record.status == ToolExecutionStatus.FAILED
+        assert record.status == ToolExecutionStatus.UNKNOWN
+        assert record.retry_state == ToolRetryState.RETRY_SUPPRESSED
+        assert record.retry_suppressed_reason == "unsafe"
         assert record.error == "tool execution cancelled"
         assert not marker.exists()
         assert supervisor.list_active() == ()

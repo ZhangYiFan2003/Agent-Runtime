@@ -148,6 +148,18 @@ class DependencyConfig:
 
 
 @dataclass(slots=True)
+class StorageConfig:
+    """Durable Runtime storage selection. PostgreSQL credentials stay in the DSN."""
+
+    backend: str = "sqlite"
+    sqlite_path: str | None = None
+    postgres_dsn: str = ""
+    pool_min_size: int = 1
+    pool_max_size: int = 4
+    connect_timeout_seconds: float = 5.0
+
+
+@dataclass(slots=True)
 class ProgressConfig:
     """Deterministic, bounded no-progress detection for durable Runs."""
 
@@ -213,6 +225,7 @@ class AxiomConfig:
     context: ContextConfig = field(default_factory=ContextConfig)
     run_budget: RunBudgetConfig = field(default_factory=RunBudgetConfig)
     dependency: DependencyConfig = field(default_factory=DependencyConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
     progress: ProgressConfig = field(default_factory=ProgressConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
@@ -263,6 +276,8 @@ def config_to_public_dict(config: AxiomConfig) -> dict[str, Any]:
         data["llm"]["api_key"] = "***"
     if data.get("embedding", {}).get("api_key"):
         data["embedding"]["api_key"] = "***"
+    if data.get("storage", {}).get("postgres_dsn"):
+        data["storage"]["postgres_dsn"] = "***"
     return data
 
 
@@ -311,6 +326,21 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     context = result.setdefault("context", {})
     run_budget = result.setdefault("run_budget", {})
     progress = result.setdefault("progress", {})
+    storage = result.setdefault("storage", {})
+
+    storage_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_STORAGE_BACKEND", "backend", str),
+        ("AXIOM_SQLITE_PATH", "sqlite_path", str),
+        ("AXIOM_POSTGRES_DSN", "postgres_dsn", str),
+        ("AXIOM_POSTGRES_POOL_MIN_SIZE", "pool_min_size", int),
+        ("AXIOM_POSTGRES_POOL_MAX_SIZE", "pool_max_size", int),
+        ("AXIOM_POSTGRES_CONNECT_TIMEOUT_SECONDS", "connect_timeout_seconds", float),
+    ]
+    for env_key, config_key, caster in storage_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                storage[config_key] = caster(raw)
 
     mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_API_KEY", "api_key", str),
@@ -490,6 +520,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         context=ContextConfig(**data.get("context", {})),
         run_budget=RunBudgetConfig(**data.get("run_budget", {})),
         dependency=DependencyConfig(**data.get("dependency", {})),
+        storage=StorageConfig(**data.get("storage", {})),
         progress=ProgressConfig(**data.get("progress", {})),
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),
