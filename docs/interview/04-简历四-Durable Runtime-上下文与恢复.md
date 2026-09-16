@@ -735,7 +735,7 @@ SQLite/Memory Runtime store、可选 PostgreSQL shared durable store 与 bounded
 
 ### 【当前部分支持】
 
-外部写副作用只能在有幂等契约时安全重试；两种 durable backend 都持久化显式 retry state、`next_retry_at`、失败分类和 suppression reason，但 ToolExecution 唯一约束仍不能证明外部 exactly-once；PostgreSQL 真库集成仍必须在发布前通过；Context retention 能验证声明事实但没有证明开放域语义等价；模型价格可能未知；本地 supervisor 不能做多进程接管，也没有自动 Recovery Scanner。
+外部写副作用只能在有幂等契约时安全重试；两种 durable backend 都持久化显式 retry state、`next_retry_at`、失败分类和 suppression reason，但 ToolExecution 唯一约束仍不能证明外部 exactly-once；PostgreSQL contract/CAS/唯一约束已在真实 PostgreSQL 15.12 上通过，本地验证时 PostgreSQL 用例零跳过，但普通 CI 尚未配置 PostgreSQL 服务；Context retention 能验证声明事实但没有证明开放域语义等价；模型价格可能未知；本地 supervisor 不能做多进程接管，也没有自动 Recovery Scanner。
 
 ### 【未来可扩展】
 

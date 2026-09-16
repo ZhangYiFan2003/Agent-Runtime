@@ -20,8 +20,8 @@ Core runtime choices:
 - MCP integration: the official `mcp` Python SDK.
 - Durable Runtime persistence: SQLite by default for local/single-node use, with an optional
   PostgreSQL shared-store backend (`psycopg` + bounded pool) for cross-process durable truth.
-  SQLite is locally verified; the PostgreSQL implementation and contract tests exist, but the
-  real-database integration gate has not yet run in the current task environment.
+  SQLite is locally verified, and the PostgreSQL contract and concurrency suite has passed
+  against a real local PostgreSQL 15.12 instance. Ordinary CI does not yet provision PostgreSQL.
 
 The default LLM provider is `deepseek`, the default model is
 `deepseek-v4-flash`, and the default provider base URL is
