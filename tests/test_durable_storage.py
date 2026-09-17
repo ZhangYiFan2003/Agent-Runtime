@@ -129,12 +129,21 @@ def test_backend_identity_is_reported(durable_storage):
 
 
 def test_ephemeral_runtime_contracts_add_no_durable_tables(durable_storage):
-    forbidden = ("steps", "contexts", "context_snapshots")
+    forbidden = (
+        "steps",
+        "contexts",
+        "context_snapshots",
+        "completion_decisions",
+        "completion_policy",
+        "next_actions",
+    )
     if durable_storage.backend == "sqlite":
         with durable_storage.runtime._connect() as conn:
             rows = conn.execute(
                 "select name from sqlite_master where type = 'table' "
-                "and name in ('steps', 'contexts', 'context_snapshots')"
+                "and name in "
+                "('steps', 'contexts', 'context_snapshots', "
+                "'completion_decisions', 'completion_policy', 'next_actions')"
             ).fetchall()
     else:
         with durable_storage.runtime.pool.connection() as conn:

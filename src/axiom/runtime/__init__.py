@@ -131,7 +131,7 @@ from axiom.runtime.progress import (
     error_fingerprint,
     state_fingerprint,
 )
-from axiom.runtime.steps import NextAction, StepContext, StepResult
+from axiom.runtime.steps import CompletionPolicy, NextAction, StepContext, StepResult
 from axiom.runtime.storage import DurableStorage, create_durable_storage
 from axiom.runtime.strategies import ReactExecutionStrategy, RuntimeExecutionStrategy
 from axiom.runtime.supervisor import (
@@ -165,6 +165,7 @@ __all__ = [
     "CompletionVerificationResult",
     "CompletionVerificationStatus",
     "CompletionVerifier",
+    "CompletionPolicy",
     "DEPENDENCY_DEADLINE_EXCEEDED",
     "DEPENDENCY_RETRY_EXHAUSTED",
     "DEPENDENCY_TIMEOUT",

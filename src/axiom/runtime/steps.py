@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from axiom.runtime.completion import CompletionVerificationStatus
 from axiom.runtime.models import RunState, RunStatus
 from axiom.runtime.ownership import RunOwnership
+from axiom.runtime.progress import ProgressDecisionType
 
 
 class NextAction(StrEnum):
@@ -14,6 +16,55 @@ class NextAction(StrEnum):
     COMPLETE = "COMPLETE"
     WAIT = "WAIT"
     FAIL = "FAIL"
+
+
+class CompletionPolicy:
+    """Choose the Runtime continuation from small, structured evidence.
+
+    The policy is deliberately pure: detectors and verifiers produce evidence,
+    while the Runtime remains responsible for applying and persisting the
+    resulting RunState transition.
+    """
+
+    def decide(
+        self,
+        *,
+        run_status: RunStatus,
+        proposed_action: NextAction | None = None,
+        progress_decision: ProgressDecisionType | None = None,
+        verification_status: CompletionVerificationStatus | None = None,
+        allow_completion_correction: bool = False,
+        verification_attempt: int = 0,
+        max_correction_attempts: int = 0,
+        budget_exhausted: bool = False,
+        fatal_error: bool = False,
+    ) -> NextAction | None:
+        # Durable control state is authoritative and is not represented as a
+        # normal continuation action.
+        if run_status in {RunStatus.CANCELLED, RunStatus.INTERRUPTED}:
+            return None
+        if budget_exhausted or fatal_error or run_status == RunStatus.FAILED:
+            return NextAction.FAIL
+        if progress_decision == ProgressDecisionType.TERMINATE:
+            return NextAction.FAIL
+        if progress_decision == ProgressDecisionType.RECOVER:
+            return NextAction.CONTINUE
+
+        action = proposed_action or _action_for_status(run_status)
+        if action == NextAction.COMPLETE and verification_status is not None:
+            if verification_status in {
+                CompletionVerificationStatus.VERIFIED,
+                CompletionVerificationStatus.NOT_APPLICABLE,
+            }:
+                return NextAction.COMPLETE
+            if (
+                verification_status == CompletionVerificationStatus.NOT_VERIFIED
+                and allow_completion_correction
+                and verification_attempt <= max_correction_attempts
+            ):
+                return NextAction.CONTINUE
+            return NextAction.FAIL
+        return action
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,12 +103,12 @@ class StepResult:
         return cls(
             step_index=step_index,
             run_state=run_state,
-            next_action=_next_action(run_state.status),
+            next_action=CompletionPolicy().decide(run_status=run_state.status),
             tool_invocation_ids=tool_invocation_ids,
         )
 
 
-def _next_action(status: RunStatus) -> NextAction | None:
+def _action_for_status(status: RunStatus) -> NextAction | None:
     if status == RunStatus.RUNNING:
         return NextAction.CONTINUE
     if status == RunStatus.COMPLETED:

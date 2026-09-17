@@ -89,7 +89,7 @@ from axiom.runtime.progress import (
     evidence_fingerprint,
     recovery_message,
 )
-from axiom.runtime.steps import StepContext, StepResult
+from axiom.runtime.steps import CompletionPolicy, NextAction, StepContext, StepResult
 from axiom.runtime.strategies import RuntimeExecutionStrategy, execution_strategy_from_name
 from axiom.runtime.supervisor import ActiveRunSupervisor, ExecutionHandle
 from axiom.tools.base import Tool, ToolContext, ToolResult
@@ -157,6 +157,7 @@ class DurableAgentRuntime:
         budget_manager: BudgetManager | None = None,
         progress_detector: ProgressDetector | None = None,
         completion_verifier: CompletionVerifier | None = None,
+        completion_policy: CompletionPolicy | None = None,
         retry_random: Callable[[], float] | None = None,
         retry_sleep: Callable[[float], Awaitable[None]] | None = None,
         ownership: RunOwnership | None = None,
@@ -204,6 +205,7 @@ class DurableAgentRuntime:
             ProgressPolicy.from_config(config.progress)
         )
         self.completion_verifier = completion_verifier or CompletionVerifier()
+        self.completion_policy = completion_policy or CompletionPolicy()
         self.max_turns = max_turns
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -1063,7 +1065,14 @@ class DurableAgentRuntime:
         parent_span_id: str | None = None,
     ) -> CompletionVerificationResult | None:
         if not state.completion_contract:
-            state.status = RunStatus.COMPLETED
+            action = self.completion_policy.decide(
+                run_status=state.status,
+                proposed_action=NextAction.COMPLETE,
+                verification_status=CompletionVerificationStatus.NOT_APPLICABLE,
+            )
+            if action == NextAction.COMPLETE:
+                state.status = RunStatus.COMPLETED
+                state.error = None
             return None
         contract = CompletionContract.from_dict(state.completion_contract)
         state.completion_verification_attempts += 1
@@ -1114,20 +1123,23 @@ class DurableAgentRuntime:
                 "failed_check_ids": list(result.failed_check_ids),
             },
         )
-        if result.status in {
-            CompletionVerificationStatus.VERIFIED,
-            CompletionVerificationStatus.NOT_APPLICABLE,
-        }:
+        action = self.completion_policy.decide(
+            run_status=state.status,
+            proposed_action=NextAction.COMPLETE,
+            verification_status=result.status,
+            allow_completion_correction=allow_correction,
+            verification_attempt=attempt,
+            max_correction_attempts=contract.max_correction_attempts,
+        )
+        if action == NextAction.COMPLETE:
             state.status = RunStatus.COMPLETED
             state.error = None
             return result
-        if (
-            result.status == CompletionVerificationStatus.NOT_VERIFIED
-            and allow_correction
-            and attempt <= contract.max_correction_attempts
-        ):
+        if action == NextAction.CONTINUE:
             state.status = RunStatus.RUNNING
             state.messages.append(Message(role="user", content=verification_feedback(result)))
+            return result
+        if action is None:
             return result
         state.status = RunStatus.FAILED
         state.error = RunError(
@@ -1921,7 +1933,12 @@ class DurableAgentRuntime:
                     "detector_type": progress_state.detector_type,
                 },
             )
-        elif decision.decision == ProgressDecisionType.TERMINATE:
+        next_action = self.completion_policy.decide(
+            run_status=state.status,
+            proposed_action=NextAction.CONTINUE,
+            progress_decision=decision.decision,
+        )
+        if next_action == NextAction.FAIL:
             await self._fail(
                 state,
                 NoProgressError(
@@ -1984,6 +2001,14 @@ class DurableAgentRuntime:
         return state
 
     async def _fail(self, state: Checkpoint, exc: Exception, *, step: str) -> Checkpoint:
+        action = self.completion_policy.decide(
+            run_status=state.status,
+            proposed_action=NextAction.CONTINUE,
+            budget_exhausted=isinstance(exc, BudgetExceededError),
+            fatal_error=not isinstance(exc, BudgetExceededError),
+        )
+        if action is None:
+            return state
         state.status = RunStatus.FAILED
         state.error = RunError(
             type=exc.code
