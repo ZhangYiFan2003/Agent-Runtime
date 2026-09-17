@@ -18,7 +18,7 @@ Agent 任务比普通 HTTP 请求更长，也更有状态。一次任务可能�
 
 我把 durable Run 看成一个持久化状态机。Runtime 在 LLM、Tool、interrupt 等关键边界保存带版本号的 Checkpoint，并用 CAS 拒绝旧版本覆盖新状态；Tool 调用使用稳定 invocation ID，成功结果写入 ToolExecution，恢复时相同调用可直接复用。
 
-长上下文由 ContextManager 在每次模型调用前重新估算：保留系统协议、当前目标、近期原始消息和结构化任务状态，对较早内容做摘要，对过大的历史 Tool 输出做投影，并在硬上限前 fail closed。RunBudget 同时限制步骤、模型/工具调用、Token、时间和成本；ProgressDetector 检查重复动作、重复错误、短循环和状态停滞。当前 durable truth 可选本地 SQLite 或共享 PostgreSQL，但共享存储不等于分布式 Worker 接管，也不提供外部写 exactly-once。
+长上下文在每次模型调用前分两段处理：ContextBuilder 决定这次需要哪些信息，ContextBudget 再按模型窗口和输出预留做估算、摘要、Tool 投影与 fail closed。构建结果不持久化，宕机后从 RunState、历史/Memory 和 ToolExecution 重建。RunBudget 另行限制整个 Run 的步骤、调用、实际 Token、时间和成本；ProgressDetector 检查重复动作、重复错误、短循环和状态停滞。
 
 ## 3. 2～3 分钟完整故事
 
@@ -30,7 +30,7 @@ Step Contract 只统一一次迭代的内存输入输出：`StepContext` 引用�
 
 Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool call 身份派生，并保存参数哈希。若记录已是 `SUCCEEDED`，恢复时可以复用结果；若进程在 Tool 外部副作用成功后、写成功记录前崩溃，数据库里可能仍是 `RUNNING`，此时结果未知。已分类的 unsafe timeout 会持久化为 `UNKNOWN + RETRY_SUPPRESSED`，重启不会重新执行；读操作或带下游幂等契约的 Tool 才适合按剩余 attempt 和 UTC backoff deadline 自动重试。这里说“Tool 结果成功持久化”，不要把它叫成 Kafka/Redis Streams 的消息 ACK。
 
-上下文管理不是简单“超过长度就 summary”。ContextManager 先组成消息单元，保护 tool_call/tool_result 配对与最新用户目标，复用已有结构化摘要，将历史超大 Tool 输出投影为名称、状态和裁剪内容。达到高水位才压缩到目标区间；若固定内容本身超过硬上限，在调用 LLM 之前就失败。Map-Reduce 摘要也用于长会话记忆，但执行态摘要和长期事实不能混为一谈。
+上下文管理不是简单“超过长度就 summary”。ContextBuilder 做语义选择和组装，不因 token 压力自行删内容；ContextBudget 保护 tool_call/tool_result 原子单元和输出预留，复用已有结构化摘要，将历史超大 Tool 输出投影，并在 required 内容仍超限时于调用 LLM 前返回 `CONTEXT_BUDGET_EXCEEDED`。Map-Reduce 摘要也用于长会话记忆，但执行态摘要、长期事实和本次临时 Context 不能混为一谈。
 
 最后用预算、deadline 和无进展检测封顶。预算在调用前预留、调用后按实际用量核销，Child Run 消耗归集到 root ledger；未知模型价格标成 unknown，而不是按 0 元。LLM/Tool attempt 的 timeout 会取配置值和 root Run 剩余 lifetime 的较小值；暂态失败的每次 retry 仍占普通调用预算。ProgressDetector 使用稳定指纹识别同动作、同错误、2～4 步短循环和状态无变化，先给恢复提示，仍不收敛则以 `NO_PROGRESS` 终止。
 
@@ -71,7 +71,7 @@ Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool c
 - `src/axiom/runtime/postgres.py`：psycopg 3 bounded pool、PostgreSQL schema/version、Run head CAS、Checkpoint history、ToolExecution、budget ledger、Event 与 control idempotency。
 - `src/axiom/runtime/events.py`：EventRepository contract 与 SQLite event backend；PostgreSQL Event ID 使用 identity/BIGINT，保证 replay 顺序但不追求无空洞。
 - `src/axiom/runtime/durable.py`：`start/resume/interrupt/cancel`、LLM/Tool 边界、稳定 invocation、恢复和错误状态。
-- `src/axiom/context.py`：`ContextBudgetPolicy`、`RuntimeContextSummary`、`ContextManager`、Tool 投影和硬上限。
+- `src/axiom/context.py`：`ContextBuilder/ContextBuildResult` 做语义组装，`ContextBudget` 做窗口约束、Tool 投影、协议原子性、摘要与硬上限；`ContextManager` 保留兼容门面。
 - `src/axiom/runtime/budget.py`：策略、Decimal 定价、预留/核销、root Run 聚合。
 - `src/axiom/runtime/progress.py`：动作/错误/状态/证据指纹、短循环和恢复提示。
 - `src/axiom/memory/summarizer.py`、`memory/context.py`：Map-Reduce 会话摘要和记忆上下文；它们与 Runtime Context projection 是相关但不同的层。

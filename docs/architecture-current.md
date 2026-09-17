@@ -522,9 +522,9 @@ is a projection layer, not a persistence or memory replacement:
 ```text
 Durable State
      ↓
-Context Projection
+ContextBuilder (semantic selection / assembly)
      ↓
-Token Budget
+ContextBudget (token-window enforcement)
      ↓
 Optional Compaction
      ↓
@@ -546,10 +546,12 @@ The three layers remain intentionally distinct:
 
 ### Budget and configuration
 
-`ContextManager` runs immediately before each provider call in normal ReAct, durable ReAct,
-planning, compatibility multi-agent roles, and durable multi-agent parent roles. Plan-and-Execute
-and Multi-Agent tool-capable Child Runs use nested `DurableAgentRuntime` instances and therefore
-inherit the same check.
+`ContextBuilder` decides which existing Runtime messages, valid reusable summary, Tool protocol
+evidence, strategy-specific prompt, and recovery hint are desired for a model call. It does not
+trim for token pressure and returns only an ephemeral `ContextBuildResult`. `ContextBudget.fit()`
+then estimates and fits that desired context within one request's input window. `ContextManager`
+remains the compatibility facade composing both stages. ReAct and durable multi-agent role calls
+use the split explicitly; planning and lightweight paths use the same split through that facade.
 
 The deterministic estimator counts the system prompt, tool definitions, message content,
 tool-call metadata, and per-message overhead. It implements the pluggable `TokenEstimator`
@@ -584,7 +586,8 @@ target = usable_input * target_after_compaction_ratio
 
 ### Compaction and pinned context
 
-The manager first reuses a valid prior live summary and its covered-prefix fingerprint. When the
+The builder validates a prior live summary against its covered-prefix fingerprint without mutating
+RunState. The budget stage reuses that summary and, when the
 projection reaches the high watermark, it selects only the oldest eligible prefix, segments it for
 the existing map stage, calls the existing `ConversationSummarizer` map/reduce protocol, and emits
 one structured summary containing objective, constraints, decisions, completed work, open work,
@@ -603,7 +606,7 @@ includes the tool name, success/error state, original character size, `truncated
 head/tail content. The full ToolExecution result remains durable. Current/recent tool interactions
 remain pinned; if they alone cannot fit, the request fails rather than silently discarding them.
 
-After compaction the manager re-estimates the complete request. If the configured summarizer
+After compaction the budget stage re-estimates the complete request. If the configured summarizer
 fails, it retains the prior derived summary and durable history, then uses the deterministic local
 summarizer for eligible old context. If pinned context still exceeds the hard input limit, the Run
 fails before provider invocation with `CONTEXT_BUDGET_EXCEEDED`. No known-oversized request is sent,
@@ -614,6 +617,11 @@ Existing LLM spans record `context.estimated_tokens_before`,
 `context.compaction_count`, `context.compression_ratio`, `context.evicted_messages`,
 `context.preserved_messages`, `context.tool_results_projected`, and
 `context.trigger_reason`. These attributes contain counts and decisions, never full tool payloads.
+No complete prompt or `ContextBuildResult` is persisted: after a crash the Runtime rebuilds it from
+RunState, history/Memory, existing summary state, and ToolExecution evidence. Memory stores reusable
+information; retrieval produces candidate evidence; ContextBuilder decides whether that evidence
+joins this call; ContextBudget only enforces the window. ContextBudget is per request, while
+RunBudget accounts cumulative calls, actual provider-reported tokens, time, and cost across a Run.
 
 ### Interview-oriented explanation
 
