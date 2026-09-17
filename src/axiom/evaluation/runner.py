@@ -16,6 +16,7 @@ from axiom.evaluation.models import (
     ScorerSpec,
     now,
 )
+from axiom.evaluation.quality import project_run_evidence
 from axiom.evaluation.scorers import Scorer, required_scores_passed, score_case, scorer_from_spec
 from axiom.runtime.checkpoints import RuntimeStore
 from axiom.runtime.completion import CompletionVerificationResult
@@ -135,6 +136,12 @@ class DurableEvaluationExecutor:
                 child_bundles.append(child_bundle)
             if child_metric is not None:
                 child_metrics.append(child_metric)
+        all_run_ids = [run_id, *sorted(child_run_ids)]
+        tool_executions = [
+            record
+            for evidence_run_id in all_run_ids
+            for record in await self.checkpoint_store.list_tool_executions(evidence_run_id)
+        ]
         tool_calls = (
             [
                 str(span.attributes.get("tool_name") or span.name.removeprefix("tool."))
@@ -209,6 +216,15 @@ class DurableEvaluationExecutor:
             verification_attempts=(verification.attempt if verification is not None else 0),
             failed_verification_checks=(
                 list(verification.failed_check_ids) if verification is not None else []
+            ),
+            quality=(
+                project_run_evidence(
+                    state,
+                    [trace_bundle for trace_bundle in [bundle, *child_bundles] if trace_bundle],
+                    tool_executions,
+                )
+                if state is not None
+                else None
             ),
         )
 

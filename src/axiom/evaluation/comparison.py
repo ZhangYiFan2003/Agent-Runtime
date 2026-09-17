@@ -72,6 +72,9 @@ class RegressionThresholds:
     max_latency_increase_ratio: float | None = None
     max_step_increase: float | None = None
     max_cost_per_success_increase_ratio: float | None = None
+    max_completion_verified_rate_drop: float | None = None
+    max_no_progress_rate_increase: float | None = None
+    max_tool_success_rate_drop: float | None = None
     fail_new_required_case_failure: bool = True
 
     def __post_init__(self) -> None:
@@ -81,6 +84,9 @@ class RegressionThresholds:
             "max_latency_increase_ratio",
             "max_step_increase",
             "max_cost_per_success_increase_ratio",
+            "max_completion_verified_rate_drop",
+            "max_no_progress_rate_increase",
+            "max_tool_success_rate_drop",
         ):
             value = getattr(self, name)
             if value is not None and value < 0:
@@ -160,6 +166,17 @@ def compare_results(
     new_cost = _optional_metric(new.cost_per_success)
     if old_cost is not None and new_cost is not None:
         changes.append(_change("cost_per_success", old_cost, new_cost))
+    for name, old_value, new_value in (
+        (
+            "completion_verified_rate",
+            old.quality.completion_verified_rate,
+            new.quality.completion_verified_rate,
+        ),
+        ("no_progress_rate", old.quality.no_progress_rate, new.quality.no_progress_rate),
+        ("tool_success_rate", old.quality.tool_success_rate, new.quality.tool_success_rate),
+    ):
+        if old_value is not None and new_value is not None:
+            changes.append(_change(name, old_value, new_value))
     warnings: list[PerformanceWarning] = []
     if _increase_percent(old.avg_tokens, new.avg_tokens) > token_warning_percent:
         warnings.append(
@@ -275,6 +292,30 @@ def evaluate_regression_gate(
             f"{policy.max_latency_increase_ratio:.4f}"
         )
     warnings = [warning.message for warning in comparison.performance_warnings]
+    _quality_drop_gate(
+        failures,
+        warnings,
+        "completion verified rate",
+        baseline.quality.completion_verified_rate,
+        candidate.quality.completion_verified_rate,
+        policy.max_completion_verified_rate_drop,
+    )
+    _quality_increase_gate(
+        failures,
+        warnings,
+        "NO_PROGRESS rate",
+        baseline.quality.no_progress_rate,
+        candidate.quality.no_progress_rate,
+        policy.max_no_progress_rate_increase,
+    )
+    _quality_drop_gate(
+        failures,
+        warnings,
+        "tool success rate",
+        baseline.quality.tool_success_rate,
+        candidate.quality.tool_success_rate,
+        policy.max_tool_success_rate_drop,
+    )
     warnings.extend(
         f"stochastic quality change: {case_id} had a lower trial success rate"
         for case_id in comparison.stochastic_regressions
@@ -314,6 +355,38 @@ def _increase_ratio(old: float, new: float) -> float:
 
 def _optional_metric(value: str | None) -> float | None:
     return float(value) if value is not None else None
+
+
+def _quality_drop_gate(
+    failures: list[str],
+    warnings: list[str],
+    name: str,
+    baseline: float | None,
+    candidate: float | None,
+    limit: float | None,
+) -> None:
+    if limit is None:
+        return
+    if baseline is None or candidate is None:
+        warnings.append(f"{name} gate not evaluated because evidence is unavailable")
+    elif baseline - candidate > limit:
+        failures.append(f"{name} regression: drop exceeded {limit:.4f}")
+
+
+def _quality_increase_gate(
+    failures: list[str],
+    warnings: list[str],
+    name: str,
+    baseline: float | None,
+    candidate: float | None,
+    limit: float | None,
+) -> None:
+    if limit is None:
+        return
+    if baseline is None or candidate is None:
+        warnings.append(f"{name} gate not evaluated because evidence is unavailable")
+    elif candidate - baseline > limit:
+        failures.append(f"{name} regression: increase exceeded {limit:.4f}")
 
 
 def _aggregates(suite: EvaluationSuiteResult) -> dict[str, EvaluationCaseAggregate]:

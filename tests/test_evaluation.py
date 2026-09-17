@@ -270,6 +270,12 @@ def test_runner_uses_real_durable_runtime_and_captures_metrics(tmp_path):
         assert checkpoint.turn_id == result.turn_id
         assert trace is not None
         assert result.trace_id == trace.trace.trace_id
+        assert result.quality is not None
+        assert result.quality.logical_tool_calls == 1
+        assert result.quality.physical_tool_attempts == 1
+        assert result.quality.tool_success_rate == 1.0
+        assert len(result.quality.steps) == 3
+        assert suite.quality.logical_tool_calls == 1
 
     asyncio.run(scenario())
 

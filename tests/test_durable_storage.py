@@ -139,6 +139,9 @@ def test_ephemeral_runtime_contracts_add_no_durable_tables(durable_storage):
         "step_results",
         "step_transitions",
         "runtime_loops",
+        "step_views",
+        "step_metrics",
+        "evaluation_steps",
     )
     if durable_storage.backend == "sqlite":
         with durable_storage.runtime._connect() as conn:
@@ -147,7 +150,8 @@ def test_ephemeral_runtime_contracts_add_no_durable_tables(durable_storage):
                 "and name in "
                 "('steps', 'contexts', 'context_snapshots', "
                 "'completion_decisions', 'completion_policy', 'next_actions', "
-                "'step_results', 'step_transitions', 'runtime_loops')"
+                "'step_results', 'step_transitions', 'runtime_loops', "
+                "'step_views', 'step_metrics', 'evaluation_steps')"
             ).fetchall()
     else:
         with durable_storage.runtime.pool.connection() as conn:

@@ -5,10 +5,15 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from axiom.evaluation.quality import (
+    EvaluationQualitySummary,
+    RunEvaluationView,
+    aggregate_quality,
+)
 from axiom.runtime.completion import CompletionContract
 
 EVALUATION_SCHEMA_VERSION = 1
-EVALUATION_RESULT_SCHEMA_VERSION = 3
+EVALUATION_RESULT_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +214,7 @@ class EvaluationRunResult:
     verification_status: str = "NOT_APPLICABLE"
     verification_attempts: int = 0
     failed_verification_checks: list[str] = field(default_factory=list)
+    quality: RunEvaluationView | None = None
 
     @property
     def tool_call_count(self) -> int:
@@ -245,6 +251,7 @@ class EvaluationRunResult:
                 "attempts": self.verification_attempts,
                 "failed_checks": list(self.failed_verification_checks),
             },
+            "quality": self.quality.to_dict() if self.quality is not None else None,
             "case_definition": _json_dict(self.case_definition),
             "attribution": _json_dict(self.attribution),
         }
@@ -286,10 +293,13 @@ class EvaluationRunResult:
             verification_status=str(verification.get("status") or "NOT_APPLICABLE"),
             verification_attempts=max(0, int(verification.get("attempts") or 0)),
             failed_verification_checks=[
-                str(item)
-                for item in verification.get("failed_checks", [])
-                if isinstance(item, str)
+                str(item) for item in verification.get("failed_checks", []) if isinstance(item, str)
             ],
+            quality=(
+                RunEvaluationView.from_dict(data["quality"])
+                if isinstance(data.get("quality"), dict)
+                else None
+            ),
         )
 
 
@@ -433,6 +443,7 @@ class EvaluationSuiteResult:
     cost_per_success: str | None = None
     cost_known_trial_count: int = 0
     cost_fully_known: bool = False
+    quality: EvaluationQualitySummary = field(default_factory=EvaluationQualitySummary)
 
     @classmethod
     def create(
@@ -496,6 +507,9 @@ class EvaluationSuiteResult:
             ),
             cost_known_trial_count=len(costs),
             cost_fully_known=cost_fully_known,
+            quality=aggregate_quality(
+                result.quality for result in results if result.quality is not None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -521,6 +535,7 @@ class EvaluationSuiteResult:
             "cost_per_success": self.cost_per_success,
             "cost_known_trial_count": self.cost_known_trial_count,
             "cost_fully_known": self.cost_fully_known,
+            "quality": self.quality.to_dict(),
             "case_aggregates": [item.to_dict() for item in self.case_aggregates],
             "attribution": _json_dict(self.attribution),
             "results": [result.to_dict() for result in self.results],
@@ -532,6 +547,7 @@ class EvaluationSuiteResult:
         if schema_version not in {
             EVALUATION_SCHEMA_VERSION,
             2,
+            3,
             EVALUATION_RESULT_SCHEMA_VERSION,
         }:
             raise ValueError(f"unsupported evaluation result schema version: {schema_version}")
@@ -579,7 +595,7 @@ class EvaluationSuiteResult:
             attribution=_json_dict(data.get("attribution")),
             schema_version=(
                 EVALUATION_RESULT_SCHEMA_VERSION
-                if schema_version in {EVALUATION_SCHEMA_VERSION, 2}
+                if schema_version in {EVALUATION_SCHEMA_VERSION, 2, 3}
                 else schema_version
             ),
             total_cost_usd=_optional_str(data.get("total_cost_usd")),
@@ -588,6 +604,13 @@ class EvaluationSuiteResult:
             cost_per_success=_optional_str(data.get("cost_per_success")),
             cost_known_trial_count=int(data.get("cost_known_trial_count") or 0),
             cost_fully_known=bool(data.get("cost_fully_known")),
+            quality=(
+                EvaluationQualitySummary.from_dict(data["quality"])
+                if isinstance(data.get("quality"), dict)
+                else aggregate_quality(
+                    result.quality for result in results if result.quality is not None
+                )
+            ),
         )
 
 
