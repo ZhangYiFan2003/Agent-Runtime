@@ -17,3 +17,4 @@ credentials.json
 *.secret
 *token*
 .uv-cache/
+docs/interview/
