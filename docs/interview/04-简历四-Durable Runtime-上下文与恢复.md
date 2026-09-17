@@ -57,7 +57,9 @@ Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool c
                ActiveRunSupervisor
 ```
 
-必须反复强调：**shared durable state != live process ownership**。SQLite 或 PostgreSQL 里的状态能让进程重建执行；`asyncio.Task` 和 `ActiveRunSupervisor` 只代表当前进程里谁正在跑。PostgreSQL 让多个进程看到同一真相，但不能阻止它们同时决定执行；当前没有 lease、heartbeat、fencing 或自动接管。
+必须反复强调：**shared durable state != live process ownership**。SQLite 或 PostgreSQL 里的状态能让进程重建执行；`asyncio.Task` 和 `ActiveRunSupervisor` 只代表当前进程里谁正在跑。现在 PostgreSQL Worker 另有 durable runnable metadata、原子 claim、数据库时间 lease、heartbeat 和单调 fencing token：它们约束谁能继续提交 Runtime 状态，并在 lease 过期后由 claim loop 自动接管；SQLite 仍只支持单节点。
+
+这几层不要混淆：`FOR UPDATE SKIP LOCKED` 只在短事务内避开并发候选，事务提交后锁就消失；长任务所有权来自 lease + fencing，而不是把事务保持到 LLM/Tool 结束。Checkpoint CAS 防同一 sequence 的 stale state，fencing 防旧 ownership generation；heartbeat 无法证明权限时 fail closed。fencing 只能拒绝旧 Worker 写 Runtime truth，不能撤回已经发往外部系统的副作用。
 
 ## 5. 最新源码实现
 
@@ -205,7 +207,7 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 
 **先给结论：** 重新加载最新 Checkpoint，校验当前状态和版本，重建 LLM/Tool/策略依赖，再由 `resume` 从 pending 边界推进；父 Run 还要重新对账 Child 状态。
 
-**60～120 秒完整口语答案：** Runtime 不恢复原协程栈，而是重新构造 DurableAgentRuntime，读取 Checkpoint 中的消息、策略状态、pending Tool、interrupt 和版本。如果处于可恢复状态，`resume` 根据策略继续；如果有已完成 ToolExecution，按稳定 invocation 复用结果；Plan/Multi-Agent 父 Run读取 Child Checkpoint 重新计算就绪或汇合。当前恢复由本地 API/调用链触发，ActiveRunSupervisor 的内存 Task 不会跨进程保存，也没有自动多机抢占。
+**60～120 秒完整口语答案：** Runtime 不恢复原协程栈，而是重新构造 DurableAgentRuntime，读取 Checkpoint 中的消息、策略状态、pending Tool、interrupt 和版本。如果处于可恢复状态，`resume` 根据策略继续；如果有已完成 ToolExecution，按稳定 invocation 复用结果；Plan/Multi-Agent 父 Run读取 Child Checkpoint 重新计算就绪或汇合。SQLite 恢复仍由本地 API/调用链触发；PostgreSQL Worker 的 claim loop 会在 lease 过期后自动取得更高 fence 并 resume。ActiveRunSupervisor 的内存 Task 始终不会跨进程保存。
 
 **第一轮追问：** “恢复后两个请求同时 resume？”——同进程锁减少竞争，Checkpoint CAS 决定谁成功推进；失败方重新加载或返回冲突。
 
@@ -374,7 +376,7 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 
 **面试官想看什么：** durable recovery capability 与 automatic ownership/failover 的边界。
 
-**先说结论：** 当前 SQLite 保存 Run/Checkpoint/ToolExecution，API 能识别 `RUNNING` 为 recovery 状态并由显式 resume 重建；`ActiveRunSupervisor` 不跨进程，也没有自动扫描、lease、heartbeat 或 fencing。
+**先说结论：** SQLite 仍由显式 resume 重建；PostgreSQL distributed Worker 的轮询 claim loop 会发现 runnable 且无有效 lease 的 `RUNNING` Run，原子取得更高 fencing token，再从最新 Checkpoint resume。`ActiveRunSupervisor` 仍不跨进程，只负责 owner 本地 Task。
 
 **60～120 秒完整口语答案：** “服务重启后可以查到哪些 Checkpoint 仍是 RUNNING，但数据库记录不会自己执行。当前由客户端/API resume 触发，Runtime 先写一个 no-op claim checkpoint，让同一 sequence 的第二个恢复者冲突，再重建 LLM、Tool 和策略依赖。这个 claim 能减少双推进，却不是长期 owner lease，也不能保证两个 Worker 在 claim 前没调用外部 Tool。生产化我会用共享 PostgreSQL，原子抢 owner lease，heartbeat 续租，过期后 recovery scanner 接管，并用递增 fencing token 让旧 owner 的写失效。”
 
@@ -383,7 +385,7 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 - **为什么问：** 检查内存 registry 的作用域。
 - **30～60 秒回答：** “它保存本进程 Task 和 Event Loop 引用，用于线程安全 cancel 和 drain；进程一死引用全没，也没有跨节点共识或租约。所以它是 live execution registry，不是 durable ownership service。”
 
-**当前边界：** restart recovery capability 和本地 supervisor 已实现；自动 failover/lease/fencing 是未来设计。
+**当前边界：** PostgreSQL 的 claim/lease/heartbeat/fencing 与过期自动接管已实现；全局准入、背压、公平/优先级调度、Run DLQ 和跨进程即时 Task signal 仍未实现。
 
 ### P1 — 回答后的自然深挖（8 题）
 
@@ -439,9 +441,9 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 
 **为什么会被追到这里：** 你解释 CAS 后自然产生所有权问题。
 
-**30～60 秒回答：** Checkpoint CAS 会让一个状态写成功、另一个冲突，但二者可能已经同时产生外部调用，所以 CAS 不足以阻止双执行。当前用进程内锁和 Supervisor 限制本地并发；多进程要 lease/atomic claim/fencing。
+**30～60 秒回答：** PostgreSQL 用短事务原子 claim，所以同一代只有一个 Worker 获得 lease；所有执行权威写同时校验 fencing token。Checkpoint CAS 仍负责 sequence 冲突。即便如此，已发出的外部调用仍可能产生副作用，所以还需要稳定 invocation 与下游幂等，不能宣称 exactly-once。
 
-**典型继续追问：** “fencing 是什么？” **回答思路：** 递增所有权令牌，存储/下游拒绝旧令牌写。**项目边界：** 当前没有多进程 Run ownership。
+**典型继续追问：** “fencing 是什么？” **回答思路：** 每次 claim 递增所有权令牌；Checkpoint、ToolExecution 与 budget ledger 写在同一短事务中锁定并校验当前 owner/token/未过期 lease，旧令牌写抛出 `OwnershipLostError`。
 
 #### P1-8｜“CAS 和幂等为什么不是一回事？”
 
@@ -711,7 +713,7 @@ Tool 成功但 Checkpoint 前挂了怎么办？
   - **30～60 秒回答：** “它是对当前 checkpoint sequence 的乐观 claim，只能让两个恢复者不能都从同一版本继续写；它没有租期、续租和 owner identity，也不能阻止 claim 前的外部调用，所以不是分布式锁。”
 - **“SQLite 为什么现在合适、何时迁 PostgreSQL？”**
   - **为什么问：** 简历明确写 SQLite。
-  - **30～60 秒回答：** “项目先服务本地 Runtime，SQLite 零运维、事务和 WAL 适合小写并发与快速迭代，所以保留为默认。现在已增加 PostgreSQL backend，让多个进程共享 Run/Checkpoint/ToolExecution/Event 真相，并用跨进程原子 CAS；但尚未增加 claim、lease 和 fencing，因此两个 Worker 仍可能执行同一个 Run。”
+  - **30～60 秒回答：** “项目先服务本地 Runtime，SQLite 零运维、事务和 WAL 适合小写并发与快速迭代，所以保留为默认。PostgreSQL 先提供共享真相和跨进程 CAS，现在又加入 runnable claim、lease、heartbeat 和 fencing；两个并发 claimer 只有一个获得当前执行权，旧 owner 的权威写会被拒绝。”
 - **“为什么 durable truth 不只放 Redis？”**
   - **为什么问：** 区分正确性真相与临时协调缓存。
   - **30～60 秒回答：** “Run、Checkpoint 和 ToolExecution 决定崩溃后能否安全恢复，需要事务、约束、可查询历史和明确 schema；PostgreSQL 是 durable correctness truth。Redis 以后可以辅助通知或协调，但不能在当前设计里成为唯一真相源。”
@@ -735,7 +737,7 @@ SQLite/Memory Runtime store、可选 PostgreSQL shared durable store 与 bounded
 
 ### 【当前部分支持】
 
-外部写副作用只能在有幂等契约时安全重试；两种 durable backend 都持久化显式 retry state、`next_retry_at`、失败分类和 suppression reason，但 ToolExecution 唯一约束仍不能证明外部 exactly-once；PostgreSQL contract/CAS/唯一约束已在真实 PostgreSQL 15.12 上通过，本地验证时 PostgreSQL 用例零跳过，但普通 CI 尚未配置 PostgreSQL 服务；Context retention 能验证声明事实但没有证明开放域语义等价；模型价格可能未知；本地 supervisor 不能做多进程接管，也没有自动 Recovery Scanner。
+外部写副作用只能在有幂等契约时安全重试；两种 durable backend 都持久化显式 retry state、`next_retry_at`、失败分类和 suppression reason，但 ToolExecution 唯一约束与 Runtime fencing 仍不能证明外部 exactly-once；PostgreSQL storage contract 与 ownership matrix 已在真实 PostgreSQL 15 上通过，普通 CI 尚未配置 PostgreSQL 服务；Context retention 能验证声明事实但没有证明开放域语义等价；模型价格可能未知；本地 Supervisor 不做跨进程 ownership，自动接管由 PostgreSQL claim/lease/fence Worker loop 完成。
 
 ### 【未来可扩展】
 

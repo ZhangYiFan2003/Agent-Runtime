@@ -22,6 +22,10 @@ Core runtime choices:
   PostgreSQL shared-store backend (`psycopg` + bounded pool) for cross-process durable truth.
   SQLite is locally verified, and the PostgreSQL contract and concurrency suite has passed
   against a real local PostgreSQL 15.12 instance. Ordinary CI does not yet provision PostgreSQL.
+- Distributed Run ownership on PostgreSQL: durable runnable metadata, atomic short-transaction
+  claims, database-time leases, heartbeat renewal, per-Run fencing generations, expired-lease
+  takeover, and ownership-fenced Checkpoint, ToolExecution, and budget writes. SQLite remains the
+  local/single-node backend and rejects distributed Worker mode.
 
 The default LLM provider is `deepseek`, the default model is
 `deepseek-v4-flash`, and the default provider base URL is
@@ -940,6 +944,32 @@ environment overrides follow normal config precedence; inconsistent bounds are r
 10. **Can it false-positive?** Yes; conservative defaults, complete-cycle requirements, evidence
     resets, and recovery-before-termination mitigate that risk.
 
+## 12.1 Distributed Run ownership
+
+Distributed Worker mode keeps execution status separate from scheduling metadata on `runs`:
+`runnable`, `owner_worker_id`, `lease_until`, and monotonic `fencing_token` (plus diagnostic claim
+and heartbeat timestamps). `claim_next` selects stable `created_at/run_id` order with
+`FOR UPDATE SKIP LOCKED`, updates ownership, and commits immediately. The row lock only avoids
+claim-selection contention; the finite lease and fence provide long-running authority, so no
+database transaction spans LLM or Tool work.
+
+The claimability predicate requires a runnable active execution state (`RUNNING` or the Parent's
+inline-child coordination state `WAITING_CHILD`), no active lease, a live wall-time deadline, and
+no cancelled durable ancestor. User-intentionally `INTERRUPTED` Runs are not
+automatically recovered. Routine heartbeats use PostgreSQL server time and do not append Event rows.
+Renewal rejection or database uncertainty fails closed and cancels local execution. A later claim
+of an expired runnable Run increments the fence and resumes its latest Checkpoint; no separate
+queue broker or state-rewrite scanner is required in v1.
+
+Checkpoint sequence CAS and fencing compose: CAS rejects stale state while fencing rejects a stale
+execution owner. Claimed execution also fences ToolExecution and root budget-ledger mutations.
+Durable cancel is intentionally independent and authoritative; it can commit while the owner is
+dead, makes renewal fail, and makes the Run unclaimable. Current Plan/Multi-Agent schedulers execute
+Child Runs inline, so the claimed root Run's ownership authorizes that execution tree rather than
+claiming each Child independently. Fencing cannot revoke an already-issued external side effect;
+stable invocation identity, downstream idempotency, status lookup, and `UNKNOWN` semantics remain
+necessary. `ActiveRunSupervisor` still only manages live Tasks inside one process.
+
 ## 13. Current limitations
 
 - The only concrete LLM client implementation is OpenAI-compatible streaming
@@ -953,17 +983,19 @@ environment overrides follow normal config precedence; inconsistent bounds are r
   should treat these files as sensitive and avoid reading their contents unless
   explicitly requested.
 - Runtime API durable truth can use local SQLite or shared PostgreSQL. The HTTP server remains
-  bound to localhost by default and is not a distributed scheduler, public deployment
-  validation, load-tested API, or distributed queue. PostgreSQL unavailability fails visibly;
-  it never silently falls back to SQLite and splits truth.
+  bound to localhost by default and is not a public deployment, load-tested API, admission
+  controller, or fair/priority scheduler. PostgreSQL unavailability fails visibly; it never
+  silently falls back to SQLite and splits truth.
 - The durable Runtime covers ReAct plus bounded local Plan DAG and Multi-Agent scheduling.
   Plan Tasks and tool-capable Multi-Agent Workers use stable React Child Runs; Parent state is
   checkpointed with stable lineage and CAS-safe terminal reconciliation. There is no distributed
   lock, distributed scheduler, cross-process worker supervisor, or checkpoint compaction yet.
-- Active execution supervision and cancellation are process-local. A crashed process loses
-  every handle; a persisted `RUNNING` Run can therefore have no active owner until a client
-  explicitly resumes it. There is no startup recovery scanner, lease, heartbeat, fencing token,
-  cross-process cancellation, or automatic abandoned-Run takeover.
+- Active execution supervision and Task cancellation remain process-local. In distributed Worker
+  mode, PostgreSQL is the ownership authority: a Worker atomically claims runnable `RUNNING` Runs,
+  renews a finite lease, and supplies the current fencing token to authoritative writes. The
+  bounded polling claim loop also discovers expired leases and takes them over with a higher
+  token. It does not provide cross-process Task signalling; durable cancellation instead prevents
+  renewal/reclaim and the local owner converges by failed heartbeat or fenced write.
 - Parent cancellation is the durable authority. Cancellation persists the Parent first and then
   best-effort cancels non-terminal descendants. If a crash lands between those steps, explicit
   Child resume/execution preflight walks durable ancestors and reconciles the Child to `CANCELLED`;
@@ -1015,9 +1047,9 @@ attempts after the first. A restored `SUCCEEDED` Tool execution is reuse, not an
 The core Runtime capability set is now frozen. Future work should prioritize interview
 preparation, source-code review, real-workload evaluation, bug fixes, and evidence-driven
 hardening. New Runtime subsystems should be added only when a concrete requirement demonstrates a
-gap. A shared PostgreSQL durable store is now implemented, but an automatic Recovery Scanner,
-distributed Worker ownership, lease/heartbeat/fencing, Durable Run Queue, global Admission Control,
-backpressure, task-level DLQ,
+gap. PostgreSQL-backed runnable discovery, Worker claim, lease/heartbeat/fencing, and expired-lease
+takeover are implemented. Global Admission Control, backpressure, Run-level retry/DLQ,
+fairness/priority scheduling,
 shared circuit breakers, and global rate limiting remain explicit future decisions rather than
 implied features.
 
