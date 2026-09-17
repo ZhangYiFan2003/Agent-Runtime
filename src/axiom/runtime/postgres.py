@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from axiom.runtime.capacity import AdmissionRejectedError, CapacitySnapshot
 from axiom.runtime.checkpoints import BudgetLedgerConflictError, CheckpointConflictError
 from axiom.runtime.control_plane import (
     ApiError,
@@ -20,7 +21,7 @@ from axiom.runtime.events import RuntimeEvent
 from axiom.runtime.models import BudgetLedgerRecord, Checkpoint, ToolExecutionRecord
 from axiom.runtime.ownership import OwnershipLostError, RunOwnership
 
-POSTGRES_SCHEMA_VERSION = 2
+POSTGRES_SCHEMA_VERSION = 3
 
 
 class PostgresDependencyError(RuntimeError):
@@ -98,7 +99,7 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()
         version = int(row[0]) if row else POSTGRES_SCHEMA_VERSION
-        if version not in {1, POSTGRES_SCHEMA_VERSION}:
+        if version not in {1, 2, POSTGRES_SCHEMA_VERSION}:
             raise PostgresSchemaError(
                 f"unsupported PostgreSQL runtime schema version: {version}"
             )
@@ -123,6 +124,14 @@ class PostgresRuntimeStore:
 
     def __init__(self, pool: PostgresConnectionPool):
         self.pool = pool
+        self._admission_rejections = 0
+        self._capacity_blocked_claims = 0
+
+    async def admit_run(
+        self, checkpoint: Checkpoint, max_queued_runs: int | None = None
+    ) -> None:
+        _require_optional_limit(max_queued_runs, "max_queued_runs")
+        await asyncio.to_thread(self._admit_run, checkpoint, max_queued_runs)
 
     async def save(
         self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None
@@ -158,16 +167,29 @@ class PostgresRuntimeStore:
         await asyncio.to_thread(self._mark_runnable, run_id)
 
     async def claim_run(
-        self, run_id: str, worker_id: str, lease_seconds: float
+        self,
+        run_id: str,
+        worker_id: str,
+        lease_seconds: float,
+        max_active_runs: int | None = None,
     ) -> RunOwnership | None:
         _require_positive_lease(lease_seconds)
-        return await asyncio.to_thread(self._claim_run, run_id, worker_id, lease_seconds)
+        _require_optional_limit(max_active_runs, "max_active_runs")
+        return await asyncio.to_thread(
+            self._claim_run, run_id, worker_id, lease_seconds, max_active_runs
+        )
 
     async def claim_next(
-        self, worker_id: str, lease_seconds: float
+        self,
+        worker_id: str,
+        lease_seconds: float,
+        max_active_runs: int | None = None,
     ) -> RunOwnership | None:
         _require_positive_lease(lease_seconds)
-        return await asyncio.to_thread(self._claim_next, worker_id, lease_seconds)
+        _require_optional_limit(max_active_runs, "max_active_runs")
+        return await asyncio.to_thread(
+            self._claim_next, worker_id, lease_seconds, max_active_runs
+        )
 
     async def renew_lease(
         self, ownership: RunOwnership, lease_seconds: float
@@ -185,6 +207,36 @@ class PostgresRuntimeStore:
 
     async def validate_ownership(self, ownership: RunOwnership) -> None:
         await asyncio.to_thread(self._validate_ownership, ownership)
+
+    async def capacity_snapshot(
+        self,
+        *,
+        max_queued_runs: int | None = None,
+        max_active_runs: int | None = None,
+    ) -> CapacitySnapshot:
+        return await asyncio.to_thread(
+            self._capacity_snapshot, max_queued_runs, max_active_runs
+        )
+
+    def _admit_run(self, checkpoint: Checkpoint, max_queued_runs: int | None) -> None:
+        if checkpoint.sequence != 0:
+            raise ValueError("only a new Run may pass external admission")
+        updated_at = _now()
+        with self.pool.connection() as conn:
+            _lock_capacity_coordination(conn)
+            if conn.execute(
+                "select 1 from runs where run_id = %s", (checkpoint.run_id,)
+            ).fetchone():
+                raise ValueError(f"run already exists: {checkpoint.run_id}")
+            queued = _queued_count(conn)
+            if max_queued_runs is not None and queued >= max_queued_runs:
+                self._admission_rejections += 1
+                raise AdmissionRejectedError(
+                    queued_runs=queued, max_queued_runs=max_queued_runs
+                )
+            _insert_initial_run(conn, checkpoint, updated_at=updated_at, runnable=True)
+        checkpoint.sequence = 1
+        checkpoint.updated_at = updated_at
 
     def _save(self, checkpoint: Checkpoint, ownership: RunOwnership | None = None) -> None:
         expected = checkpoint.sequence
@@ -285,6 +337,16 @@ class PostgresRuntimeStore:
                         checkpoint.run_id,
                     ),
                 )
+                if checkpoint.parent_run_id is not None:
+                    conn.execute(
+                        """
+                        update runs
+                        set runnable = true
+                        where run_id = %s and status = 'WAITING_CHILD'
+                          and owner_worker_id is null
+                        """,
+                        (checkpoint.parent_run_id,),
+                    )
         checkpoint.sequence = next_sequence
         checkpoint.updated_at = updated_at
 
@@ -447,9 +509,18 @@ class PostgresRuntimeStore:
                 raise ValueError(f"run is not eligible for distributed execution: {run_id}")
 
     def _claim_run(
-        self, run_id: str, worker_id: str, lease_seconds: float
+        self,
+        run_id: str,
+        worker_id: str,
+        lease_seconds: float,
+        max_active_runs: int | None,
     ) -> RunOwnership | None:
         with self.pool.connection() as conn:
+            if max_active_runs is not None:
+                _lock_capacity_coordination(conn)
+                if _active_count(conn) >= max_active_runs:
+                    self._capacity_blocked_claims += 1
+                    return None
             row = conn.execute(
                 f"""
                 update runs as candidate
@@ -466,8 +537,15 @@ class PostgresRuntimeStore:
             ).fetchone()
         return _ownership(row) if row else None
 
-    def _claim_next(self, worker_id: str, lease_seconds: float) -> RunOwnership | None:
+    def _claim_next(
+        self, worker_id: str, lease_seconds: float, max_active_runs: int | None
+    ) -> RunOwnership | None:
         with self.pool.connection() as conn:
+            if max_active_runs is not None:
+                _lock_capacity_coordination(conn)
+                if _active_count(conn) >= max_active_runs:
+                    self._capacity_blocked_claims += 1
+                    return None
             row = conn.execute(
                 f"""
                 with selected as (
@@ -492,6 +570,30 @@ class PostgresRuntimeStore:
                 (worker_id, lease_seconds),
             ).fetchone()
         return _ownership(row) if row else None
+
+    def _capacity_snapshot(
+        self, max_queued_runs: int | None, max_active_runs: int | None
+    ) -> CapacitySnapshot:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                select
+                    count(*) filter (where {_RUN_IS_QUEUED}),
+                    count(*) filter (where {_RUN_IS_ACTIVE}),
+                    extract(epoch from current_timestamp - min(created_at)
+                        filter (where {_RUN_IS_QUEUED}))
+                from runs as candidate
+                """
+            ).fetchone()
+        return CapacitySnapshot(
+            queued_runs=int(row[0]),
+            active_runs=int(row[1]),
+            max_queued_runs=max_queued_runs,
+            max_active_runs=max_active_runs,
+            admission_rejections=self._admission_rejections,
+            capacity_blocked_claims=self._capacity_blocked_claims,
+            oldest_queued_age_seconds=float(row[2]) if row[2] is not None else None,
+        )
 
     def _renew_lease(
         self, ownership: RunOwnership, lease_seconds: float
@@ -523,7 +625,7 @@ class PostgresRuntimeStore:
                 update runs
                 set owner_worker_id = null, lease_until = null,
                     runnable = case
-                        when status in ('RUNNING', 'WAITING_CHILD') then %s
+                        when status = 'RUNNING' then %s
                         else false
                     end
                 where run_id = %s and owner_worker_id = %s and fencing_token = %s
@@ -918,6 +1020,80 @@ def _require_positive_lease(lease_seconds: float) -> None:
         raise ValueError("lease_seconds must be positive")
 
 
+def _require_positive_limit(value: int, name: str) -> None:
+    if isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def _require_optional_limit(value: int | None, name: str) -> None:
+    if value is not None:
+        _require_positive_limit(value, name)
+
+
+def _lock_capacity_coordination(conn) -> None:
+    conn.execute(
+        "select singleton from runtime_capacity_coordination where singleton = true for update"
+    ).fetchone()
+
+
+def _queued_count(conn) -> int:
+    row = conn.execute(
+        f"select count(*) from runs as candidate where {_RUN_IS_QUEUED}"
+    ).fetchone()
+    return int(row[0])
+
+
+def _active_count(conn) -> int:
+    row = conn.execute(
+        f"select count(*) from runs as candidate where {_RUN_IS_ACTIVE}"
+    ).fetchone()
+    return int(row[0])
+
+
+def _insert_initial_run(conn, checkpoint: Checkpoint, *, updated_at: str, runnable: bool) -> None:
+    state = checkpoint.to_dict()
+    state["sequence"] = 1
+    state["updated_at"] = updated_at
+    payload = _json(state)
+    conn.execute(
+        """
+        insert into runs(
+            run_id, thread_id, turn_id, status, current_sequence,
+            schema_version, state_json, parent_run_id, created_at, updated_at, runnable
+        ) values (%s, %s, %s, %s, 1, %s, %s::jsonb, %s, %s, %s, %s)
+        """,
+        (
+            checkpoint.run_id,
+            checkpoint.thread_id,
+            checkpoint.turn_id,
+            checkpoint.status.value,
+            checkpoint.schema_version,
+            payload,
+            checkpoint.parent_run_id,
+            checkpoint.created_at,
+            updated_at,
+            runnable,
+        ),
+    )
+    conn.execute(
+        """
+        insert into checkpoints(
+            run_id, sequence, schema_version, thread_id, turn_id,
+            status, state_json, created_at
+        ) values (%s, 1, %s, %s, %s, %s, %s::jsonb, %s)
+        """,
+        (
+            checkpoint.run_id,
+            checkpoint.schema_version,
+            checkpoint.thread_id,
+            checkpoint.turn_id,
+            checkpoint.status.value,
+            payload,
+            updated_at,
+        ),
+    )
+
+
 def _lock_and_validate_ownership(conn, ownership: RunOwnership) -> None:
     row = conn.execute(
         """
@@ -971,6 +1147,14 @@ and candidate.status in ('RUNNING', 'WAITING_CHILD')
 and (candidate.owner_worker_id is null or candidate.lease_until <= current_timestamp)
 and {_DEADLINE_IS_LIVE}
 and {_ANCESTORS_NOT_CANCELLED}
+"""
+
+_RUN_IS_QUEUED = _RUN_IS_CLAIMABLE
+
+_RUN_IS_ACTIVE = """
+candidate.status in ('RUNNING', 'WAITING_CHILD')
+and candidate.owner_worker_id is not null
+and candidate.lease_until > current_timestamp
 """
 
 
@@ -1080,6 +1264,17 @@ _SCHEMA_STATEMENTS = (
         schema_version integer not null,
         unique(run_id, idempotency_key)
     )
+    """,
+    """
+    create table if not exists runtime_capacity_coordination (
+        singleton boolean primary key default true check(singleton),
+        created_at timestamptz not null default current_timestamp
+    )
+    """,
+    """
+    insert into runtime_capacity_coordination(singleton)
+    values (true)
+    on conflict(singleton) do nothing
     """,
     """
     create index if not exists idx_control_operations_interrupt

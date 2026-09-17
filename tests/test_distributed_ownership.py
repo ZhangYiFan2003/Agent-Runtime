@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 from axiom.config import AxiomConfig, StorageConfig, load_config
+from axiom.runtime.capacity import AdmissionRejectedError
 from axiom.runtime.durable import DurableAgentRuntime
 from axiom.runtime.models import (
     BudgetLedgerRecord,
@@ -23,6 +24,7 @@ from axiom.runtime.ownership import (
     DistributedWorkerConfigurationError,
     OwnershipLostError,
 )
+from axiom.runtime.postgres import initialize_postgres_schema
 from axiom.runtime.storage import DurableStorage, create_durable_storage
 from axiom.tools import ToolRegistry
 
@@ -76,6 +78,330 @@ def _expire(storage: DurableStorage, run_id: str) -> None:
             "where run_id = %s",
             (run_id,),
         )
+
+
+async def _admit(
+    storage: DurableStorage, run_id: str, *, limit: int
+) -> Checkpoint:
+    state = Checkpoint.create(thread_id="thread-capacity", run_id=run_id, input="work")
+    await storage.runtime.admit_run(state, limit)
+    return state
+
+
+@pytest.mark.postgres
+def test_external_admission_rejects_without_fake_run_and_recovers(postgres_storage):
+    first = asyncio.run(_admit(postgres_storage, "admitted-1", limit=1))
+    assert first.sequence == 1
+
+    rejected = Checkpoint.create(
+        thread_id="thread-capacity", run_id="rejected", input="work"
+    )
+    with pytest.raises(AdmissionRejectedError) as exc_info:
+        asyncio.run(postgres_storage.runtime.admit_run(rejected, 1))
+    assert exc_info.value.reason == "QUEUE_CAPACITY_EXCEEDED"
+    assert asyncio.run(postgres_storage.runtime.load("rejected")) is None
+
+    first.status = RunStatus.CANCELLED
+    asyncio.run(postgres_storage.runtime.save(first))
+    later = asyncio.run(_admit(postgres_storage, "admitted-2", limit=1))
+    assert later.sequence == 1
+
+
+@pytest.mark.postgres
+def test_runtime_submit_uses_atomic_external_admission(postgres_storage, tmp_path):
+    runtime = DurableAgentRuntime(
+        llm_client=_TakeoverLlm(),
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=AxiomConfig(),
+        store=postgres_storage.runtime,
+    )
+
+    state = asyncio.run(
+        runtime.submit(
+            thread_id="thread-submit",
+            run_id="submitted-root",
+            turn_id="turn-submit",
+            input="work",
+            max_queued_runs=1,
+        )
+    )
+
+    assert state.sequence == 1
+    snapshot = asyncio.run(postgres_storage.runtime.capacity_snapshot())
+    assert snapshot.queued_runs == 1
+
+
+@pytest.mark.postgres
+def test_distributed_resume_requeues_then_respects_active_capacity(
+    postgres_storage, tmp_path
+):
+    asyncio.run(_admit(postgres_storage, "capacity-holder", limit=2))
+    holder = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            "capacity-holder", "worker-holder", 30, max_active_runs=1
+        )
+    )
+    assert holder is not None
+    state = Checkpoint.create(
+        thread_id="thread-resume",
+        run_id="resume-queued",
+        input="resume",
+    )
+    state.status = RunStatus.INTERRUPTED
+    asyncio.run(postgres_storage.runtime.save(state))
+    runtime = DurableAgentRuntime(
+        llm_client=_TakeoverLlm(),
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=AxiomConfig(),
+        store=postgres_storage.runtime,
+    )
+
+    resumed = asyncio.run(runtime.queue_resume(state.run_id))
+
+    assert resumed.status == RunStatus.RUNNING
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(
+                resumed.run_id, "worker-resume", 30, max_active_runs=1
+            )
+        )
+        is None
+    )
+    assert asyncio.run(postgres_storage.runtime.release_lease(holder, runnable=False))
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(
+                resumed.run_id, "worker-resume", 30, max_active_runs=1
+            )
+        )
+        is not None
+    )
+
+
+@pytest.mark.postgres
+def test_capacity_schema_migrates_v2_with_coordination_only(postgres_storage):
+    with postgres_storage._close.connection() as conn:
+        conn.execute(
+            "update axiom_schema_versions set version = 2 where component = 'runtime'"
+        )
+    initialize_postgres_schema(postgres_storage._close)
+    with postgres_storage._close.connection() as conn:
+        version = conn.execute(
+            "select version from axiom_schema_versions where component = 'runtime'"
+        ).fetchone()[0]
+        columns = {
+            row[0]
+            for row in conn.execute(
+                """
+                select column_name from information_schema.columns
+                where table_schema = current_schema()
+                  and table_name = 'runtime_capacity_coordination'
+                """
+            ).fetchall()
+        }
+
+    assert version == 3
+    assert columns == {"singleton", "created_at"}
+
+
+@pytest.mark.postgres
+def test_concurrent_external_admission_never_overshoots_limit(postgres_storage):
+    async def scenario():
+        gate = asyncio.Event()
+
+        async def actor(index: int) -> bool:
+            await gate.wait()
+            try:
+                await _admit(postgres_storage, f"admission-{index}", limit=3)
+            except AdmissionRejectedError:
+                return False
+            return True
+
+        tasks = [asyncio.create_task(actor(index)) for index in range(10)]
+        gate.set()
+        return await asyncio.gather(*tasks)
+
+    results = asyncio.run(scenario())
+    snapshot = asyncio.run(
+        postgres_storage.runtime.capacity_snapshot(max_queued_runs=3)
+    )
+    assert sum(results) == 3
+    assert snapshot.queued_runs == 3
+    assert snapshot.admission_rejections == 7
+
+
+@pytest.mark.postgres
+def test_global_active_capacity_is_atomic_across_claimers(postgres_storage):
+    for index in range(5):
+        asyncio.run(_admit(postgres_storage, f"active-{index}", limit=10))
+
+    async def scenario():
+        gate = asyncio.Event()
+
+        async def actor(index: int):
+            await gate.wait()
+            return await postgres_storage.runtime.claim_next(
+                f"worker-{index}", 30, max_active_runs=2
+            )
+
+        tasks = [asyncio.create_task(actor(index)) for index in range(5)]
+        gate.set()
+        return await asyncio.gather(*tasks)
+
+    owners = [owner for owner in asyncio.run(scenario()) if owner is not None]
+    snapshot = asyncio.run(
+        postgres_storage.runtime.capacity_snapshot(max_active_runs=2)
+    )
+    assert len(owners) == 2
+    assert snapshot.active_runs == 2
+    assert snapshot.queued_runs == 3
+    assert snapshot.capacity_blocked_claims == 3
+
+
+@pytest.mark.postgres
+def test_expired_lease_releases_global_active_capacity(postgres_storage):
+    asyncio.run(_admit(postgres_storage, "lease-a", limit=2))
+    asyncio.run(_admit(postgres_storage, "lease-b", limit=2))
+    first = asyncio.run(
+        postgres_storage.runtime.claim_next("worker-a", 30, max_active_runs=1)
+    )
+    assert first is not None
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_next("worker-b", 30, max_active_runs=1)
+        )
+        is None
+    )
+
+    _expire(postgres_storage, first.run_id)
+    second = asyncio.run(
+        postgres_storage.runtime.claim_next("worker-b", 30, max_active_runs=1)
+    )
+    assert second is not None
+    assert second.run_id in {"lease-a", "lease-b"}
+
+
+@pytest.mark.postgres
+def test_wait_releases_slot_and_resume_recompetes_for_capacity(postgres_storage):
+    waiting = asyncio.run(_admit(postgres_storage, "waiting", limit=2))
+    asyncio.run(_admit(postgres_storage, "other", limit=2))
+    owner = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            waiting.run_id, "worker-a", 30, max_active_runs=1
+        )
+    )
+    assert owner is not None
+    waiting.status = RunStatus.WAITING_CHILD
+    asyncio.run(postgres_storage.runtime.save(waiting, ownership=owner))
+    assert asyncio.run(postgres_storage.runtime.release_lease(owner, runnable=False))
+
+    other = asyncio.run(
+        postgres_storage.runtime.claim_next("worker-b", 30, max_active_runs=1)
+    )
+    assert other is not None
+    waiting.status = RunStatus.RUNNING
+    asyncio.run(postgres_storage.runtime.save(waiting))
+    asyncio.run(postgres_storage.runtime.mark_runnable(waiting.run_id))
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(
+                waiting.run_id, "worker-c", 30, max_active_runs=1
+            )
+        )
+        is None
+    )
+    assert asyncio.run(postgres_storage.runtime.release_lease(other, runnable=False))
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(
+                waiting.run_id, "worker-c", 30, max_active_runs=1
+            )
+        )
+        is not None
+    )
+
+
+@pytest.mark.postgres
+def test_terminal_child_wakes_waiting_parent_without_holding_active_slot(postgres_storage):
+    parent = asyncio.run(_admit(postgres_storage, "parent-wait", limit=2))
+    parent_owner = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            parent.run_id, "worker-parent", 30, max_active_runs=1
+        )
+    )
+    assert parent_owner is not None
+    parent.status = RunStatus.WAITING_CHILD
+    asyncio.run(postgres_storage.runtime.save(parent, ownership=parent_owner))
+    assert asyncio.run(
+        postgres_storage.runtime.release_lease(parent_owner, runnable=False)
+    )
+
+    child = Checkpoint.create(
+        thread_id=parent.thread_id,
+        run_id="child-active",
+        input="child",
+        parent_run_id=parent.run_id,
+    )
+    asyncio.run(postgres_storage.runtime.save(child))
+    asyncio.run(postgres_storage.runtime.mark_runnable(child.run_id))
+    child_owner = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            child.run_id, "worker-child", 30, max_active_runs=1
+        )
+    )
+    assert child_owner is not None
+    child.status = RunStatus.COMPLETED
+    asyncio.run(postgres_storage.runtime.save(child, ownership=child_owner))
+
+    snapshot = asyncio.run(
+        postgres_storage.runtime.capacity_snapshot(max_active_runs=1)
+    )
+    assert snapshot.active_runs == 0
+    assert snapshot.queued_runs == 1
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(
+                parent.run_id, "worker-parent-2", 30, max_active_runs=1
+            )
+        )
+        is not None
+    )
+
+
+def test_capacity_blocked_worker_reuses_bounded_idle_polling():
+    class FullStore:
+        backend = "postgres"
+
+        def __init__(self):
+            self.claims = 0
+
+        async def claim_next(self, _worker_id, _lease_seconds, _max_active_runs=None):
+            self.claims += 1
+            return None
+
+    store = FullStore()
+    sleeps: list[float] = []
+    worker = None
+
+    async def controlled_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        worker._stopping = True
+
+    worker = DistributedRunWorker(
+        store=store,
+        runtime_factory=lambda _ownership: object(),
+        max_active_runs=1,
+        poll_interval_seconds=0.25,
+        sleep=controlled_sleep,
+    )
+    asyncio.run(worker.run_forever())
+
+    assert store.claims == 1
+    assert sleeps == [0.25]
 
 
 @pytest.mark.postgres

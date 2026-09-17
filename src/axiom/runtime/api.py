@@ -21,6 +21,7 @@ from axiom.bootstrap import build_tool_registry
 from axiom.config import AxiomConfig
 from axiom.llm import create_llm_client
 from axiom.memory import MemoryService, SummaryPolicy
+from axiom.runtime.capacity import AdmissionRejectedError
 from axiom.runtime.checkpoints import (
     CheckpointConflictError,
     RuntimeStore,
@@ -330,6 +331,7 @@ class RuntimeApiServer:
         path = parsed.path
         query = parse_qs(parsed.query)
         if method == "GET" and path == "/health":
+            capacity = self._capacity_health()
             _send_json(
                 request,
                 200,
@@ -338,6 +340,7 @@ class RuntimeApiServer:
                     "workers": self.workers,
                     "database": "ok" if self.repository.database_ok() else "error",
                     "storage_backend": self.storage_backend,
+                    **({"capacity": capacity} if capacity is not None else {}),
                 },
             )
             return
@@ -366,7 +369,8 @@ class RuntimeApiServer:
                     result = asyncio.run(self._run_turn(thread_id, message))
                     response_status = (
                         202
-                        if result.get("status")
+                        if result.get("queued")
+                        or result.get("status")
                         in {
                             RunStatus.INTERRUPTED.value,
                             RunStatus.WAITING_APPROVAL.value,
@@ -458,7 +462,8 @@ class RuntimeApiServer:
                 )
                 response_status = (
                     202
-                    if result.get("status")
+                    if result.get("queued")
+                    or result.get("status")
                     in {RunStatus.WAITING_APPROVAL.value, RunStatus.WAITING_CHILD.value}
                     else 200
                 )
@@ -502,6 +507,17 @@ class RuntimeApiServer:
                 _send_json(request, 404, {"error": "not found"})
         except ApiError as exc:
             _send_json(request, exc.http_status, exc.to_dict())
+        except AdmissionRejectedError as exc:
+            error = ApiError(
+                exc.reason,
+                str(exc),
+                503,
+                details={
+                    "queued_runs": exc.queued_runs,
+                    "max_queued_runs": exc.max_queued_runs,
+                },
+            )
+            _send_json(request, error.http_status, error.to_dict())
         except CheckpointConflictError as exc:
             error = ApiError("checkpoint_conflict", _safe_error(exc), 409)
             _send_json(request, error.http_status, error.to_dict())
@@ -510,6 +526,21 @@ class RuntimeApiServer:
             _send_json(request, error.http_status, error.to_dict())
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": _safe_error(exc)})
+
+    def _capacity_health(self) -> dict[str, object] | None:
+        snapshot = getattr(self.checkpoint_store, "capacity_snapshot", None)
+        if snapshot is None:
+            return None
+        try:
+            value = asyncio.run(
+                snapshot(
+                    max_queued_runs=self.config.capacity.max_queued_runs,
+                    max_active_runs=self.config.capacity.max_active_runs,
+                )
+            )
+        except Exception:  # noqa: BLE001 - health already reports database state
+            return {"status": "unavailable"}
+        return asdict(value)
 
     async def _run_turn(self, thread_id: str, message: str) -> dict[str, Any]:
         history_events = await self._list_events_async(thread_id)
@@ -550,6 +581,21 @@ class RuntimeApiServer:
                     thread_id,
                     execution_strategy=_execution_strategy_name(engine.config.prompt.agent_mode),
                 )
+                if self.config.worker.distributed_enabled:
+                    state = await runtime.submit(
+                        thread_id=thread_id,
+                        input=message,
+                        history=history,
+                        run_id=run_id,
+                        turn_id=turn_id,
+                        max_queued_runs=self.config.capacity.max_queued_runs,
+                    )
+                    return {
+                        "thread_id": state.thread_id,
+                        "run_id": state.run_id,
+                        "status": state.status.value,
+                        "queued": True,
+                    }
                 state = await runtime.start(
                     thread_id=thread_id,
                     input=message,
@@ -777,7 +823,12 @@ class RuntimeApiServer:
                     if operation in {ControlOperationName.APPROVE, ControlOperationName.REJECT}
                     else None
                 )
-                result = asyncio.run(self._resume_run(run_id, decision=decision))
+                if self.config.worker.distributed_enabled:
+                    result = asyncio.run(
+                        self._queue_distributed_resume(state, decision=decision)
+                    )
+                else:
+                    result = asyncio.run(self._resume_run(run_id, decision=decision))
             self.control_operations.complete(record.operation_id, result)
             return result
         except ApiError as exc:
@@ -809,6 +860,31 @@ class RuntimeApiServer:
             raise error from exc
         finally:
             lock.release()
+
+    async def _queue_distributed_resume(
+        self, state: Checkpoint, *, decision: str | None
+    ) -> dict[str, Any]:
+        context = RuntimeRequestContext(
+            thread_id=state.thread_id,
+            message=state.input,
+            history=state.history,
+            cwd=self.cwd,
+            config=self.config,
+            turn_id=state.turn_id,
+            run_id=state.run_id,
+        )
+        engine = await self._engine(context)
+        if not isinstance(engine, QueryEngine):
+            raise ValueError("custom engine does not support durable resume")
+        runtime = self._durable_runtime(
+            engine,
+            state.thread_id,
+            execution_strategy=state.execution_strategy,
+        )
+        queued = await runtime.queue_resume(state.run_id, decision=decision)
+        result = await self._run_view(queued)
+        result["queued"] = not queued.finished
+        return result
 
     def _replay_operation(self, record) -> dict[str, Any]:
         if record.status == ControlOperationStatus.COMPLETED and record.result is not None:

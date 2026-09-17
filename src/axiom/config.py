@@ -170,6 +170,14 @@ class WorkerConfig:
 
 
 @dataclass(slots=True)
+class CapacityConfig:
+    """Optional shared PostgreSQL backlog and active-execution limits."""
+
+    max_queued_runs: int | None = None
+    max_active_runs: int | None = None
+
+
+@dataclass(slots=True)
 class ProgressConfig:
     """Deterministic, bounded no-progress detection for durable Runs."""
 
@@ -237,6 +245,7 @@ class AxiomConfig:
     dependency: DependencyConfig = field(default_factory=DependencyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
+    capacity: CapacityConfig = field(default_factory=CapacityConfig)
     progress: ProgressConfig = field(default_factory=ProgressConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
@@ -282,6 +291,12 @@ def load_config(
         raise ValueError(
             "distributed Worker requires positive polling and heartbeat shorter than lease"
         )
+    for name, value in (
+        ("max_queued_runs", config.capacity.max_queued_runs),
+        ("max_active_runs", config.capacity.max_active_runs),
+    ):
+        if value is not None and value <= 0:
+            raise ValueError(f"capacity.{name} must be positive or null")
     return config
 
 
@@ -350,6 +365,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     progress = result.setdefault("progress", {})
     storage = result.setdefault("storage", {})
     worker = result.setdefault("worker", {})
+    capacity = result.setdefault("capacity", {})
 
     storage_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_STORAGE_BACKEND", "backend", str),
@@ -376,6 +392,16 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 worker[config_key] = caster(raw)
+
+    capacity_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_MAX_QUEUED_RUNS", "max_queued_runs", int),
+        ("AXIOM_MAX_ACTIVE_RUNS", "max_active_runs", int),
+    ]
+    for env_key, config_key, caster in capacity_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                capacity[config_key] = caster(raw)
 
     mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_API_KEY", "api_key", str),
@@ -557,6 +583,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         dependency=DependencyConfig(**data.get("dependency", {})),
         storage=StorageConfig(**data.get("storage", {})),
         worker=WorkerConfig(**data.get("worker", {})),
+        capacity=CapacityConfig(**data.get("capacity", {})),
         progress=ProgressConfig(**data.get("progress", {})),
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),

@@ -224,31 +224,17 @@ class DurableAgentRuntime:
         budget_owner_run_id: str | None = None,
         completion_contract: CompletionContract | None = None,
     ) -> Checkpoint:
-        if run_kind == "agent" and self.execution_strategy.name == "multi_agent":
-            run_kind = "orchestrator"
-        resolved_budget_owner = budget_owner_run_id
-        if resolved_budget_owner is None and parent_run_id is not None:
-            parent = await load_run_state(self.store, parent_run_id)
-            resolved_budget_owner = (
-                parent.budget_owner_run_id or parent.run_id if parent is not None else parent_run_id
-            )
-        state = Checkpoint.create(
+        state = await self._new_run_state(
             thread_id=thread_id,
             input=input,
             history=history,
             run_id=run_id,
             turn_id=turn_id,
-            execution_strategy=self.execution_strategy.name,
             parent_run_id=parent_run_id,
             parent_step_id=parent_step_id,
             run_kind=run_kind,
-            budget_owner_run_id=resolved_budget_owner,
-            budget_policy=self.budget_manager.policy.to_dict(),
-            progress_policy=self.progress_detector.policy.to_dict(),
-            progress_state=ProgressState().to_dict(),
-            completion_contract=(
-                completion_contract.to_dict() if completion_contract is not None else None
-            ),
+            budget_owner_run_id=budget_owner_run_id,
+            completion_contract=completion_contract,
         )
 
         async with self._run_lock(state.run_id):
@@ -275,6 +261,79 @@ class DurableAgentRuntime:
 
         return await self._supervise(state, execute)
 
+    async def submit(
+        self,
+        *,
+        thread_id: str,
+        input: str,
+        history: list[Message] | None = None,
+        run_id: str | None = None,
+        turn_id: str | None = None,
+        max_queued_runs: int | None = None,
+    ) -> Checkpoint:
+        """Atomically admit a new root Run to the PostgreSQL runnable backlog."""
+        admit = getattr(self.store, "admit_run", None)
+        if admit is None or getattr(self.store, "backend", None) != "postgres":
+            raise ValueError("distributed Run admission requires PostgreSQL storage")
+        state = await self._new_run_state(
+            thread_id=thread_id,
+            input=input,
+            history=history,
+            run_id=run_id,
+            turn_id=turn_id,
+        )
+        await admit(state, max_queued_runs)
+        await self._emit(
+            "run.admitted",
+            {
+                "run_id": state.run_id,
+                "turn_id": state.turn_id,
+                "status": state.status.value,
+            },
+        )
+        return state
+
+    async def _new_run_state(
+        self,
+        *,
+        thread_id: str,
+        input: str,
+        history: list[Message] | None = None,
+        run_id: str | None = None,
+        turn_id: str | None = None,
+        parent_run_id: str | None = None,
+        parent_step_id: str | None = None,
+        run_kind: str = "agent",
+        budget_owner_run_id: str | None = None,
+        completion_contract: CompletionContract | None = None,
+    ) -> Checkpoint:
+        if run_kind == "agent" and self.execution_strategy.name == "multi_agent":
+            run_kind = "orchestrator"
+        resolved_budget_owner = budget_owner_run_id
+        if resolved_budget_owner is None and parent_run_id is not None:
+            parent = await load_run_state(self.store, parent_run_id)
+            resolved_budget_owner = (
+                parent.budget_owner_run_id or parent.run_id if parent is not None else parent_run_id
+            )
+        return Checkpoint.create(
+            thread_id=thread_id,
+            input=input,
+            history=history,
+            run_id=run_id,
+            turn_id=turn_id,
+            execution_strategy=self.execution_strategy.name,
+            parent_run_id=parent_run_id,
+            parent_step_id=parent_step_id,
+            run_kind=run_kind,
+            budget_owner_run_id=resolved_budget_owner,
+            budget_policy=self.budget_manager.policy.to_dict(),
+            progress_policy=self.progress_detector.policy.to_dict(),
+            progress_state=ProgressState().to_dict(),
+            completion_contract=(
+                completion_contract.to_dict() if completion_contract is not None else None
+            ),
+        )
+
     async def budget_snapshot(self, state: Checkpoint) -> RunBudgetState:
         return await self.budget_manager.snapshot(state)
 
@@ -288,6 +347,40 @@ class DurableAgentRuntime:
             return await self._resume_inner(run_id, decision=decision)
 
         return await self._supervise(state, execute)
+
+    async def queue_resume(
+        self, run_id: str, *, decision: str | None = None
+    ) -> Checkpoint:
+        """Persist a control transition and requeue it for capacity-gated execution."""
+        mark_runnable = getattr(self.store, "mark_runnable", None)
+        if mark_runnable is None or getattr(self.store, "backend", None) != "postgres":
+            raise ValueError("distributed Run resume requires PostgreSQL storage")
+        async with self._run_lock(run_id):
+            state = await self._require(run_id)
+            if state.status == RunStatus.CANCELLED:
+                raise ValueError("cancelled run cannot be resumed")
+            if state.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+                raise ValueError(f"{state.status.value.lower()} run cannot be resumed")
+            if state.status == RunStatus.WAITING_APPROVAL:
+                normalized = _normalize_decision(decision)
+                if normalized is None:
+                    raise ValueError("approval decision must be approve or reject")
+                if state.interrupt and state.interrupt.invocation_id:
+                    state.decisions[state.interrupt.invocation_id] = normalized
+            elif state.status == RunStatus.INTERRUPTED and decision is not None:
+                if _normalize_decision(decision) == "reject":
+                    state.status = RunStatus.CANCELLED
+                    state.interrupt = None
+                    await self._save_checkpoint(state, operation="resume.reject")
+                    await self._emit("run.cancelled", {"run_id": run_id})
+                    return state
+            state.status = RunStatus.RUNNING
+            state.interrupt = None
+            state.error = None
+            await self._save_checkpoint(state, operation="resume.queued")
+            await mark_runnable(run_id)
+            await self._emit("run.resume_queued", {"run_id": run_id})
+            return state
 
     async def _resume_inner(self, run_id: str, *, decision: str | None) -> Checkpoint:
         async with self._run_lock(run_id):

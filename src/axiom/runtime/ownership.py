@@ -51,6 +51,7 @@ class DistributedRunWorker:
         lease_seconds: float = 30.0,
         heartbeat_interval_seconds: float = 10.0,
         poll_interval_seconds: float = 0.5,
+        max_active_runs: int | None = None,
         worker_id: str | None = None,
         event_sink: OwnershipEventSink | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -67,11 +68,16 @@ class DistributedRunWorker:
             )
         if poll_interval_seconds <= 0:
             raise DistributedWorkerConfigurationError("poll interval must be positive")
+        if max_active_runs is not None and max_active_runs <= 0:
+            raise DistributedWorkerConfigurationError(
+                "max_active_runs must be positive or null"
+            )
         self.store = store
         self.runtime_factory = runtime_factory
         self.lease_seconds = lease_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.poll_interval_seconds = poll_interval_seconds
+        self.max_active_runs = max_active_runs
         self.worker_id = worker_id or new_worker_id()
         self.event_sink = event_sink
         self.sleep = sleep
@@ -81,7 +87,11 @@ class DistributedRunWorker:
     async def run_once(self) -> Checkpoint | None:
         if self._stopping:
             return None
-        ownership = await self.store.claim_next(self.worker_id, self.lease_seconds)
+        ownership = await self.store.claim_next(
+            self.worker_id,
+            self.lease_seconds,
+            self.max_active_runs,
+        )
         if ownership is None:
             return None
         await self._emit(
@@ -98,7 +108,7 @@ class DistributedRunWorker:
                 ownership,
                 runnable=(
                     not result.finished
-                    and result.status.value in {"RUNNING", "WAITING_CHILD"}
+                    and result.status.value == "RUNNING"
                 ),
             )
             await self._emit("run.released", ownership)

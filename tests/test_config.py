@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from axiom.config import load_config
 
 
@@ -58,3 +60,26 @@ def test_plan_parallelism_environment_override(tmp_path, monkeypatch):
     config = load_config(project_root=tmp_path)
 
     assert config.plan.max_parallel_tasks == 3
+
+
+def test_capacity_environment_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(
+        project_root=tmp_path,
+        env={
+            "AXIOM_MAX_QUEUED_RUNS": "7",
+            "AXIOM_MAX_ACTIVE_RUNS": "3",
+        },
+    )
+
+    assert config.capacity.max_queued_runs == 7
+    assert config.capacity.max_active_runs == 3
+
+
+def test_capacity_limits_must_be_positive(tmp_path):
+    with pytest.raises(ValueError, match="capacity.max_active_runs"):
+        load_config(
+            project_root=tmp_path,
+            overrides={"capacity": {"max_active_runs": 0}},
+            env={},
+        )

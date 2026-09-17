@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from axiom.runtime.capacity import CapacitySnapshot
 from axiom.runtime.models import BudgetLedgerRecord, Checkpoint, RunState, ToolExecutionRecord
 from axiom.runtime.ownership import RunOwnership
 
@@ -59,14 +60,25 @@ class RuntimeStore(RunStateStore, ToolExecutionStore, Protocol):
 
 
 class DistributedRuntimeStore(RuntimeStore, Protocol):
+    async def admit_run(
+        self, checkpoint: Checkpoint, max_queued_runs: int | None = None
+    ) -> None: ...
+
     async def mark_runnable(self, run_id: str) -> None: ...
 
     async def claim_run(
-        self, run_id: str, worker_id: str, lease_seconds: float
+        self,
+        run_id: str,
+        worker_id: str,
+        lease_seconds: float,
+        max_active_runs: int | None = None,
     ) -> RunOwnership | None: ...
 
     async def claim_next(
-        self, worker_id: str, lease_seconds: float
+        self,
+        worker_id: str,
+        lease_seconds: float,
+        max_active_runs: int | None = None,
     ) -> RunOwnership | None: ...
 
     async def renew_lease(
@@ -78,6 +90,13 @@ class DistributedRuntimeStore(RuntimeStore, Protocol):
     ) -> bool: ...
 
     async def get_ownership(self, run_id: str) -> RunOwnership | None: ...
+
+    async def capacity_snapshot(
+        self,
+        *,
+        max_queued_runs: int | None = None,
+        max_active_runs: int | None = None,
+    ) -> CapacitySnapshot: ...
 
 
 async def load_run_state(store: RunStateStore, run_id: str) -> RunState | None:

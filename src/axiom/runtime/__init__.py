@@ -21,6 +21,11 @@ from axiom.runtime.budget import (
     RunBudgetState,
     RunBudgetUsage,
 )
+from axiom.runtime.capacity import (
+    QUEUE_CAPACITY_EXCEEDED,
+    AdmissionRejectedError,
+    CapacitySnapshot,
+)
 from axiom.runtime.checkpoints import (
     BudgetLedgerConflictError,
     CheckpointConflictError,
@@ -145,6 +150,9 @@ from axiom.runtime.tasks import DurableTaskManager, TaskRecord
 
 __all__ = [
     "Checkpoint",
+    "AdmissionRejectedError",
+    "CapacitySnapshot",
+    "QUEUE_CAPACITY_EXCEEDED",
     "RunState",
     "BudgetLedgerConflictError",
     "CheckpointConflictError",

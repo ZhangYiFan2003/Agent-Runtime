@@ -9,6 +9,7 @@ from typing import Any
 from axiom.agent import QueryEngine
 from axiom.config import AxiomConfig
 from axiom.runtime import (
+    AdmissionRejectedError,
     AssignmentStatus,
     Checkpoint,
     ControlOperationName,
@@ -287,6 +288,27 @@ def test_run_query_returns_stable_react_representation(tmp_path):
     assert result["run_kind"] == "agent"
     assert result["completed_at"]
     assert "strategy_state" not in result
+
+
+def test_admission_rejection_is_global_overload_not_run_failure(tmp_path, monkeypatch):
+    server, _ = _server(tmp_path)
+    thread_id = _thread(server)
+
+    async def reject(_thread_id: str, _message: str):
+        raise AdmissionRejectedError(queued_runs=2, max_queued_runs=2)
+
+    monkeypatch.setattr(server, "_run_turn", reject)
+    status, result = _handle(
+        server,
+        FakeRequest("POST", f"/v1/threads/{thread_id}/turns", {"message": "work"}),
+    )
+
+    assert status == 503
+    assert result["error"]["code"] == "QUEUE_CAPACITY_EXCEEDED"
+    assert result["error"]["details"] == {
+        "queued_runs": 2,
+        "max_queued_runs": 2,
+    }
 
 
 def test_run_query_returns_plan_strategy(tmp_path):
