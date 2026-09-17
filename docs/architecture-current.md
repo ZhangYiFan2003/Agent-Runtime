@@ -213,7 +213,7 @@ flowchart TD
 - `src/axiom/policy/audit_log.py`
   - Writes JSONL audit entries with sensitive input fields redacted.
 - `src/axiom/runtime/api.py`
-  - Provides a local Runtime control-plane API for threads, turns, hierarchical
+  - Provides a local Runtime control-plane API for threads, interaction-compatible `/turns`, hierarchical
     Runs, interrupts, idempotent state transitions, events, and background tasks.
   - Supports explicit `data_dir` injection, ephemeral localhost port binding,
     start/shutdown/context-manager lifecycle, `/health`, fake engine injection
@@ -230,11 +230,11 @@ flowchart TD
   - Runs best-effort fact/preference extraction after completed turns. Extracted
     facts are derived state and never replace raw Runtime events.
 - `src/axiom/runtime/models.py`
-  - Defines explicit Thread/Turn/Run checkpoint identities, Run statuses,
-    interrupts, errors, and ToolExecution records with stable JSON conversion.
+  - Defines `RunState` as the central versioned durable execution state, with `Checkpoint` retained
+    as a compatibility name, plus Run statuses, interrupts, errors, and ToolExecution records.
 - `src/axiom/runtime/checkpoints.py`
-  - Defines the async-compatible checkpoint/tool execution store protocols and
-    Memory/SQLite implementations. SQLite appends checkpoint sequences and uses
+  - Defines the RuntimeStore and `load_run_state`/`advance_run_state` facade plus
+    Memory/SQLite implementations. SQLite appends Run-state checkpoint sequences and uses
     optimistic sequence checks to reject stale workers.
 - `src/axiom/runtime/events.py`
   - Defines the thread/event repository contract, event envelope, and backward-compatible
@@ -970,6 +970,33 @@ claiming each Child independently. Fencing cannot revoke an already-issued exter
 stable invocation identity, downstream idempotency, status lookup, and `UNKNOWN` semantics remain
 necessary. `ActiveRunSupervisor` still only manages live Tasks inside one process.
 
+## 12.2 Canonical Runtime domain model
+
+Thread manages conversation scope. Run is the only durable execution/control/ownership unit and
+may be a root or independently durable Child Run. `RunState` is its versioned recovery state;
+`Checkpoint` and the append-only `checkpoints` table remain backward-compatible persistence/history
+terminology, not a separate business aggregate. A Step is an ephemeral execution iteration and has
+no table, repository, lease, or state machine. Event is append-only timeline/SSE/audit evidence and
+is not replayed to recover a Run. ToolExecution remains separate durable truth because logical Tool
+identity, attempts, ambiguous outcomes, and external side effects need stronger semantics.
+
+`turn_id` remains correlation and HTTP interaction compatibility metadata. There is no Turn model,
+TurnRepository, Turn state machine, or `turns` table, and recovery does not load or replay a Turn.
+The canonical recovery path is ownership claim, load RunState, load required ToolExecution evidence,
+reconstruct in-memory execution context, and continue. Core idempotency uses run ID, Run sequence
+CAS, ownership fence, stable Tool invocation ID and ToolExecution outcome—not Turn or Step identity.
+
+| Concept | Durable? | Authority |
+| --- | ---: | --- |
+| Thread | yes | conversation scope |
+| Turn | compatibility projection only | interaction correlation, not recovery |
+| Run | yes | execution, control, lineage, ownership |
+| RunState / Checkpoint mechanism | yes | versioned recovery state and CAS history |
+| Event | yes | timeline, SSE, audit/debug evidence |
+| ToolExecution | yes | logical Tool invocation, attempts, and outcome |
+| Step | no | ephemeral execution iteration |
+| Trace/Span | observability | metrics and debugging |
+
 ## 13. Current limitations
 
 - The only concrete LLM client implementation is OpenAI-compatible streaming
@@ -1063,7 +1090,7 @@ DAG / Child Runs
 
 Durability
 ----------
-Run / Checkpoint / CAS
+Run / versioned RunState / CAS
 ToolExecution
 interrupt / resume / cancel
 Supervisor

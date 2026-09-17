@@ -22,7 +22,7 @@ Agent 任务比普通 HTTP 请求更长，也更有状态。一次任务可能�
 
 ## 3. 2～3 分钟完整故事
 
-我先把会话和执行状态分开。Thread/Turn/Event 是用户交互与事件历史；Run/Checkpoint 是可恢复执行状态；ToolExecution 是外部调用账本。这样 SSE 重放、对话恢复和 Agent 执行恢复不会混成一个表，也能分别定义一致性边界。
+我先把会话和执行状态分开。Thread 管会话范围；Run 是唯一 durable 执行、控制、ownership 单元；Checkpoint 只是 Run 的版本化 durable state 机制；Step 是 Run 内临时迭代；Event 保存历史/SSE 证据；ToolExecution 保存外部调用事实。`turn_id` 只保留交互关联兼容性，不是恢复实体。
 
 每个 Checkpoint 有版本号。保存时使用 compare-and-swap（CAS，比较并交换）：只有数据库中的版本等于调用方预期版本，才允许写入新版本。SQLite 用 `BEGIN IMMEDIATE` 比较最新 sequence 后追加版本；PostgreSQL 用单条 `UPDATE runs ... WHERE current_sequence = expected RETURNING` 原子推进 head，并在同一短事务追加 Checkpoint 历史。两种实现都能拒绝 stale write，但 CAS 本身不等于持续执行所有权；多 Worker 仍需 lease 和 fencing token。
 
@@ -141,11 +141,11 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 
 **面试官为什么问：** 简历一次列出五类状态，面试官会检查它们是否只是重复建模。
 
-**先给结论：** Thread/Turn/Event 描述用户交互历史，Run/Checkpoint 描述可恢复执行。拆开后，一个用户回合可以拥有父子多个 Run，事件用于重放，Checkpoint 用于恢复，不会互相污染职责。
+**先给结论：** Thread 是会话容器，Run 是唯一 durable 执行实体；一个交互可触发 Root Run，复杂执行再产生 Child Run。Event 用于历史重放，Checkpoint 是版本化 Run state 的保存机制，Step 只存在于内存执行循环。
 
-**60～120 秒完整口语答案：** Thread 是会话容器，Turn 是一次用户输入到系统响应的交互，Event 是其中可追加、可按 ID 重放的事实。Run 是一次可控制的 Agent 执行，复杂模式下还会有 Child Run；Checkpoint 是 Run 在某个安全边界上的最新可恢复状态。Event 适合展示“发生过什么”，但仅靠事件重放恢复状态机复杂且容易漏不变量；Checkpoint 直接保存“下一步从哪里继续”。反过来，Checkpoint 也不适合替代完整用户事件历史。
+**60～120 秒完整口语答案：** Thread 是会话容器，Event 是可追加、可按 ID 重放的历史事实。Run 是一次可控制、可恢复、可调度的 Agent 执行，复杂模式下还有 Child Run；`RunState` 在安全边界保存最新可恢复状态，Checkpoint 是它的兼容/历史名称。Event 展示“发生过什么”，但恢复不依赖全量 Event replay。Turn 没有表、Repository 或状态机，只剩 `/turns` API 与 `turn_id` 关联兼容；Step 没有持久化。
 
-**第一轮追问：** “创建 Turn 后为什么还要 Run？”——Turn 面向交互，一个 Turn 可能触发父 Run 和多个 Child Run；Run 还需要独立状态、预算、取消和 Trace。
+**第一轮追问：** “Turn 为什么不再是核心对象？”——当前 correctness 只需要用户事件触发 Root Run；控制、预算、ownership、恢复和 Child lineage 都属于 Run。`turn_id` 可继续关联 UI/Event，但不参与 CAS、fencing 或幂等。
 
 **第二轮追问：** “Event 和 Checkpoint 会不会不一致？”——它们是不同目的的数据；关键状态以 Checkpoint 为恢复事实，事件用于可见历史。生产化可用同一事务/outbox 缩小跨表不一致窗口。
 
