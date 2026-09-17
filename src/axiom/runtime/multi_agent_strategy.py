@@ -986,12 +986,14 @@ class MultiAgentExecutionStrategy:
             role_messages = [Message(role="user", content=content)]
             if progress_state.recovery_signal_pending:
                 role_messages.append(Message(role="user", content=recovery_message(progress_state)))
-            projection = await runtime.context_manager.prepare(
+            desired_context = runtime.context_manager.build(
                 role_messages,
                 system_prompt=role_system_prompt,
                 tools=[],
                 objective=state.input,
+                step_context=runtime._step_context(state),
             )
+            projection = await runtime.context_manager.fit(desired_context)
             context_attributes = projection.observability_attributes(compaction_count=0)
             if runtime.tracer is not None and llm_span is not None:
                 await runtime.tracer.annotate_span(llm_span.span_id, **context_attributes)

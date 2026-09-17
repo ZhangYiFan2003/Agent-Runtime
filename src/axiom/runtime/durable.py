@@ -546,7 +546,7 @@ class DurableAgentRuntime:
         else:
             state.pending_tool_calls = []
             state.next_tool_index = 0
-            state = await self._execute_llm_step(state)
+            state = await self._execute_llm_step(state, step_context=context)
         return StepResult.from_run_state(
             step_index=context.step_index,
             run_state=state,
@@ -563,6 +563,7 @@ class DurableAgentRuntime:
         fail_run: bool = True,
         output_state_key: str | None = None,
         tool_call_scope: str | None = None,
+        step_context: StepContext | None = None,
     ) -> Checkpoint:
         try:
             await self.budget_manager.consume_step(
@@ -703,13 +704,15 @@ class DurableAgentRuntime:
                     model_messages.append(
                         Message(role="user", content=recovery_message(progress_state))
                     )
-                projection = await self.context_manager.prepare(
+                desired_context = self.context_manager.build(
                     model_messages,
                     system_prompt=effective_system_prompt,
                     tools=self.tool_registry.definitions(),
                     objective=state.input,
                     previous_summary=summary_from_strategy_state(state.strategy_state),
+                    step_context=step_context,
                 )
+                projection = await self.context_manager.fit(desired_context)
                 compaction_count = apply_compaction_to_strategy_state(
                     state.strategy_state,
                     projection,

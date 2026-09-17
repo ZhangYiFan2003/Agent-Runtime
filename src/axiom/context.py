@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from axiom.config import AxiomConfig
 from axiom.memory.summarizer import (
@@ -14,6 +14,9 @@ from axiom.memory.summarizer import (
     segment_runtime_messages,
 )
 from axiom.types import Message
+
+if TYPE_CHECKING:
+    from axiom.runtime.steps import StepContext
 
 DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW = 64_000
 MINIMUM_TRUSTED_MODEL_CONTEXT_WINDOW = 8_192
@@ -131,20 +134,6 @@ class ContextBudgetPolicy:
         return int(self.usable_input * self.target_after_compaction_ratio)
 
 
-@dataclass(frozen=True, slots=True)
-class ContextBudget:
-    policy: ContextBudgetPolicy
-    estimated_input_tokens: int
-
-    @property
-    def above_high_watermark(self) -> bool:
-        return self.estimated_input_tokens >= self.policy.high_watermark_tokens
-
-    @property
-    def exceeds_hard_limit(self) -> bool:
-        return self.estimated_input_tokens > int(self.policy.hard_input_limit or 0)
-
-
 @dataclass(slots=True)
 class RuntimeContextSummary:
     objective: str = ""
@@ -214,6 +203,97 @@ class RuntimeContextSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextBuildResult:
+    """Ephemeral desired context selected before token-window enforcement."""
+
+    messages: tuple[Message, ...]
+    system_prompt: str
+    tools: tuple[dict[str, Any], ...]
+    objective: str
+    previous_summary: RuntimeContextSummary | None
+    required_message_indexes: frozenset[int]
+    source_metadata: tuple[tuple[str, str, str], ...]
+    run_id: str | None = None
+    step_index: int | None = None
+    strategy: str | None = None
+
+
+class ContextBuilder:
+    """Select and assemble desired model context without applying token pressure."""
+
+    def build(
+        self,
+        messages: list[Message],
+        *,
+        system_prompt: str,
+        tools: list[dict[str, Any]] | None = None,
+        objective: str = "",
+        previous_summary: RuntimeContextSummary | None = None,
+        step_context: StepContext | None = None,
+    ) -> ContextBuildResult:
+        raw = tuple(_copy_message(message) for message in messages)
+        previous = self._valid_previous_summary(list(raw), previous_summary)
+        required = self._required_message_indexes(list(raw), objective)
+        sources: list[tuple[str, str, str]] = [("system", "system_prompt", "required")]
+        if tools:
+            sources.append(("tools", "tool_definitions", "required"))
+        if previous is not None:
+            sources.append(("summary", "live_runtime_summary", "high"))
+        sources.extend(
+            (
+                "message",
+                str(index),
+                "required" if index in required else "normal",
+            )
+            for index in range(len(raw))
+        )
+        return ContextBuildResult(
+            messages=raw,
+            system_prompt=system_prompt,
+            tools=tuple(tools or ()),
+            objective=objective,
+            previous_summary=previous,
+            required_message_indexes=frozenset(required),
+            source_metadata=tuple(sources),
+            run_id=step_context.run_id if step_context is not None else None,
+            step_index=step_context.step_index if step_context is not None else None,
+            strategy=step_context.strategy if step_context is not None else None,
+        )
+
+    def _valid_previous_summary(
+        self,
+        messages: list[Message],
+        previous: RuntimeContextSummary | None,
+    ) -> RuntimeContextSummary | None:
+        if previous is None or previous.covered_message_count <= 0:
+            return None
+        if previous.covered_message_count > len(messages):
+            return None
+        fingerprint = _message_fingerprint(messages[: previous.covered_message_count])
+        return previous if fingerprint == previous.source_fingerprint else None
+
+    def _required_message_indexes(
+        self,
+        messages: list[Message],
+        objective: str,
+    ) -> set[int]:
+        required: set[int] = set()
+        objective_index = _latest_user_index(messages)
+        if objective_index is not None:
+            required.add(objective_index)
+        if objective:
+            for index in range(len(messages) - 1, -1, -1):
+                message = messages[index]
+                if message.role == "user" and _content_text(message.content) == objective:
+                    required.add(index)
+                    break
+        for unit in _message_units(messages):
+            if unit.pending_protocol:
+                required.update(range(unit.start, unit.end))
+        return required
+
+
+@dataclass(frozen=True, slots=True)
 class ContextCompactionResult:
     messages: list[Message]
     compacted: bool
@@ -253,10 +333,13 @@ class ContextBudgetExceededError(RuntimeError):
         )
 
 
-class ContextManager:
+class ContextBudget:
+    """Fit desired context into one model request's input window."""
+
     def __init__(
         self,
         policy: ContextBudgetPolicy,
+        estimated_input_tokens: int = 0,
         *,
         estimator: TokenEstimator | None = None,
         summarizer: ConversationSummarizer | None = None,
@@ -266,29 +349,33 @@ class ContextManager:
         self.estimator = estimator or ApproximateTokenEstimator()
         self.summarizer = summarizer or DeterministicConversationSummarizer()
         self.summary_policy = (summary_policy or SummaryPolicy()).normalized()
+        self.estimated_input_tokens = max(0, int(estimated_input_tokens))
 
-    async def prepare(
+    @property
+    def above_high_watermark(self) -> bool:
+        return self.estimated_input_tokens >= self.policy.high_watermark_tokens
+
+    @property
+    def exceeds_hard_limit(self) -> bool:
+        return self.estimated_input_tokens > int(self.policy.hard_input_limit or 0)
+
+    async def fit(
         self,
-        messages: list[Message],
-        *,
-        system_prompt: str,
-        tools: list[dict[str, Any]] | None = None,
-        objective: str = "",
-        previous_summary: RuntimeContextSummary | None = None,
+        desired: ContextBuildResult,
     ) -> ContextCompactionResult:
-        raw = [_copy_message(message) for message in messages]
-        previous = self._valid_previous_summary(raw, previous_summary)
+        raw = [_copy_message(message) for message in desired.messages]
+        previous = desired.previous_summary
         candidate = self._with_previous_summary(raw, previous)
         before = self.estimator.estimate_messages(
             candidate,
-            system_prompt=system_prompt,
-            tools=tools,
+            system_prompt=desired.system_prompt,
+            tools=list(desired.tools),
         )
         candidate, projected = self._project_oversized_historical_tools(candidate)
         projected_tokens = self.estimator.estimate_messages(
             candidate,
-            system_prompt=system_prompt,
-            tools=tools,
+            system_prompt=desired.system_prompt,
+            tools=list(desired.tools),
         )
         trigger: str | None = None
         if projected:
@@ -314,7 +401,11 @@ class ContextManager:
             )
 
         covered = previous.covered_message_count if previous else 0
-        compact_end = self._eligible_prefix_end(raw, covered)
+        compact_end = self._eligible_prefix_end(
+            raw,
+            covered,
+            desired.required_message_indexes,
+        )
         if compact_end <= covered:
             self._enforce_hard_limit(projected_tokens)
             return ContextCompactionResult(
@@ -336,7 +427,7 @@ class ContextManager:
         summary = await self._summarize(
             eligible,
             previous=previous,
-            objective=objective or _latest_user_text(raw),
+            objective=desired.objective or _latest_user_text(raw),
             covered_message_count=compact_end,
             all_messages=raw,
         )
@@ -350,8 +441,8 @@ class ContextManager:
         projected += newly_projected
         after = self.estimator.estimate_messages(
             compacted_messages,
-            system_prompt=system_prompt,
-            tools=tools,
+            system_prompt=desired.system_prompt,
+            tools=list(desired.tools),
         )
         self._enforce_hard_limit(after)
         return ContextCompactionResult(
@@ -369,18 +460,6 @@ class ContextManager:
             summary_reused=previous is not None,
         )
 
-    def _valid_previous_summary(
-        self,
-        messages: list[Message],
-        previous: RuntimeContextSummary | None,
-    ) -> RuntimeContextSummary | None:
-        if previous is None or previous.covered_message_count <= 0:
-            return None
-        if previous.covered_message_count > len(messages):
-            return None
-        fingerprint = _message_fingerprint(messages[: previous.covered_message_count])
-        return previous if fingerprint == previous.source_fingerprint else None
-
     def _with_previous_summary(
         self,
         messages: list[Message],
@@ -393,7 +472,12 @@ class ContextManager:
             *messages[previous.covered_message_count :],
         ]
 
-    def _eligible_prefix_end(self, messages: list[Message], covered: int) -> int:
+    def _eligible_prefix_end(
+        self,
+        messages: list[Message],
+        covered: int,
+        required_message_indexes: frozenset[int],
+    ) -> int:
         units = _message_units(messages)
         recent_start = max(0, len(messages) - self.policy.recent_message_reserve)
         objective_index = _latest_user_index(messages)
@@ -405,6 +489,9 @@ class ContextManager:
                 unit.end > recent_start
                 or (objective_index is not None and unit.start <= objective_index < unit.end)
                 or unit.pending_protocol
+                or any(
+                    index in required_message_indexes for index in range(unit.start, unit.end)
+                )
             )
             if pinned:
                 break
@@ -493,6 +580,74 @@ class ContextManager:
         hard = int(self.policy.hard_input_limit or self.policy.usable_input)
         if estimated_tokens > hard:
             raise ContextBudgetExceededError(estimated_tokens, hard)
+
+
+class ContextManager:
+    """Compatibility facade composing semantic construction with token fitting."""
+
+    def __init__(
+        self,
+        policy: ContextBudgetPolicy,
+        *,
+        estimator: TokenEstimator | None = None,
+        summarizer: ConversationSummarizer | None = None,
+        summary_policy: SummaryPolicy | None = None,
+        builder: ContextBuilder | None = None,
+    ) -> None:
+        self.builder = builder or ContextBuilder()
+        self.budget = ContextBudget(
+            policy,
+            estimator=estimator,
+            summarizer=summarizer,
+            summary_policy=summary_policy,
+        )
+        # Compatibility attributes for callers that previously inspected the manager.
+        self.policy = self.budget.policy
+        self.estimator = self.budget.estimator
+        self.summarizer = self.budget.summarizer
+        self.summary_policy = self.budget.summary_policy
+
+    def build(
+        self,
+        messages: list[Message],
+        *,
+        system_prompt: str,
+        tools: list[dict[str, Any]] | None = None,
+        objective: str = "",
+        previous_summary: RuntimeContextSummary | None = None,
+        step_context: StepContext | None = None,
+    ) -> ContextBuildResult:
+        return self.builder.build(
+            messages,
+            system_prompt=system_prompt,
+            tools=tools,
+            objective=objective,
+            previous_summary=previous_summary,
+            step_context=step_context,
+        )
+
+    async def fit(self, desired: ContextBuildResult) -> ContextCompactionResult:
+        return await self.budget.fit(desired)
+
+    async def prepare(
+        self,
+        messages: list[Message],
+        *,
+        system_prompt: str,
+        tools: list[dict[str, Any]] | None = None,
+        objective: str = "",
+        previous_summary: RuntimeContextSummary | None = None,
+        step_context: StepContext | None = None,
+    ) -> ContextCompactionResult:
+        desired = self.build(
+            messages,
+            system_prompt=system_prompt,
+            tools=tools,
+            objective=objective,
+            previous_summary=previous_summary,
+            step_context=step_context,
+        )
+        return await self.fit(desired)
 
 
 def context_policy_from_config(config: AxiomConfig, llm_client: Any) -> ContextBudgetPolicy:
