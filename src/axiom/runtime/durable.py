@@ -39,7 +39,12 @@ from axiom.runtime.budget import (
     RunBudgetPolicy,
     RunBudgetState,
 )
-from axiom.runtime.checkpoints import CheckpointConflictError, RuntimeStore
+from axiom.runtime.checkpoints import (
+    CheckpointConflictError,
+    RuntimeStore,
+    advance_run_state,
+    load_run_state,
+)
 from axiom.runtime.completion import (
     COMPLETION_NOT_VERIFIED,
     CompletionContract,
@@ -219,7 +224,7 @@ class DurableAgentRuntime:
             run_kind = "orchestrator"
         resolved_budget_owner = budget_owner_run_id
         if resolved_budget_owner is None and parent_run_id is not None:
-            parent = await self.store.load(parent_run_id)
+            parent = await load_run_state(self.store, parent_run_id)
             resolved_budget_owner = (
                 parent.budget_owner_run_id or parent.run_id if parent is not None else parent_run_id
             )
@@ -243,7 +248,7 @@ class DurableAgentRuntime:
         )
 
         async with self._run_lock(state.run_id):
-            if await self.store.load(state.run_id) is not None:
+            if await load_run_state(self.store, state.run_id) is not None:
                 raise ValueError(f"run already exists: {state.run_id}")
             if self.tracer is not None:
                 await self.tracer.start_run(state)
@@ -406,7 +411,7 @@ class DurableAgentRuntime:
             if ancestor_id in visited:
                 raise ValueError(f"run lineage cycle detected at {ancestor_id}")
             visited.add(ancestor_id)
-            ancestor = await self.store.load(ancestor_id)
+            ancestor = await load_run_state(self.store, ancestor_id)
             if ancestor is None:
                 break
             if ancestor.status == RunStatus.CANCELLED:
@@ -476,7 +481,7 @@ class DurableAgentRuntime:
                 raise
             return await self._converge_cancelled(state.run_id)
         except CheckpointConflictError:
-            current = await self.store.load(state.run_id)
+            current = await load_run_state(self.store, state.run_id)
             if current is not None and current.status == RunStatus.CANCELLED:
                 return current
             raise
@@ -1993,7 +1998,7 @@ class DurableAgentRuntime:
         raise RuntimeError(f"run {state.run_id} was concurrently advanced")
 
     async def _require(self, run_id: str) -> Checkpoint:
-        state = await self.store.load(run_id)
+        state = await load_run_state(self.store, run_id)
         if state is None:
             raise ValueError(f"run not found: {run_id}")
         return state
@@ -2163,10 +2168,7 @@ class DurableAgentRuntime:
         parent_span_id: str | None = None,
     ) -> None:
         if self.tracer is None:
-            if self.ownership is None:
-                await self.store.save(state)
-            else:
-                await self.store.save(state, ownership=self.ownership)
+            await advance_run_state(self.store, state, ownership=self.ownership)
             return
         span = await self.tracer.start_span(
             SpanType.CHECKPOINT,
@@ -2179,10 +2181,7 @@ class DurableAgentRuntime:
             },
         )
         try:
-            if self.ownership is None:
-                await self.store.save(state)
-            else:
-                await self.store.save(state, ownership=self.ownership)
+            await advance_run_state(self.store, state, ownership=self.ownership)
         except Exception as exc:
             await self.tracer.finish_span(
                 span,

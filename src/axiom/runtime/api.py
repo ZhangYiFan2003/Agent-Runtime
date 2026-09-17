@@ -52,7 +52,13 @@ from axiom.types import Message
 
 
 @dataclass(slots=True)
-class RuntimeTurnContext:
+class RuntimeRequestContext:
+    """Interaction projection used to start a root Run.
+
+    ``turn_id`` is retained as correlation/API compatibility metadata; a Turn is
+    not an independently persisted Runtime execution entity.
+    """
+
     thread_id: str | None
     message: str
     history: list[Message]
@@ -62,7 +68,9 @@ class RuntimeTurnContext:
     run_id: str | None = None
 
 
-EngineFactory = Callable[[RuntimeTurnContext], Any]
+RuntimeTurnContext = RuntimeRequestContext
+
+EngineFactory = Callable[[RuntimeRequestContext], Any]
 ToolRegistryFactory = Callable[[AxiomConfig, str], Any]
 
 
@@ -508,7 +516,7 @@ class RuntimeApiServer:
         history = self.memory_service.history_from_runtime_events(history_events)
         turn_id = f"turn_{uuid4().hex}"
         run_id = f"run_{uuid4().hex}"
-        context = RuntimeTurnContext(
+        context = RuntimeRequestContext(
             thread_id=thread_id,
             message=message,
             history=history,
@@ -565,7 +573,7 @@ class RuntimeApiServer:
         self,
         *,
         engine: Any,
-        context: RuntimeTurnContext,
+        context: RuntimeRequestContext,
         thread_id: str,
         message: str,
         history: list[Message],
@@ -671,7 +679,7 @@ class RuntimeApiServer:
         state = await self.checkpoint_store.load(run_id)
         if state is None:
             raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
-        context = RuntimeTurnContext(
+        context = RuntimeRequestContext(
             thread_id=state.thread_id,
             message=state.input,
             history=list(state.messages),
@@ -893,7 +901,7 @@ class RuntimeApiServer:
     async def _cancel_run(self, state: Checkpoint) -> dict[str, Any]:
         if state.status == RunStatus.CANCELLED:
             return await self._run_view(state)
-        context = RuntimeTurnContext(
+        context = RuntimeRequestContext(
             thread_id=state.thread_id,
             message=state.input,
             history=list(state.messages),
@@ -1307,7 +1315,7 @@ class RuntimeApiServer:
         thread_id = self._create_thread() if task_id is not None else None
         turn_id = f"turn_{uuid4().hex}" if task_id is not None else None
         run_id = _task_run_id(task_id) if task_id is not None else None
-        context = RuntimeTurnContext(
+        context = RuntimeRequestContext(
             thread_id=thread_id,
             message=prompt,
             history=[],
@@ -1343,7 +1351,7 @@ class RuntimeApiServer:
         with contextlib.suppress(ApiError, CheckpointConflictError, ValueError):
             await self._cancel_run(state)
 
-    async def _engine(self, context: RuntimeTurnContext) -> Any:
+    async def _engine(self, context: RuntimeRequestContext) -> Any:
         if self.engine_factory is not None:
             engine = self.engine_factory(context)
             if inspect.isawaitable(engine):

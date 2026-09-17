@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from axiom.runtime.models import BudgetLedgerRecord, Checkpoint, ToolExecutionRecord
+from axiom.runtime.models import BudgetLedgerRecord, Checkpoint, RunState, ToolExecutionRecord
 from axiom.runtime.ownership import RunOwnership
 
 
@@ -21,7 +21,9 @@ class BudgetLedgerConflictError(RuntimeError):
     """Raised when an atomic budget ledger update loses a CAS race."""
 
 
-class CheckpointStore(Protocol):
+class RunStateStore(Protocol):
+    """Persistence contract for the current and historical durable state of Runs."""
+
     async def save(
         self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None
     ) -> None: ...
@@ -41,7 +43,10 @@ class ToolExecutionStore(Protocol):
     async def list_tool_executions(self, run_id: str) -> list[ToolExecutionRecord]: ...
 
 
-class RuntimeStore(CheckpointStore, ToolExecutionStore, Protocol):
+CheckpointStore = RunStateStore
+
+
+class RuntimeStore(RunStateStore, ToolExecutionStore, Protocol):
     backend: str
 
     async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None: ...
@@ -73,6 +78,24 @@ class DistributedRuntimeStore(RuntimeStore, Protocol):
     ) -> bool: ...
 
     async def get_ownership(self, run_id: str) -> RunOwnership | None: ...
+
+
+async def load_run_state(store: RunStateStore, run_id: str) -> RunState | None:
+    """Load recovery authority for a Run without implying a separate domain entity."""
+    return await store.load(run_id)
+
+
+async def advance_run_state(
+    store: RunStateStore,
+    state: RunState,
+    *,
+    ownership: RunOwnership | None = None,
+) -> None:
+    """CAS-advance one Run's versioned durable state."""
+    if ownership is None:
+        await store.save(state)
+    else:
+        await store.save(state, ownership=ownership)
 
 
 class MemoryCheckpointStore:

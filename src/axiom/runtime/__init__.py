@@ -9,7 +9,7 @@ from axiom.context import (
     RuntimeContextSummary,
     TokenEstimator,
 )
-from axiom.runtime.api import RuntimeApiServer
+from axiom.runtime.api import RuntimeApiServer, RuntimeRequestContext, RuntimeTurnContext
 from axiom.runtime.budget import (
     BudgetExceededError,
     BudgetManager,
@@ -25,8 +25,11 @@ from axiom.runtime.checkpoints import (
     CheckpointStore,
     DistributedRuntimeStore,
     MemoryCheckpointStore,
+    RunStateStore,
     RuntimeStore,
     SQLiteCheckpointStore,
+    advance_run_state,
+    load_run_state,
 )
 from axiom.runtime.completion import (
     COMPLETION_NOT_VERIFIED,
@@ -61,6 +64,7 @@ from axiom.runtime.durable import DurableAgentRuntime
 from axiom.runtime.events import EventRepository, RuntimeEvent, ThreadEventRepository
 from axiom.runtime.models import (
     Checkpoint,
+    RunState,
     RunStatus,
     ToolExecutionRecord,
     ToolExecutionStatus,
@@ -138,11 +142,15 @@ from axiom.runtime.tasks import DurableTaskManager, TaskRecord
 
 __all__ = [
     "Checkpoint",
+    "RunState",
     "BudgetLedgerConflictError",
     "CheckpointConflictError",
     "CheckpointStore",
     "DistributedRuntimeStore",
+    "RunStateStore",
     "RuntimeStore",
+    "advance_run_state",
+    "load_run_state",
     "ApiError",
     "ControlOperationName",
     "ControlOperationRecord",
@@ -196,6 +204,8 @@ __all__ = [
     "RunBudgetUsage",
     "RunMetrics",
     "RuntimeApiServer",
+    "RuntimeRequestContext",
+    "RuntimeTurnContext",
     "RuntimeExecutionStrategy",
     "RuntimeContextSummary",
     "MultiAgentExecutionStrategy",

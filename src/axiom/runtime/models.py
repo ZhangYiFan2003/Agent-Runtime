@@ -93,9 +93,15 @@ class RunError:
 
 
 @dataclass(slots=True)
-class Checkpoint:
+class RunState:
+    """Versioned durable state of one Run.
+
+    ``Checkpoint`` remains a compatibility alias; it is a persistence mechanism,
+    not a separate execution aggregate.
+    """
     run_id: str
     thread_id: str
+    # Interaction correlation retained for API/event compatibility; not recovery authority.
     turn_id: str
     input: str
     messages: list[Message]
@@ -144,7 +150,7 @@ class Checkpoint:
         progress_policy: dict[str, Any] | None = None,
         progress_state: dict[str, Any] | None = None,
         completion_contract: dict[str, Any] | None = None,
-    ) -> Checkpoint:
+    ) -> RunState:
         return cls(
             run_id=run_id or _new_id("run"),
             thread_id=thread_id,
@@ -206,7 +212,7 @@ class Checkpoint:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Checkpoint:
+    def from_dict(cls, data: dict[str, Any]) -> RunState:
         schema_version = int(data.get("schema_version") or 0)
         if schema_version != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError(f"unsupported checkpoint schema version: {schema_version}")
@@ -282,6 +288,10 @@ class Checkpoint:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+
+# Backward-compatible public name used by existing APIs, fixtures, and stored schema terminology.
+Checkpoint = RunState
 
 
 @dataclass(slots=True)
