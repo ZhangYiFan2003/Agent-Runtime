@@ -28,6 +28,8 @@ Step Contract 只统一一次迭代的内存输入输出：`StepContext` 引用�
 
 完成决策也分层：ProgressDetector 只产出是否继续、恢复或终止的进展证据；CompletionVerifier 只按 CompletionContract 产出 VERIFIED / NOT_VERIFIED / NOT_APPLICABLE / ERROR；纯 `CompletionPolicy` 再结合这些证据、硬 RunBudget/fatal outcome 和 strategy 的通用提议生成统一 NextAction。Runtime 才负责把动作应用到 RunState，并继续走 CAS/fencing。Cancel/Interrupt 是更高优先级的 durable control，不进入 NextAction；REPLAN 和各类 retry 仍属于各自策略/依赖层。
 
+ReAct、Plan 和 Multi-Agent 现在共用一个很薄的 Runtime Step lifecycle：每轮先做 ancestor/control、Run ownership/fence 与 wall-budget preflight，再创建 StepContext，调用一次策略迭代，最后按 StepResult/NextAction 决定继续、等待或终止。Runtime 不理解 plan node、reviewer 或 worker 细节；策略也不能绕开 RunState CAS。`WAIT` 会直接退出普通循环，所以 Parent 等 Child 或 HITL 时不会自旋；resume/takeover 重新经过同一 preflight。helper 本身不增加 step budget 或 step_index，成功 LLM/Tool 等既有语义边界仍是唯一计数位置。
+
 每个 Checkpoint 有版本号。保存时使用 compare-and-swap（CAS，比较并交换）：只有数据库中的版本等于调用方预期版本，才允许写入新版本。SQLite 用 `BEGIN IMMEDIATE` 比较最新 sequence 后追加版本；PostgreSQL 用单条 `UPDATE runs ... WHERE current_sequence = expected RETURNING` 原子推进 head，并在同一短事务追加 Checkpoint 历史。两种实现都能拒绝 stale write，但 CAS 本身不等于持续执行所有权；多 Worker 仍需 lease 和 fencing token。
 
 Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool call 身份派生，并保存参数哈希。若记录已是 `SUCCEEDED`，恢复时可以复用结果；若进程在 Tool 外部副作用成功后、写成功记录前崩溃，数据库里可能仍是 `RUNNING`，此时结果未知。已分类的 unsafe timeout 会持久化为 `UNKNOWN + RETRY_SUPPRESSED`，重启不会重新执行；读操作或带下游幂等契约的 Tool 才适合按剩余 attempt 和 UTC backoff deadline 自动重试。这里说“Tool 结果成功持久化”，不要把它叫成 Kafka/Redis Streams 的消息 ACK。

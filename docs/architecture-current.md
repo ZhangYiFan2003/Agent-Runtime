@@ -1014,6 +1014,30 @@ and `FAIL`; cancellation and interrupt remain authoritative Run control states. 
 necessarily one model call, Tool
 call, Event, Checkpoint, Turn, plan node, or Child Run.
 
+All three execution strategies now enter the same small Runtime step skeleton. Before constructing
+an ordinary `StepContext`, Runtime reconciles ancestor cancellation, requires `RUNNING`, validates
+the current Run ownership/fence through refresh, and checks remaining wall-time budget. It then
+invokes one strategy-specific iteration and validates the returned Run/index correlation. Only
+`CONTINUE` begins another ordinary iteration; `WAIT`, `COMPLETE`, `FAIL`, or authoritative control
+state returns to the caller. This prevents Parent `WAITING_CHILD` and HITL states from busy-spinning.
+The helper does not charge budgets, increment `step_index`, execute Tools, or persist a second kind
+of state: existing successful model/Tool boundaries remain the sole owners of their accounting,
+index advancement, ToolExecution truth, and versioned RunState writes.
+
+```text
+control / ancestor / ownership / wall-budget preflight
+        ↓
+StepContext
+        ↓
+strategy-specific model / Tool / Child-Run work
+        ↓
+ProgressDetector → CompletionVerifier (completion candidates only)
+        ↓
+CompletionPolicy → NextAction
+        ↓
+existing ownership-aware RunState CAS
+```
+
 `turn_id` remains correlation and HTTP interaction compatibility metadata. There is no Turn model,
 TurnRepository, Turn state machine, or `turns` table, and recovery does not load or replay a Turn.
 The canonical recovery path is ownership claim, load RunState, load required ToolExecution evidence,
