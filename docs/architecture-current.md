@@ -236,6 +236,9 @@ flowchart TD
   - Defines the RuntimeStore and `load_run_state`/`advance_run_state` facade plus
     Memory/SQLite implementations. SQLite appends Run-state checkpoint sequences and uses
     optimistic sequence checks to reject stale workers.
+- `src/axiom/runtime/steps.py`
+  - Defines the in-memory `StepContext`, `StepResult`, and small `NextAction` vocabulary.
+    These types are execution contracts only and have no repository or serialized form.
 - `src/axiom/runtime/events.py`
   - Defines the thread/event repository contract, event envelope, and backward-compatible
     SQLite event implementation with monotonic replay IDs.
@@ -979,6 +982,14 @@ terminology, not a separate business aggregate. A Step is an ephemeral execution
 no table, repository, lease, or state machine. Event is append-only timeline/SSE/audit evidence and
 is not replayed to recover a Run. ToolExecution remains separate durable truth because logical Tool
 identity, attempts, ambiguous outcomes, and external side effects need stronger semantics.
+
+One Step begins from an authoritative `RunState`. `StepContext` carries Run correlation, the current
+control state, strategy, and inherited Run ownership context; the strategy/runtime performs one
+existing iteration and returns `StepResult` with a small continuation decision plus lightweight
+Tool invocation IDs. The Runtime still owns control checks, budgets, ownership validation, and
+RunState CAS. `NextAction` is limited to `CONTINUE`, `COMPLETE`, `WAIT`, and `FAIL`; cancellation and
+interrupt remain authoritative Run control states. A Step is not necessarily one model call, Tool
+call, Event, Checkpoint, Turn, plan node, or Child Run.
 
 `turn_id` remains correlation and HTTP interaction compatibility metadata. There is no Turn model,
 TurnRepository, Turn state machine, or `turns` table, and recovery does not load or replay a Turn.

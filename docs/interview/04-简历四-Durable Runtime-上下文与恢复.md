@@ -24,6 +24,8 @@ Agent 任务比普通 HTTP 请求更长，也更有状态。一次任务可能�
 
 我先把会话和执行状态分开。Thread 管会话范围；Run 是唯一 durable 执行、控制、ownership 单元；Checkpoint 只是 Run 的版本化 durable state 机制；Step 是 Run 内临时迭代；Event 保存历史/SSE 证据；ToolExecution 保存外部调用事实。`turn_id` 只保留交互关联兼容性，不是恢复实体。
 
+Step Contract 只统一一次迭代的内存输入输出：`StepContext` 引用当前 RunState、控制状态与 Run-level ownership，`StepResult` 返回 `CONTINUE/COMPLETE/WAIT/FAIL` 和轻量 Tool invocation ID。它没有表、Repository、lease 或 fencing；崩溃后丢失 StepResult 是安全的，因为恢复事实仍在 RunState 与 ToolExecution。
+
 每个 Checkpoint 有版本号。保存时使用 compare-and-swap（CAS，比较并交换）：只有数据库中的版本等于调用方预期版本，才允许写入新版本。SQLite 用 `BEGIN IMMEDIATE` 比较最新 sequence 后追加版本；PostgreSQL 用单条 `UPDATE runs ... WHERE current_sequence = expected RETURNING` 原子推进 head，并在同一短事务追加 Checkpoint 历史。两种实现都能拒绝 stale write，但 CAS 本身不等于持续执行所有权；多 Worker 仍需 lease 和 fencing token。
 
 Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool call 身份派生，并保存参数哈希。若记录已是 `SUCCEEDED`，恢复时可以复用结果；若进程在 Tool 外部副作用成功后、写成功记录前崩溃，数据库里可能仍是 `RUNNING`，此时结果未知。已分类的 unsafe timeout 会持久化为 `UNKNOWN + RETRY_SUPPRESSED`，重启不会重新执行；读操作或带下游幂等契约的 Tool 才适合按剩余 attempt 和 UTC backoff deadline 自动重试。这里说“Tool 结果成功持久化”，不要把它叫成 Kafka/Redis Streams 的消息 ACK。
