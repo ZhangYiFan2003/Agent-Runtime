@@ -903,6 +903,7 @@ class PlanExecuteStrategy:
             active_run_supervisor=runtime.active_run_supervisor,
             context_manager=runtime.context_manager,
             budget_manager=runtime.budget_manager,
+            ownership=runtime.ownership,
             max_turns=self.max_task_turns,
         )
 

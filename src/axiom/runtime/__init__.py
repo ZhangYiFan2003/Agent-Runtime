@@ -23,6 +23,7 @@ from axiom.runtime.checkpoints import (
     BudgetLedgerConflictError,
     CheckpointConflictError,
     CheckpointStore,
+    DistributedRuntimeStore,
     MemoryCheckpointStore,
     RuntimeStore,
     SQLiteCheckpointStore,
@@ -88,6 +89,13 @@ from axiom.runtime.observability_store import (
     ObservabilityService,
     SQLiteObservabilityStore,
 )
+from axiom.runtime.ownership import (
+    DistributedRunWorker,
+    DistributedWorkerConfigurationError,
+    OwnershipLostError,
+    RunOwnership,
+    new_worker_id,
+)
 from axiom.runtime.plan_strategy import (
     LocalPlanTaskScheduler,
     PlanExecuteStrategy,
@@ -133,6 +141,7 @@ __all__ = [
     "BudgetLedgerConflictError",
     "CheckpointConflictError",
     "CheckpointStore",
+    "DistributedRuntimeStore",
     "RuntimeStore",
     "ApiError",
     "ControlOperationName",
@@ -170,6 +179,11 @@ __all__ = [
     "ModelPricing",
     "ModelPricingRegistry",
     "ObservabilityService",
+    "DistributedRunWorker",
+    "DistributedWorkerConfigurationError",
+    "OwnershipLostError",
+    "RunOwnership",
+    "new_worker_id",
     "PlanExecuteStrategy",
     "LocalPlanTaskScheduler",
     "PlanSchedulerSnapshot",

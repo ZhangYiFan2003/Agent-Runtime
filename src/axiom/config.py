@@ -160,6 +160,16 @@ class StorageConfig:
 
 
 @dataclass(slots=True)
+class WorkerConfig:
+    """Optional PostgreSQL distributed ownership Worker settings."""
+
+    distributed_enabled: bool = False
+    lease_seconds: float = 30.0
+    heartbeat_interval_seconds: float = 10.0
+    poll_interval_seconds: float = 0.5
+
+
+@dataclass(slots=True)
 class ProgressConfig:
     """Deterministic, bounded no-progress detection for durable Runs."""
 
@@ -226,6 +236,7 @@ class AxiomConfig:
     run_budget: RunBudgetConfig = field(default_factory=RunBudgetConfig)
     dependency: DependencyConfig = field(default_factory=DependencyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    worker: WorkerConfig = field(default_factory=WorkerConfig)
     progress: ProgressConfig = field(default_factory=ProgressConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
@@ -260,6 +271,17 @@ def load_config(
     config = _dict_to_config(data)
     config.memory.long_term_db_path = _expand_home(config.memory.long_term_db_path)
     config.policy.audit_log_path = _expand_home(config.policy.audit_log_path)
+    if config.worker.distributed_enabled and config.storage.backend.strip().lower() != "postgres":
+        raise ValueError("distributed Worker ownership requires storage.backend=postgres")
+    if config.worker.distributed_enabled and (
+        config.worker.lease_seconds <= 0
+        or config.worker.heartbeat_interval_seconds <= 0
+        or config.worker.heartbeat_interval_seconds >= config.worker.lease_seconds
+        or config.worker.poll_interval_seconds <= 0
+    ):
+        raise ValueError(
+            "distributed Worker requires positive polling and heartbeat shorter than lease"
+        )
     return config
 
 
@@ -327,6 +349,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     run_budget = result.setdefault("run_budget", {})
     progress = result.setdefault("progress", {})
     storage = result.setdefault("storage", {})
+    worker = result.setdefault("worker", {})
 
     storage_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_STORAGE_BACKEND", "backend", str),
@@ -341,6 +364,18 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 storage[config_key] = caster(raw)
+
+    worker_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_DISTRIBUTED_WORKER", "distributed_enabled", _as_bool),
+        ("AXIOM_WORKER_LEASE_SECONDS", "lease_seconds", float),
+        ("AXIOM_WORKER_HEARTBEAT_INTERVAL_SECONDS", "heartbeat_interval_seconds", float),
+        ("AXIOM_WORKER_POLL_INTERVAL_SECONDS", "poll_interval_seconds", float),
+    ]
+    for env_key, config_key, caster in worker_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                worker[config_key] = caster(raw)
 
     mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_API_KEY", "api_key", str),
@@ -521,6 +556,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         run_budget=RunBudgetConfig(**data.get("run_budget", {})),
         dependency=DependencyConfig(**data.get("dependency", {})),
         storage=StorageConfig(**data.get("storage", {})),
+        worker=WorkerConfig(**data.get("worker", {})),
         progress=ProgressConfig(**data.get("progress", {})),
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),
@@ -530,3 +566,12 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
 
 def _expand_home(path: str) -> str:
     return str(Path(path).expanduser())
+
+
+def _as_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value: {value}")

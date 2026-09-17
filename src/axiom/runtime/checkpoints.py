@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from axiom.runtime.models import BudgetLedgerRecord, Checkpoint, ToolExecutionRecord
+from axiom.runtime.ownership import RunOwnership
 
 
 class CheckpointConflictError(RuntimeError):
@@ -21,7 +22,9 @@ class BudgetLedgerConflictError(RuntimeError):
 
 
 class CheckpointStore(Protocol):
-    async def save(self, checkpoint: Checkpoint) -> None: ...
+    async def save(
+        self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None
+    ) -> None: ...
 
     async def load(self, run_id: str) -> Checkpoint | None: ...
 
@@ -29,7 +32,9 @@ class CheckpointStore(Protocol):
 
 
 class ToolExecutionStore(Protocol):
-    async def save_tool_execution(self, record: ToolExecutionRecord) -> None: ...
+    async def save_tool_execution(
+        self, record: ToolExecutionRecord, *, ownership: RunOwnership | None = None
+    ) -> None: ...
 
     async def load_tool_execution(self, invocation_id: str) -> ToolExecutionRecord | None: ...
 
@@ -41,7 +46,33 @@ class RuntimeStore(CheckpointStore, ToolExecutionStore, Protocol):
 
     async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None: ...
 
-    async def save_budget_ledger(self, record: BudgetLedgerRecord) -> None: ...
+    async def save_budget_ledger(
+        self, record: BudgetLedgerRecord, *, ownership: RunOwnership | None = None
+    ) -> None: ...
+
+    async def validate_ownership(self, ownership: RunOwnership) -> None: ...
+
+
+class DistributedRuntimeStore(RuntimeStore, Protocol):
+    async def mark_runnable(self, run_id: str) -> None: ...
+
+    async def claim_run(
+        self, run_id: str, worker_id: str, lease_seconds: float
+    ) -> RunOwnership | None: ...
+
+    async def claim_next(
+        self, worker_id: str, lease_seconds: float
+    ) -> RunOwnership | None: ...
+
+    async def renew_lease(
+        self, ownership: RunOwnership, lease_seconds: float
+    ) -> RunOwnership | None: ...
+
+    async def release_lease(
+        self, ownership: RunOwnership, *, runnable: bool = True
+    ) -> bool: ...
+
+    async def get_ownership(self, run_id: str) -> RunOwnership | None: ...
 
 
 class MemoryCheckpointStore:
@@ -53,7 +84,11 @@ class MemoryCheckpointStore:
         self._budget_ledgers: dict[str, dict[str, object]] = {}
         self._lock = asyncio.Lock()
 
-    async def save(self, checkpoint: Checkpoint) -> None:
+    async def save(
+        self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None
+    ) -> None:
+        if ownership is not None:
+            raise ValueError("distributed ownership requires PostgreSQL storage")
         async with self._lock:
             rows = self._checkpoints.setdefault(checkpoint.run_id, [])
             latest = int(rows[-1]["sequence"]) if rows else 0
@@ -80,7 +115,11 @@ class MemoryCheckpointStore:
             ]
         return sorted(checkpoints, key=lambda checkpoint: checkpoint.created_at)
 
-    async def save_tool_execution(self, record: ToolExecutionRecord) -> None:
+    async def save_tool_execution(
+        self, record: ToolExecutionRecord, *, ownership: RunOwnership | None = None
+    ) -> None:
+        if ownership is not None:
+            raise ValueError("distributed ownership requires PostgreSQL storage")
         async with self._lock:
             current = self._tool_executions.get(record.invocation_id)
             if current and current.get("arguments_hash") != record.arguments_hash:
@@ -113,7 +152,11 @@ class MemoryCheckpointStore:
                 state=deepcopy(row["state"]),
             )
 
-    async def save_budget_ledger(self, record: BudgetLedgerRecord) -> None:
+    async def save_budget_ledger(
+        self, record: BudgetLedgerRecord, *, ownership: RunOwnership | None = None
+    ) -> None:
+        if ownership is not None:
+            raise ValueError("distributed ownership requires PostgreSQL storage")
         async with self._lock:
             current = self._budget_ledgers.get(record.owner_run_id)
             current_version = int(current["version"]) if current else 0
@@ -137,7 +180,11 @@ class SQLiteCheckpointStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
-    async def save(self, checkpoint: Checkpoint) -> None:
+    async def save(
+        self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None
+    ) -> None:
+        if ownership is not None:
+            raise ValueError("distributed ownership requires PostgreSQL storage")
         await asyncio.to_thread(self._save, checkpoint)
 
     async def load(self, run_id: str) -> Checkpoint | None:
@@ -146,7 +193,11 @@ class SQLiteCheckpointStore:
     async def list(self, thread_id: str) -> list[Checkpoint]:
         return await asyncio.to_thread(self._list, thread_id)
 
-    async def save_tool_execution(self, record: ToolExecutionRecord) -> None:
+    async def save_tool_execution(
+        self, record: ToolExecutionRecord, *, ownership: RunOwnership | None = None
+    ) -> None:
+        if ownership is not None:
+            raise ValueError("distributed ownership requires PostgreSQL storage")
         await asyncio.to_thread(self._save_tool_execution, record)
 
     async def load_tool_execution(self, invocation_id: str) -> ToolExecutionRecord | None:
@@ -158,7 +209,11 @@ class SQLiteCheckpointStore:
     async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None:
         return await asyncio.to_thread(self._load_budget_ledger, owner_run_id)
 
-    async def save_budget_ledger(self, record: BudgetLedgerRecord) -> None:
+    async def save_budget_ledger(
+        self, record: BudgetLedgerRecord, *, ownership: RunOwnership | None = None
+    ) -> None:
+        if ownership is not None:
+            raise ValueError("distributed ownership requires PostgreSQL storage")
         await asyncio.to_thread(self._save_budget_ledger, record)
 
     def _save(self, checkpoint: Checkpoint) -> None:

@@ -70,6 +70,7 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.observability import Span, SpanStatus, SpanType, now, tool_span_id
 from axiom.runtime.observability_store import RunTracer
+from axiom.runtime.ownership import RunOwnership
 from axiom.runtime.progress import (
     NoProgressError,
     ProgressDecision,
@@ -152,6 +153,7 @@ class DurableAgentRuntime:
         completion_verifier: CompletionVerifier | None = None,
         retry_random: Callable[[], float] | None = None,
         retry_sleep: Callable[[float], Awaitable[None]] | None = None,
+        ownership: RunOwnership | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -164,6 +166,7 @@ class DurableAgentRuntime:
         self.retry_classifier = RetryClassifier()
         self.retry_random = retry_random or random.random
         self.retry_sleep = retry_sleep or asyncio.sleep
+        self.ownership = ownership
         self.event_sink = event_sink
         self.tracer = tracer
         self.permission_policy = permission_policy or DefaultPermissionPolicy(
@@ -187,7 +190,10 @@ class DurableAgentRuntime:
             model=llm_client.model_name,
             pricing_registry=ModelPricingRegistry.from_config(config.run_budget.model_pricing),
             observability_store=tracer.store if tracer is not None else None,
+            ownership=ownership,
         )
+        if budget_manager is not None and ownership is not None:
+            self.budget_manager.ownership = ownership
         self.progress_detector = progress_detector or ProgressDetector(
             ProgressPolicy.from_config(config.progress)
         )
@@ -1349,7 +1355,7 @@ class DurableAgentRuntime:
                 existing.last_error_code = DEPENDENCY_RETRY_EXHAUSTED
                 existing.retry_state = ToolRetryState.RETRY_EXHAUSTED
                 existing.completed_at = _now()
-                await self.store.save_tool_execution(existing)
+                await self._save_tool_execution(existing)
                 return await self._execute_pending_tool_inner(
                     state,
                     parent_span_id=parent_span_id,
@@ -1415,7 +1421,7 @@ class DurableAgentRuntime:
             record.error = f"denied by permission policy: {permission.reason}"
             record.is_error = True
             record.completed_at = _now()
-            await self.store.save_tool_execution(record)
+            await self._save_tool_execution(record)
             tool_span = await self._start_tool_span(
                 invocation_id,
                 name,
@@ -1463,7 +1469,7 @@ class DurableAgentRuntime:
             status=ToolExecutionStatus.PENDING,
         )
         if existing is None:
-            await self.store.save_tool_execution(record)
+            await self._save_tool_execution(record)
 
         tool_span = await self._start_tool_span(
             invocation_id,
@@ -1493,7 +1499,7 @@ class DurableAgentRuntime:
                     record.retry_suppressed_reason = "deadline"
                     record.last_error_code = DEPENDENCY_DEADLINE_EXCEEDED
                     record.next_retry_at = None
-                    await self.store.save_tool_execution(record)
+                    await self._save_tool_execution(record)
                     await self._finish_span(
                         tool_span,
                         SpanStatus.FAILED,
@@ -1523,7 +1529,7 @@ class DurableAgentRuntime:
                     await self.retry_sleep(pending_delay)
                 record.next_retry_at = None
                 record.retry_state = ToolRetryState.NONE
-                await self.store.save_tool_execution(record)
+                await self._save_tool_execution(record)
             next_attempt = record.attempt + 1
             try:
                 await self.budget_manager.consume_tool_call(
@@ -1536,7 +1542,7 @@ class DurableAgentRuntime:
             record.status = ToolExecutionStatus.RUNNING
             record.started_at = record.started_at or _now()
             record.error = None
-            await self.store.save_tool_execution(record)
+            await self._save_tool_execution(record)
             if tool_span is not None and self.tracer is not None:
                 await self.tracer.annotate_span(
                     tool_span.span_id,
@@ -1608,7 +1614,7 @@ class DurableAgentRuntime:
                 record.retry_suppressed_reason = "unsafe" if unsafe_outcome else "cancelled"
                 record.next_retry_at = None
                 record.completed_at = _now()
-                await self.store.save_tool_execution(record)
+                await self._save_tool_execution(record)
                 cancelled = {
                     **self._execution_start_attributes(tool, payload),
                     "cancelled": True,
@@ -1641,7 +1647,7 @@ class DurableAgentRuntime:
                 record.retry_state = ToolRetryState.NONE
                 record.retry_suppressed_reason = None
                 record.next_retry_at = None
-                await self.store.save_tool_execution(record)
+                await self._save_tool_execution(record)
                 await self._finish_span(
                     tool_span,
                     SpanStatus.SUCCEEDED,
@@ -1718,7 +1724,7 @@ class DurableAgentRuntime:
                     else ToolRetryState.RETRY_SUPPRESSED
                 )
                 record.next_retry_at = None
-            await self.store.save_tool_execution(record)
+            await self._save_tool_execution(record)
             await self._emit(
                 "tool.failed",
                 {
@@ -1977,6 +1983,8 @@ class DurableAgentRuntime:
         return state
 
     async def _refresh(self, state: Checkpoint) -> Checkpoint:
+        if self.ownership is not None:
+            await self.store.validate_ownership(self.ownership)
         current = await self._require(state.run_id)
         if current.sequence == state.sequence:
             return state
@@ -2155,7 +2163,10 @@ class DurableAgentRuntime:
         parent_span_id: str | None = None,
     ) -> None:
         if self.tracer is None:
-            await self.store.save(state)
+            if self.ownership is None:
+                await self.store.save(state)
+            else:
+                await self.store.save(state, ownership=self.ownership)
             return
         span = await self.tracer.start_span(
             SpanType.CHECKPOINT,
@@ -2168,7 +2179,10 @@ class DurableAgentRuntime:
             },
         )
         try:
-            await self.store.save(state)
+            if self.ownership is None:
+                await self.store.save(state)
+            else:
+                await self.store.save(state, ownership=self.ownership)
         except Exception as exc:
             await self.tracer.finish_span(
                 span,
@@ -2181,6 +2195,12 @@ class DurableAgentRuntime:
             SpanStatus.SUCCEEDED,
             attributes={"sequence": state.sequence},
         )
+
+    async def _save_tool_execution(self, record: ToolExecutionRecord) -> None:
+        if self.ownership is None:
+            await self.store.save_tool_execution(record)
+        else:
+            await self.store.save_tool_execution(record, ownership=self.ownership)
 
     async def _start_span(
         self,

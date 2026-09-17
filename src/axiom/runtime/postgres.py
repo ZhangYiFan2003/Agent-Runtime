@@ -18,8 +18,9 @@ from axiom.runtime.control_plane import (
 )
 from axiom.runtime.events import RuntimeEvent
 from axiom.runtime.models import BudgetLedgerRecord, Checkpoint, ToolExecutionRecord
+from axiom.runtime.ownership import OwnershipLostError, RunOwnership
 
-POSTGRES_SCHEMA_VERSION = 1
+POSTGRES_SCHEMA_VERSION = 2
 
 
 class PostgresDependencyError(RuntimeError):
@@ -82,7 +83,7 @@ class PostgresConnectionPool:
 
 
 def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
-    """Create the v1 schema and reject stores created by newer code."""
+    """Create or migrate the schema and reject stores created by newer code."""
     with pool.connection() as conn:
         conn.execute(
             """
@@ -93,24 +94,28 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
             )
             """
         )
-        conn.execute(
-            """
-            insert into axiom_schema_versions(component, version, updated_at)
-            values ('runtime', %s, %s)
-            on conflict(component) do nothing
-            """,
-            (POSTGRES_SCHEMA_VERSION, _now()),
-        )
         row = conn.execute(
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()
-        version = int(row[0]) if row else 0
-        if version != POSTGRES_SCHEMA_VERSION:
+        version = int(row[0]) if row else POSTGRES_SCHEMA_VERSION
+        if version not in {1, POSTGRES_SCHEMA_VERSION}:
             raise PostgresSchemaError(
                 f"unsupported PostgreSQL runtime schema version: {version}"
             )
         for statement in _SCHEMA_STATEMENTS:
             conn.execute(statement)
+        for statement in _OWNERSHIP_MIGRATION_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            """
+            insert into axiom_schema_versions(component, version, updated_at)
+            values ('runtime', %s, %s)
+            on conflict(component) do update set
+                version = excluded.version,
+                updated_at = excluded.updated_at
+            """,
+            (POSTGRES_SCHEMA_VERSION, _now()),
+        )
 
 
 class PostgresRuntimeStore:
@@ -119,8 +124,10 @@ class PostgresRuntimeStore:
     def __init__(self, pool: PostgresConnectionPool):
         self.pool = pool
 
-    async def save(self, checkpoint: Checkpoint) -> None:
-        await asyncio.to_thread(self._save, checkpoint)
+    async def save(
+        self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None
+    ) -> None:
+        await asyncio.to_thread(self._save, checkpoint, ownership)
 
     async def load(self, run_id: str) -> Checkpoint | None:
         return await asyncio.to_thread(self._load, run_id)
@@ -128,8 +135,10 @@ class PostgresRuntimeStore:
     async def list(self, thread_id: str) -> list[Checkpoint]:
         return await asyncio.to_thread(self._list, thread_id)
 
-    async def save_tool_execution(self, record: ToolExecutionRecord) -> None:
-        await asyncio.to_thread(self._save_tool_execution, record)
+    async def save_tool_execution(
+        self, record: ToolExecutionRecord, *, ownership: RunOwnership | None = None
+    ) -> None:
+        await asyncio.to_thread(self._save_tool_execution, record, ownership)
 
     async def load_tool_execution(self, invocation_id: str) -> ToolExecutionRecord | None:
         return await asyncio.to_thread(self._load_tool_execution, invocation_id)
@@ -140,10 +149,44 @@ class PostgresRuntimeStore:
     async def load_budget_ledger(self, owner_run_id: str) -> BudgetLedgerRecord | None:
         return await asyncio.to_thread(self._load_budget_ledger, owner_run_id)
 
-    async def save_budget_ledger(self, record: BudgetLedgerRecord) -> None:
-        await asyncio.to_thread(self._save_budget_ledger, record)
+    async def save_budget_ledger(
+        self, record: BudgetLedgerRecord, *, ownership: RunOwnership | None = None
+    ) -> None:
+        await asyncio.to_thread(self._save_budget_ledger, record, ownership)
 
-    def _save(self, checkpoint: Checkpoint) -> None:
+    async def mark_runnable(self, run_id: str) -> None:
+        await asyncio.to_thread(self._mark_runnable, run_id)
+
+    async def claim_run(
+        self, run_id: str, worker_id: str, lease_seconds: float
+    ) -> RunOwnership | None:
+        _require_positive_lease(lease_seconds)
+        return await asyncio.to_thread(self._claim_run, run_id, worker_id, lease_seconds)
+
+    async def claim_next(
+        self, worker_id: str, lease_seconds: float
+    ) -> RunOwnership | None:
+        _require_positive_lease(lease_seconds)
+        return await asyncio.to_thread(self._claim_next, worker_id, lease_seconds)
+
+    async def renew_lease(
+        self, ownership: RunOwnership, lease_seconds: float
+    ) -> RunOwnership | None:
+        _require_positive_lease(lease_seconds)
+        return await asyncio.to_thread(self._renew_lease, ownership, lease_seconds)
+
+    async def release_lease(
+        self, ownership: RunOwnership, *, runnable: bool = True
+    ) -> bool:
+        return await asyncio.to_thread(self._release_lease, ownership, runnable)
+
+    async def get_ownership(self, run_id: str) -> RunOwnership | None:
+        return await asyncio.to_thread(self._get_ownership, run_id)
+
+    async def validate_ownership(self, ownership: RunOwnership) -> None:
+        await asyncio.to_thread(self._validate_ownership, ownership)
+
+    def _save(self, checkpoint: Checkpoint, ownership: RunOwnership | None = None) -> None:
         expected = checkpoint.sequence
         next_sequence = expected + 1
         updated_at = _now()
@@ -152,6 +195,8 @@ class PostgresRuntimeStore:
         state["updated_at"] = updated_at
         payload = _json(state)
         with self.pool.connection() as conn:
+            if ownership is not None:
+                _lock_and_validate_ownership(conn, ownership)
             if expected == 0:
                 row = conn.execute(
                     """
@@ -225,6 +270,21 @@ class PostgresRuntimeStore:
                     updated_at,
                 ),
             )
+            if checkpoint.finished:
+                conn.execute(
+                    """
+                    update runs
+                    set runnable = false,
+                        owner_worker_id = case when run_id = %s then null else owner_worker_id end,
+                        lease_until = case when run_id = %s then null else lease_until end
+                    where run_id = %s
+                    """,
+                    (
+                        ownership.run_id if ownership else "",
+                        ownership.run_id if ownership else "",
+                        checkpoint.run_id,
+                    ),
+                )
         checkpoint.sequence = next_sequence
         checkpoint.updated_at = updated_at
 
@@ -243,7 +303,9 @@ class PostgresRuntimeStore:
             ).fetchall()
         return [_checkpoint(row[0]) for row in rows]
 
-    def _save_tool_execution(self, record: ToolExecutionRecord) -> None:
+    def _save_tool_execution(
+        self, record: ToolExecutionRecord, ownership: RunOwnership | None = None
+    ) -> None:
         updated_at = _now()
         values: Sequence[object] = (
             record.invocation_id,
@@ -267,6 +329,8 @@ class PostgresRuntimeStore:
             updated_at,
         )
         with self.pool.connection() as conn:
+            if ownership is not None:
+                _lock_and_validate_ownership(conn, ownership)
             row = conn.execute(
                 """
                 insert into tool_executions(
@@ -328,8 +392,12 @@ class PostgresRuntimeStore:
             else None
         )
 
-    def _save_budget_ledger(self, record: BudgetLedgerRecord) -> None:
+    def _save_budget_ledger(
+        self, record: BudgetLedgerRecord, ownership: RunOwnership | None = None
+    ) -> None:
         with self.pool.connection() as conn:
+            if ownership is not None:
+                _lock_and_validate_ownership(conn, ownership)
             if record.version == 0:
                 row = conn.execute(
                     """
@@ -360,6 +428,142 @@ class PostgresRuntimeStore:
                     f"stale budget ledger for {record.owner_run_id}"
                 )
         record.version += 1
+
+    def _mark_runnable(self, run_id: str) -> None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                update runs as candidate
+                set runnable = true
+                where run_id = %s
+                  and status in ('RUNNING', 'WAITING_CHILD')
+                  and {_DEADLINE_IS_LIVE}
+                  and {_ANCESTORS_NOT_CANCELLED}
+                returning run_id
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"run is not eligible for distributed execution: {run_id}")
+
+    def _claim_run(
+        self, run_id: str, worker_id: str, lease_seconds: float
+    ) -> RunOwnership | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                update runs as candidate
+                set owner_worker_id = %s,
+                    lease_until = current_timestamp + %s * interval '1 second',
+                    fencing_token = fencing_token + 1,
+                    claimed_at = current_timestamp,
+                    last_heartbeat_at = current_timestamp
+                where run_id = %s
+                  and {_RUN_IS_CLAIMABLE}
+                returning run_id, owner_worker_id, fencing_token, lease_until
+                """,
+                (worker_id, lease_seconds, run_id),
+            ).fetchone()
+        return _ownership(row) if row else None
+
+    def _claim_next(self, worker_id: str, lease_seconds: float) -> RunOwnership | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                with selected as (
+                    select candidate.run_id
+                    from runs as candidate
+                    where {_RUN_IS_CLAIMABLE}
+                    order by created_at, run_id
+                    for update skip locked
+                    limit 1
+                )
+                update runs as claimed
+                set owner_worker_id = %s,
+                    lease_until = current_timestamp + %s * interval '1 second',
+                    fencing_token = fencing_token + 1,
+                    claimed_at = current_timestamp,
+                    last_heartbeat_at = current_timestamp
+                from selected
+                where claimed.run_id = selected.run_id
+                returning claimed.run_id, claimed.owner_worker_id,
+                          claimed.fencing_token, claimed.lease_until
+                """,
+                (worker_id, lease_seconds),
+            ).fetchone()
+        return _ownership(row) if row else None
+
+    def _renew_lease(
+        self, ownership: RunOwnership, lease_seconds: float
+    ) -> RunOwnership | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                update runs
+                set lease_until = current_timestamp + %s * interval '1 second',
+                    last_heartbeat_at = current_timestamp
+                where run_id = %s and owner_worker_id = %s and fencing_token = %s
+                  and status in ('RUNNING', 'WAITING_CHILD')
+                  and lease_until > current_timestamp
+                returning run_id, owner_worker_id, fencing_token, lease_until
+                """,
+                (
+                    lease_seconds,
+                    ownership.run_id,
+                    ownership.worker_id,
+                    ownership.fencing_token,
+                ),
+            ).fetchone()
+        return _ownership(row) if row else None
+
+    def _release_lease(self, ownership: RunOwnership, runnable: bool) -> bool:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                update runs
+                set owner_worker_id = null, lease_until = null,
+                    runnable = case
+                        when status in ('RUNNING', 'WAITING_CHILD') then %s
+                        else false
+                    end
+                where run_id = %s and owner_worker_id = %s and fencing_token = %s
+                returning run_id
+                """,
+                (
+                    runnable,
+                    ownership.run_id,
+                    ownership.worker_id,
+                    ownership.fencing_token,
+                ),
+            ).fetchone()
+        return row is not None
+
+    def _get_ownership(self, run_id: str) -> RunOwnership | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                select run_id, owner_worker_id, fencing_token, lease_until
+                from runs where run_id = %s and owner_worker_id is not null
+                """,
+                (run_id,),
+            ).fetchone()
+        return _ownership(row) if row else None
+
+    def _validate_ownership(self, ownership: RunOwnership) -> None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                select 1 from runs
+                where run_id = %s and owner_worker_id = %s and fencing_token = %s
+                  and status in ('RUNNING', 'WAITING_CHILD')
+                  and lease_until > current_timestamp
+                """,
+                (ownership.run_id, ownership.worker_id, ownership.fencing_token),
+            ).fetchone()
+        if row is None:
+            raise OwnershipLostError(
+                f"worker {ownership.worker_id} no longer owns run {ownership.run_id}"
+            )
 
 
 class PostgresEventRepository:
@@ -695,6 +899,81 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _ownership(row) -> RunOwnership:
+    lease_until = row[3]
+    if lease_until.tzinfo is None:
+        lease_until = lease_until.replace(tzinfo=UTC)
+    token = int(row[2])
+    return RunOwnership(
+        run_id=str(row[0]),
+        worker_id=str(row[1]),
+        fencing_token=token,
+        lease_until=lease_until.astimezone(UTC),
+        takeover=token > 1,
+    )
+
+
+def _require_positive_lease(lease_seconds: float) -> None:
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+
+
+def _lock_and_validate_ownership(conn, ownership: RunOwnership) -> None:
+    row = conn.execute(
+        """
+        select 1 from runs
+        where run_id = %s and owner_worker_id = %s and fencing_token = %s
+          and status in ('RUNNING', 'WAITING_CHILD')
+          and lease_until > current_timestamp
+        for update
+        """,
+        (ownership.run_id, ownership.worker_id, ownership.fencing_token),
+    ).fetchone()
+    if row is None:
+        raise OwnershipLostError(
+            f"worker {ownership.worker_id} no longer owns run {ownership.run_id}"
+        )
+
+
+_DEADLINE_IS_LIVE = """
+(
+    coalesce(
+        (candidate.state_json -> 'budget_policy' ->> 'max_wall_time_seconds')::double precision,
+        0
+    ) <= 0
+    or candidate.created_at
+       + coalesce(
+            (candidate.state_json -> 'budget_policy' ->> 'max_wall_time_seconds')::double precision,
+            0
+         )
+         * interval '1 second' > current_timestamp
+)
+"""
+
+_ANCESTORS_NOT_CANCELLED = """
+not exists (
+    with recursive ancestors(run_id, parent_run_id, status) as (
+        select parent.run_id, parent.parent_run_id, parent.status
+        from runs as parent
+        where parent.run_id = candidate.parent_run_id
+        union all
+        select parent.run_id, parent.parent_run_id, parent.status
+        from runs as parent
+        join ancestors on parent.run_id = ancestors.parent_run_id
+    )
+    select 1 from ancestors where status = 'CANCELLED'
+)
+"""
+
+_RUN_IS_CLAIMABLE = f"""
+candidate.runnable
+and candidate.status in ('RUNNING', 'WAITING_CHILD')
+and (candidate.owner_worker_id is null or candidate.lease_until <= current_timestamp)
+and {_DEADLINE_IS_LIVE}
+and {_ANCESTORS_NOT_CANCELLED}
+"""
+
+
 _SCHEMA_STATEMENTS = (
     """
     create table if not exists runs (
@@ -707,7 +986,13 @@ _SCHEMA_STATEMENTS = (
         state_json jsonb not null,
         parent_run_id text,
         created_at timestamptz not null,
-        updated_at timestamptz not null
+        updated_at timestamptz not null,
+        runnable boolean not null default false,
+        owner_worker_id text,
+        lease_until timestamptz,
+        fencing_token bigint not null default 0,
+        claimed_at timestamptz,
+        last_heartbeat_at timestamptz
     )
     """,
     "create index if not exists idx_runs_thread on runs(thread_id, created_at, run_id)",
@@ -799,5 +1084,18 @@ _SCHEMA_STATEMENTS = (
     """
     create index if not exists idx_control_operations_interrupt
     on control_operations(run_id, operation, status)
+    """,
+)
+
+_OWNERSHIP_MIGRATION_STATEMENTS = (
+    "alter table runs add column if not exists runnable boolean not null default false",
+    "alter table runs add column if not exists owner_worker_id text",
+    "alter table runs add column if not exists lease_until timestamptz",
+    "alter table runs add column if not exists fencing_token bigint not null default 0",
+    "alter table runs add column if not exists claimed_at timestamptz",
+    "alter table runs add column if not exists last_heartbeat_at timestamptz",
+    """
+    create index if not exists idx_runs_claimable
+    on runs(runnable, status, lease_until, created_at, run_id)
     """,
 )

@@ -13,6 +13,7 @@ from axiom.runtime.checkpoints import BudgetLedgerConflictError, RuntimeStore
 from axiom.runtime.models import BudgetLedgerRecord, Checkpoint
 from axiom.runtime.observability import root_span_id_for_run
 from axiom.runtime.observability_store import ObservabilityStore
+from axiom.runtime.ownership import RunOwnership
 
 BUDGET_LEDGER_SCHEMA_VERSION = 1
 
@@ -339,6 +340,7 @@ class BudgetManager:
         model: str,
         pricing_registry: ModelPricingRegistry | None = None,
         observability_store: ObservabilityStore | None = None,
+        ownership: RunOwnership | None = None,
     ) -> None:
         self.store = store
         self.policy = policy
@@ -347,6 +349,7 @@ class BudgetManager:
         self.pricing_registry = pricing_registry or ModelPricingRegistry()
         self.pricing = self.pricing_registry.resolve(provider, model)
         self.observability_store = observability_store
+        self.ownership = ownership
         self._lock = asyncio.Lock()
         self._elapsed_anchors: dict[str, tuple[float, float]] = {}
         if policy.max_cost_usd is not None and self.pricing is None:
@@ -726,7 +729,12 @@ class BudgetManager:
                     )
                 mutate(record.state)
                 try:
-                    await self.store.save_budget_ledger(record)
+                    if self.ownership is None:
+                        await self.store.save_budget_ledger(record)
+                    else:
+                        await self.store.save_budget_ledger(
+                            record, ownership=self.ownership
+                        )
                 except BudgetLedgerConflictError:
                     continue
                 return record
