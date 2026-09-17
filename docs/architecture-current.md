@@ -711,8 +711,18 @@ records may be promoted. Dataset persistence happens before the store is marked 
 retries idempotent without silently overwriting unrelated cases. Missing deterministic
 expected/scorer evidence is a structured promotion failure rather than an invented oracle.
 
-Evaluation result schema v3 retains every trial, preserves v1/v2 loading, and adds per-case `trial_success_rate`,
-success/failure counts, and average/minimum/maximum tokens, steps, and latency. `--trials 1` is the
+Evaluation result schema v4 retains every trial, preserves v1/v2/v3 loading, and adds a regenerable
+quality projection. `StepView` is anchored only to observed `agent.step` spans; it is a read model,
+not a durable Step record. Run-level Tool metrics use `ToolExecution` as authority: logical calls
+are stable invocation records, physical attempts are durable attempt counts, and UNKNOWN remains
+separate from FAILED. Tool success excludes UNKNOWN from its decided-outcome denominator.
+Completion Verified Rate includes only applicable trials; terminal NO_PROGRESS excludes the bounded
+recovery hint. Optional TTFT stays unavailable when Trace evidence is absent rather than becoming
+zero. Regression Gate can opt into explicit completion, Tool-success, and NO_PROGRESS limits without
+changing defaults. The fault matrix separately projects RECOVERED, EXPECTED_SAFE_STOP, and FAILED.
+
+The result also retains per-case `trial_success_rate`, success/failure counts, and
+average/minimum/maximum tokens, steps, and latency. `--trials 1` is the
 backward-compatible default. Each trial receives independent Run, Thread, Turn, Trace, Checkpoint,
 and ToolExecution state.
 

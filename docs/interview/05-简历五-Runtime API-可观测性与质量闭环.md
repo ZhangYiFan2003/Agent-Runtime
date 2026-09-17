@@ -4,7 +4,7 @@
 
 ## 0. 简历原句
 
-> 构建 Runtime API，支持 Run 创建/查询、interrupt / resume / cancel 与 SSE 事件重放；基于 Trace / Span 记录延迟、TTFT、Token 与 Tool 调用指标，并支持固定任务集回归评测。
+> 构建 Runtime API 与运行评测链路，支持任务暂停、恢复、取消及 SSE 事件重放，并通过 Trace / Span 记录模型与工具调用链路；针对同一任务进行重复试验，基于任务完成条件与失败样例，持续评估任务成功率与工具调用正确性，及时发现版本退化。
 
 ## 1. 这条经历解决了什么问题
 
@@ -20,13 +20,18 @@ Runtime API 把一次 Agent 执行暴露成可查询的 durable Run，支持创�
 
 ## 3. 2～3 分钟完整故事
 
-控制面首先要区分持久状态与活跃执行对象。Checkpoint 告诉系统 Run 处于什么业务状态；`ActiveRunSupervisor` 只维护本进程的 Task、事件循环和取消信号。cancel 到来时，Supervisor 用 `call_soon_threadsafe` 通知对应 Task，同时 Runtime 将取消意图和终态持久化。进程重启后内存 registry 消失，但 Checkpoint 仍在；这也是为什么它不能被宣传成多机所有权服务。
+控制面首先要区分持久状态与活跃执行对象。Checkpoint 告诉系统 Run 处于什么业务状态；`ActiveRunSupervisor` 只维护本进程的 Task、事件循环和取消信号。cancel 到来时，Supervisor 用 `call_soon_threadsafe` 通知对应 Task，同时 Runtime 将业务终态持久化。当前没有独立的 durable cancellation-intent/outbox。进程重启后内存 registry 消失，但 Checkpoint 仍在；这也是为什么它不能被宣传成多机所有权服务。
 
 Runtime API 还处理控制操作幂等和事件历史。ThreadEventRepository 为事件分配单调 ID，客户端断线后带 `after_id` 读取后续事件，并可按 Run 过滤。这比只推内存消息可靠，但当前实现主要是 stored replay，不是 Kafka 式跨实例实时总线。Thread/Turn/Event 与 Run/Checkpoint 分离，前者服务交互历史，后者服务执行恢复。
 
 调用链追踪（Tracing）把一次 Run 拆成可解释阶段。TTFT 是发起模型请求到收到首个文本/思考/Tool delta 的时间，和完整生成延迟不同；Tool Span 使用稳定 invocation 衔接恢复；RunMetrics 汇总 Token、步骤、工具、checkpoint、budget 和成本。当前 Trace 保存在 Memory/SQLite store，适合本地诊断，并未接入 OpenTelemetry 分布式链路。
 
 质量闭环不能只看 HTTP 500。Evaluation 使用真实 Durable Runtime，而不是直接 `llm.chat()`，每个 trial 都有独立 Run/Thread/Turn/Trace。确定性 scorer 检查完成状态、包含内容、工具使用和指标阈值。失败收集为带有限证据和指纹的 Badcase，状态从 PENDING 经人工 APPROVED 后才能 PROMOTED 到回归数据集；baseline/candidate 比较既看功能退化，也看 trial success、Token、延迟、步骤和 cost per success。
+
+Runtime 执行仍以 RunState 和 ToolExecution 为 durable truth；Evaluation 不额外持久化 Step，
+而是从 Run、Trace/Event 和 ToolExecution evidence 投影可重建的 StepView 与 Run quality。
+logical Tool call 是稳定 invocation，physical attempt 是实际依赖尝试；UNKNOWN 单独保留。
+这些维度再按 trial 聚合，进入显式阈值的 Regression Gate 与既有人审 Badcase 流程。
 
 最后必须讲完成证明的边界：模型说“完成”只代表终止提议。现在可选 Completion Contract 会在终止点检查 Run status、ToolExecution、输出、workspace artifact、Plan task 与 Child Run；通过才进入 COMPLETED。ReAct 第一次失败会收到一条结构化反馈并按普通 Budget 再走一步，第二次仍失败则以 `COMPLETION_NOT_VERIFIED` 结束。没有契约的开放任务保持兼容并标记 NOT_APPLICABLE，而不是伪造客观验证。
 
@@ -61,7 +66,7 @@ DurableAgentRuntime → Checkpoint / ToolExecution
 - `src/axiom/runtime/observability.py`：Trace、Span、RunMetrics 与稳定 ID。
 - `src/axiom/runtime/observability_store.py`：Memory/SQLite store、`RunTracer`、聚合服务。
 - `src/axiom/evaluation/runner.py`：`DurableEvaluationExecutor` 与 `EvaluationRunner`。
-- `src/axiom/evaluation/models.py`：dataset schema v1、result schema v3、trial aggregate 与 cost per success。
+- `src/axiom/evaluation/models.py`：dataset schema v1、result schema v4、trial/quality aggregate 与 cost per success。
 - `src/axiom/evaluation/scorers.py`、`badcases.py`、`comparison.py`、`attribution.py`：确定性评分、坏例审核、回归门禁和安全指纹。
 - `tests/test_runtime_api_hardening.py`、`test_active_run_supervisor.py`、`test_observability.py`、`test_evaluation.py`、`test_evaluation_feedback.py`：执行证据。
 
@@ -76,6 +81,27 @@ DurableAgentRuntime → Checkpoint / ToolExecution
 **trial_success_rate** 是重复试验的直接成功比例，不是形式化 Pass@k。**cost per success** 比单次平均成本更接近 Agent 价值：便宜但经常失败的候选未必更好。
 
 **Attribution fingerprint** 记录模型、Prompt、Tool schema、策略和数据集的稳定指纹，帮助归因版本差异；它提供关联证据，不自动证明因果。
+
+### 6.1 Evaluation metric implementation audit
+
+| 指标 | 当前判断 | 证据/限制 |
+| --- | --- | --- |
+| Task Success / trial success | **IMPLEMENTED** | required scorers 共同决定 `passed`，多 trial 聚合 `trial_success_rate` |
+| Completion Verified Rate | **IMPLEMENTED** | `VERIFIED / verification applicable`；`NOT_APPLICABLE` 不进分母 |
+| Required/Forbidden Tool Coverage | **IMPLEMENTED** | `ToolUsageScorer` 做集合约束，不要求唯一 golden path |
+| Tool Selection Accuracy | **PARTIAL / NEEDS GROUND TRUTH** | 当前能判 required/forbidden pass；没有统一 accuracy 分母、tool family 或 acceptable action set 指标 |
+| Tool Argument Accuracy | **FUTURE DESIGN** | `EvaluationRunResult` 不保存规范化参数，也没有参数 predicate scorer |
+| Invalid Tool Call Rate | **FUTURE** | 当前没有跨 Tool 一致的结构化 invalid-call 分类，不能从错误文本猜测 |
+| Agent Step Count | **IMPLEMENTED** | `agent.step`/budget usage 进入 result；不要和 Tool attempt 混用 |
+| Logical Tool Invocation Count | **IMPLEMENTED** | eval 从稳定 Tool Span 收集调用；一次 invocation 可包含多个 attempt |
+| Physical Tool Attempt Count | **IMPLEMENTED** | 对稳定 invocation 的 durable `ToolExecution.attempt` 求和；结果复用不增加 attempt |
+| Token / Cost / Total Latency | **IMPLEMENTED** | result 与 trial aggregate 均支持；cost unknown 时不伪造 0 |
+| TTFT | **IMPLEMENTED / OPTIONAL** | 从 LLM Span 投影；缺失为 unavailable，不伪造 0 |
+| Tool Success / Retry / Timeout Rate | **IMPLEMENTED** | success 对 SUCCEEDED+FAILED 已决调用；retry/timeout 对实际尝试的 logical invocations |
+| No-Progress Rate | **IMPLEMENTED** | 只统计 terminal `NO_PROGRESS` trial；一次 recovery hint 不算失败 |
+| Recovery Success | **IMPLEMENTED IN SEPARATE BENCHMARK** | 当前 21 个命名 scenarios × 2，区分 RECOVERED / EXPECTED_SAFE_STOP / FAILED |
+
+这张表是防夸大的底线：**有原始证据不等于已经有产品化指标；有 required Tool scorer 不等于已经实现 Tool Selection Accuracy。**
 
 ## 7. 设计理由、替代方案与取舍
 
@@ -95,9 +121,9 @@ SQLite Trace 和 JSON/Badcase store 适合本地。共享服务再引入 OpenTel
 - 模型升级后 HTTP 错误率正常但成功率下降：固定任务、多 trial、Badcase 和回归比较负责发现。
 - Badcase 含敏感 Tool 参数：只保存有界派生证据和引用，不复制完整 Trace/原始参数。
 
-## 9. 分级面试题库（22 题）
+## 9. 分级面试题库（26 题）
 
-### P0 — 简历直击题（10 题）
+### P0 — 简历直击题（14 题）
 
 #### P0-1｜“一个 Agent 为什么还要单独做 Runtime API？普通 HTTP 接口不够吗？”
 
@@ -163,13 +189,13 @@ SQLite Trace 和 JSON/Badcase store 适合本地。共享服务再引入 OpenTel
 
 **项目证据：** `RunStatus`、`RuntimeApiServer._children()`、`_run_view()`。
 
-#### P0-5｜“为什么选择 SSE？和 WebSocket 怎么选？”
+#### P0-5｜“为什么选择 SSE？和 WebSocket 怎么选？当前真的是实时长连接吗？”
 
 **面试官为什么问：** 简历明确写 SSE，面试官会自然追 HTTP 长连接和双向通信取舍。
 
-**先给结论：** Agent 输出主要是服务端向客户端单向增量事件，SSE 基于普通 HTTP、文本事件和自动重连语义，足够简单；需要高频双向实时消息或二进制帧时才更适合 WebSocket。
+**先给结论：** SSE 协议适合服务端到客户端的单向文本事件；但当前 Axiom 实现的重点是 `text/event-stream` 格式的**有限 stored replay 响应**，带 `Content-Length`，写完已有事件就关闭，并不是持续等待新事件的实时长连接。
 
-**60～120 秒完整口语答案：** SSE 用一个 HTTP 长连接持续发送带 `id/event/data` 的文本事件，代理和浏览器支持较自然。Axiom 的控制命令仍通过普通 HTTP 请求发送，输出/事件走 SSE，因此无需为低频控制建立全双工通道。WebSocket 在双向协作、终端输入或高频互动时更灵活，但连接状态、心跳、扩容和重连恢复要自己设计。协议选择不自动解决可靠性，真正断线续看仍依赖事件持久化和游标。
+**60～120 秒完整口语答案：** “设计上，Agent 事件主要是服务端单向输出，控制命令仍走普通 HTTP，所以 SSE 比 WebSocket 简单；真正的可靠性来自持久 Event ID 和 `after_id`，不是连接本身。源码边界要说清：当前 `_send_events()` 查询已有事件，编码成 SSE 帧，设置 `Content-Length` 后一次写完，因此它实现的是 replay transport，不是 live subscription。若继续生产化，我会去掉有限快照假象，引入共享事件源或 broker，在先补历史后切 live 时用水位游标避免窗口丢失。”
 
 **第一轮追问：** “SSE 能发二进制吗？”——通常传文本，二进制需编码或改用其他通道；Agent token/event 多为 JSON 文本。
 
@@ -254,6 +280,66 @@ SQLite Trace 和 JSON/Badcase store 适合本地。共享服务再引入 OpenTel
 **常见坑：** 只做 exact match；让评测绕过真实执行链。
 
 **项目证据：** `src/axiom/evaluation/runner.py`、`scorers.py`、`benchmarks/datasets/agent-core.json`。
+
+#### P0-11｜“Agent 最后答案对了，为什么还不够？”
+
+**面试官想看什么：** 是否理解 Outcome、Trajectory、Tool behavior、Efficiency、Reliability 的共同作用。
+
+**先说结论：** 最终答案正确只覆盖 outcome；Runtime 还要看过程是否用了允许的 Tool、参数是否正确、调用次数与成本是否合理，以及成功是否依赖偶然 retry 或外部波动。
+
+**60～120 秒完整口语答案：** “一个 Agent 可能最后答对，但先选错 Tool、参数报错后碰巧恢复、调用 20 次、Token 成本是 baseline 五倍，还经历 timeout。只看 final answer 会把这些回归都藏掉。我会分四组看：Outcome 看 scorer/verification；Tool behavior 看 logical invocation、physical attempt、成功和 retry；Efficiency 看 step、Token、cost、TTFT 和总延迟；Reliability 看 timeout、terminal no-progress 和独立恢复矩阵。Axiom 从现有 Trace 与 ToolExecution 投影 Step/Run 指标，不额外持久化 Step；选择/参数准确率没有可信 oracle 时仍标成 FUTURE。”
+
+**追问 1：完成验证通过，Eval 为什么仍可能失败？**
+
+- **为什么问：** 区分 online control 和 offline experiment。
+- **30～60 秒回答：** “Completion Verification 只判断这个 Run 是否满足配置的终止契约；Eval 还可能因输出 scorer、forbidden Tool、步骤/Token/延迟阈值失败。它也不会证明契约未编码的 universal correctness。”
+
+**当前边界：** final output、run status、completion verification、tool set、step/token/latency/cost 已进入当前链路；参数正确率和统一 reliability score 仍未实现。
+
+#### P0-12｜“Tool Selection Accuracy 怎么定义？一定有唯一正确 Tool 吗？”
+
+**面试官想看什么：** 多条有效轨迹、ground truth 设计、当前 scorer 边界。
+
+**先说结论：** 很多 Agent 任务没有唯一正确序列，不能拿一条 golden trace 做逐步 exact match。应按任务定义 acceptable tool set、required tool、forbidden tool、tool family 或 task predicate。
+
+**60～120 秒完整口语答案：** “如果题目是查代码，`search_code` 和先列目录再读文件都可能有效；强制唯一序列会惩罚合理策略。我会先确定评价粒度：单步场景可以有 expected Tool；多解任务用可接受集合或 family；关键依赖用 required Tool；危险操作用 forbidden Tool；最终还要用 task scorer 判断结果。Axiom 当前实现的是 required/forbidden `ToolUsageScorer`，它能做覆盖和禁用约束，但不能直接叫完整 Tool Selection Accuracy。”
+
+**追问 1：那序列完全不评吗？**
+
+- **为什么问：** 看过程质量如何约束。
+- **30～60 秒回答：** “不必 rigid exact trace，但可评不变量和效率，例如必须先 inspect 再 write、不得调用网络、最多 N 个 invocation。对强流程任务再加局部顺序 predicate，而不是默认所有任务只有一个正确轨迹。”
+
+**当前边界：** required/forbidden tool 集合已实现；acceptable family、顺序 predicate 和 accuracy aggregate 是未来扩展。
+
+#### P0-13｜“Tool 名字选对了，参数怎么评？Invalid Tool Call Rate 又怎么定义？”
+
+**面试官想看什么：** exact JSON 的局限、参数规范化、无效调用分类。
+
+**先说结论：** 参数可以按 exact、normalized、schema-valid、关键字段子集或 task predicate 评；原始 JSON 字符串相等通常太严格。Invalid call 最好拆成 unknown Tool、unparseable/schema-invalid、policy-denied，而不是混成一个无法诊断的数。
+
+**60～120 秒完整口语答案：** “路径可以先 resolve/统一分隔符，枚举与缺省值可以规范化；有些任务只关心 `path` 和 `query`，其他可选字段不应导致失败；写操作还要用 task-specific predicate 验证目标资源。Invalid call 也要分类：Tool 名不存在是 selection/registry 问题，JSON 解析或 schema 不通过是 argument 问题，policy denied 是安全决策，不一定是模型格式错。当前 ToolExecutor 有这些错误证据，但 Eval result 没保存规范化参数，也没有 ArgumentAccuracy scorer，所以这是明确 future work。”
+
+**追问 1：为什么不直接 JSON exact match？**
+
+- **为什么问：** 看 ground truth 是否过拟合表示形式。
+- **30～60 秒回答：** “key 顺序、默认值、等价路径或多个合法参数组合都会误判。应该比较 canonical form 或对业务关键字段做 predicate，同时把 schema validity 作为独立层。”
+
+**当前边界：** schema validation、ToolNotFound/policy-denied 元数据已存在；参数准确率与 invalid-call suite rate 未实现。
+
+#### P0-14｜“Recovery Success 怎么定义？当前真的测了吗？”
+
+**面试官想看什么：** 分母、恢复不变量、40/42 数字的精确含义。
+
+**先说结论：** 可定义为 eligible fault-injected scenario 在 restart/resume 后到达预期终态，并保持无重复 Tool/Child、结果不丢等声明不变量。当前单独 benchmark 有 21 个命名场景、每个两次，不是 Eval suite 的通用 Recovery Success 指标。
+
+**60～120 秒完整口语答案：** “分母必须是预先定义、确实可恢复或应安全停顿的 injected scenarios；分子不是简单 COMPLETED，而是满足该场景的预期分类和 assertions。当前矩阵 21 类，默认两次共 42 executions：40 次 recovered，2 次 expected-safe，因为不安全外部副作用歧义时停下来才是正确结果。baseline 报告 recovery rate 1.0 是按 scenario pass 分类，不等于 42 次都自动完成，更不是 40 个独立测试。”
+
+**追问 1：生产故障能直接用这个百分比代表吗？**
+
+- **为什么问：** 防止小型 deterministic matrix 被外推。
+- **30～60 秒回答：** “不能。它证明维护的确定性边界，不含真实进程 kill、磁盘故障、网络分区或多机 lease。生产需要更广故障注入和线上恢复 SLI，当前数字只对冻结矩阵负责。”
+
+**当前边界：** deterministic recovery benchmark 已实现；通用 failure-injection platform 和线上 Recovery SLI 未实现。
 
 ### P1 — 回答后的自然深挖（8 题）
 
@@ -363,7 +449,7 @@ SQLite Trace 和 JSON/Badcase store 适合本地。共享服务再引入 OpenTel
 
 **如果继续扩展怎么做：** canary、随机分流、控制变量 A/B 和版本化报告。
 
-## 10. 重点追问树（7 条）
+## 10. 重点追问树（9 条）
 
 ### 追问树 1：Runtime API
 
@@ -519,6 +605,38 @@ Trace / Span / Metric / Log 有何区别？
   - **回答思路：** verifier ERROR 不变 success；ReAct 一次普通预算内纠正；Runtime 决定单 Run 终止，Eval 比较版本分布。
   - **30～60 秒口述：** “Verifier 异常或检查失败不能静默变成功；ReAct 可获得一次结构化反馈，仍受 Budget/Progress/deadline，之后失败为 `COMPLETION_NOT_VERIFIED`。Runtime verification 决定这个 Run 能否结束；offline Eval 在新 trial 上比较版本、成功率、成本和 Badcase，两者不能互相替代。”
 
+### 追问树 8：Agent Eval scorecard
+
+```text
+最终答案正确为什么还不够？
+└─ Tool Selection 与 Argument 分别怎么评？
+   └─ step、invocation、attempt 为什么不能混？
+      └─ 哪些指标 implemented / derivable / future？
+```
+
+- **“step、invocation、attempt 怎么分？”**
+  - **为什么问：** retry 会让计数口径失真。
+  - **30～60 秒回答：** “Agent step 是状态机推进一次；logical invocation 是模型提出的一次稳定 Tool Call；physical attempt 是依赖实际执行一次。一个 invocation 可能重试三次。当前 eval 的 `tool_calls` 来自稳定 Tool Span，更接近 invocation；物理 attempt 要从 ToolExecution/budget 派生，不能把三者都叫 Tool call。”
+- **“现在真的有 Tool correctness 吗？”**
+  - **为什么问：** 检查简历措辞是否过强。
+  - **30～60 秒回答：** “现在有 required/forbidden Tool usage scorer 和 Tool success/runtime evidence，能评一部分正确性；没有通用 selection accuracy、argument accuracy 或 invalid-call rate。因此简历说‘基于任务完成条件与失败样例评估工具调用正确性’可以解释为任务级 scorer，但如果理解成完整指标体系就过强。”
+
+### 追问树 9：数据治理与回归门禁
+
+```text
+为什么同一任务要 repeated trials？
+└─ trial_success_rate 和 Pass@k 一样吗？
+   └─ dev / holdout / regression set 怎么分？
+      └─ success 提高但成本、延迟翻倍怎么办？
+```
+
+- **“数据集怎么分？”**
+  - **为什么问：** 检查反复看评测结果造成的 leakage。
+  - **30～60 秒回答：** “development set 用于调 Prompt/策略；holdout 冻结后只做少量决策，反复看并调参就不再是 held-out；regression set 收录经过人审、必须永久守住的历史坏例。三者不能混成一份越调越高的榜单。”
+- **“成功率升、成本翻倍？”**
+  - **为什么问：** 看 gate 是否只优化单目标。
+  - **30～60 秒回答：** “不能只看 90% 到 92%。同时比较 avg tokens、latency、steps 和 cost per success；功能 hard regression 应阻断，性能阈值可按业务设 hard gate 或 warning。当前 comparison/gate 已支持 success、token、latency、step 和 cost-per-success 阈值。”
+
 ## 11. 面试官攻击面与防守口径
 
 1. **“API 只是 CLI 套 HTTP？”** 用跨请求 Run、控制、恢复和重放说明。
@@ -534,11 +652,11 @@ Trace / Span / Metric / Log 有何区别？
 
 ### 【当前已实现】
 
-Runtime API、Run/Child 查询和 lineage、interrupt/resume/cancel、控制操作幂等、本地 ActiveRunSupervisor、SSE stored replay、Trace/Span/RunMetrics、TTFT/Token/Tool/成本指标、Completion Contract/Verifier、固定数据集、多 trial、Badcase 人审晋升、baseline/candidate comparison、result schema v3 和 cost per success。
+Runtime API、Run/Child 查询和 lineage、interrupt/resume/cancel、控制操作幂等、本地 ActiveRunSupervisor、SSE 格式的有限 stored replay、Trace/Span/RunMetrics、从现有证据生成的 StepView/Run quality、TTFT/Token/Tool/成本证据、Completion Contract/Verifier、固定数据集、多 trial、Badcase 人审晋升、baseline/candidate comparison、result schema v4 和 cost per success。
 
 ### 【当前部分支持】
 
-Supervisor 仅拥有本进程 Task；SSE 主要重放持久事件；Trace/指标存在但不是集中生产平台；CompletionVerifier 只覆盖显式确定性契约，不等于通用业务完成验证；attribution 是相关证据。
+Supervisor 仅拥有本进程 Task；当前 SSE 响应查询已有事件后一次写完并关闭，不是 live subscription；Trace/指标存在但不是集中生产平台；Tool correctness 当前主要是 required/forbidden usage 与可派生运行证据，没有通用 argument accuracy；CompletionVerifier 只覆盖显式确定性契约，不等于通用业务完成验证；attribution 是相关证据。
 
 ### 【未来可扩展】
 
@@ -561,50 +679,3 @@ Supervisor 仅拥有本进程 Task；SSE 主要重放持久事件；Trace/指标
 ### 3 个陷阱
 
 不把内存 Supervisor 当分布式；不把 SSE replay 当 Kafka；不把模型 final 当验证结果。
-
-## 14. Agentic RL Bridge v1
-
-### Q1：你的 Agentic RL 实验效果怎么样？
-
-**第一版没有提升成功率。** Qwen3-0.6B 基线和 TRL GRPO + LoRA 训练后的模型在冻结
-held-out 上都是 0/30。工程训练闭环成功，但模型能力增益没有达成。训练确实执行了 168 个
-rollout 和 42 个 optimizer step，参数指纹发生变化，loss/gradient 有限，保存的 adapter 也能
-重新加载；这些证据不能替代任务成功率。
-
-### Q2：0/30 → 0/30，为什么还说实验有效？
-
-这里要区分 **training effectiveness != capability improvement**。前者回答梯度、optimizer、
-checkpoint 和 Axiom 环境到外部 Trainer 的链路是否真实工作；后者必须看冻结 held-out 的任务
-成功。第一项已经用 optimizer step、有限梯度、参数 fingerprint 变化和 checkpoint reload
-证明，第二项明确失败。因此它是有效的负实验，而不是有效的能力提升。
-
-### Q3：为什么 reward 变高了，成功率还是 0？
-
-shaped reward 含小额工具正确性和效率项。模型学会“一次有结果的 search 后停止”，平均输出
-Token 从 52.30 降到 28.90、步骤从 1.50 降到 1.13，但从未完成 read、综合证据和 submit。
-它优化的是更短的失败，即 **reward shaping shortcut**。这说明 proxy reward 不能替代任务
-成功率；outcome-only reward 仍是 -1.0。
-
-### Q4：为什么 GRPO 没学到正确行为？
-
-不能归因于单一因素。0.6B base policy 可能低于多步仓库导航的能力阈值；基线和全部 168 个
-训练 rollout 都没有成功轨迹；终止验证奖励稀疏；组内没有演示完整
-`search -> inspect -> read -> synthesize -> submit` 行为，credit assignment 很弱；小数据和短
-训练进一步限制探索；效率 shaping 又提供了提前停止的代理目标。这不等于声称“GRPO 在零
-成功样本上数学上不可能学习”。
-
-### Q5：下一版你会怎么改？
-
-优先级是：先获得非零 base competence；必要时用成功轨迹做 SFT warm-up 或用 curriculum
-进入可解区域；严格隔离 repository/feature snapshot；先跑 outcome-only reward 基线；有确定
-证据后才加入 process/efficiency reward；最后才做 RL。不是简单增加 epoch。
-
-### Q6：为什么不继续调参把结果调到正数？
-
-因为在这样的小实验上反复调整 learning rate、reward 或 group size，直到 held-out 变好，会
-变成 hyperparameter fishing。第一版已经回答了工程链路问题，并暴露了更根本的策略能力、
-探索和奖励代理问题。保留负结果比把 held-out 当调参集更可信。
-
-**项目定位：** Axiom 仍是 Agent Runtime。它负责 Run、ToolExecution、trajectory、确定性
-verification 和 reward；Agent Lightning 1.0.1 仅完成 `EventCreate` 兼容烟测，实际训练使用
-TRL GRPO。Agentic RL v1 已冻结，v2 只作为未来工作。
