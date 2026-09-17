@@ -237,8 +237,9 @@ flowchart TD
     Memory/SQLite implementations. SQLite appends Run-state checkpoint sequences and uses
     optimistic sequence checks to reject stale workers.
 - `src/axiom/runtime/steps.py`
-  - Defines the in-memory `StepContext`, `StepResult`, and small `NextAction` vocabulary.
-    These types are execution contracts only and have no repository or serialized form.
+  - Defines the in-memory `StepContext`, `StepResult`, the small `NextAction` vocabulary, and the
+    deterministic `CompletionPolicy` that combines structured Runtime evidence into a final
+    continuation. These types are execution contracts only and have no repository or serialized form.
 - `src/axiom/runtime/events.py`
   - Defines the thread/event repository contract, event envelope, and backward-compatible
     SQLite event implementation with monotonic replay IDs.
@@ -649,9 +650,13 @@ strategy first proposes termination; when the Run has a `CompletionContract`, th
 strategy/model proposes completion
         ↓
 CompletionVerifier
-        ├── no contract → backward-compatible COMPLETED
-        ├── VERIFIED / NOT_APPLICABLE → COMPLETED
-        └── NOT_VERIFIED / ERROR → correction or FAILED
+        ↓ evidence
+CompletionPolicy
+        ├── no contract / VERIFIED / NOT_APPLICABLE → COMPLETE
+        ├── first allowed NOT_VERIFIED → CONTINUE with corrective feedback
+        └── repeated NOT_VERIFIED / ERROR → FAIL
+        ↓
+Runtime applies the RunState transition through normal CAS/fencing
 ```
 
 The v1 check set is deliberately small: candidate Run status, required/forbidden Tool use,
@@ -670,6 +675,14 @@ restart without changing the checkpoint schema version. Verification spans/event
 attempt count, check count, and failed check IDs; they do not log Tool arguments. `RunMetrics` and
 Evaluation results expose `completion_verified`, `verification_status`, attempts, and failed check
 IDs. Open-ended Runs without deterministic criteria remain `NOT_APPLICABLE`, not falsely verified.
+
+`CompletionPolicy` is a pure Runtime decision layer, not another verifier or state machine. It
+consumes only the proposed generic action, Run control status, progress decision, verification
+status/attempt allowance, and hard-budget/fatal-error signals. Durable `CANCELLED` or `INTERRUPTED`
+control outranks policy and yields no ordinary action; hard limits and terminal no-progress yield
+`FAIL`; verified or not-applicable completion yields `COMPLETE`; strategy waiting remains `WAIT`.
+Specific failure truth such as `NO_PROGRESS`, `COMPLETION_NOT_VERIFIED`, or a budget error stays in
+RunState error metadata. The decision itself is ephemeral and adds no table or schema migration.
 
 ## 10. Evaluation feedback and regression gate
 
@@ -995,8 +1008,10 @@ One Step begins from an authoritative `RunState`. `StepContext` carries Run corr
 control state, strategy, and inherited Run ownership context; the strategy/runtime performs one
 existing iteration and returns `StepResult` with a small continuation decision plus lightweight
 Tool invocation IDs. The Runtime still owns control checks, budgets, ownership validation, and
-RunState CAS. `NextAction` is limited to `CONTINUE`, `COMPLETE`, `WAIT`, and `FAIL`; cancellation and
-interrupt remain authoritative Run control states. A Step is not necessarily one model call, Tool
+RunState CAS. The deterministic `CompletionPolicy` resolves structured verifier, progress, budget,
+and strategy evidence into `NextAction`, which remains limited to `CONTINUE`, `COMPLETE`, `WAIT`,
+and `FAIL`; cancellation and interrupt remain authoritative Run control states. A Step is not
+necessarily one model call, Tool
 call, Event, Checkpoint, Turn, plan node, or Child Run.
 
 `turn_id` remains correlation and HTTP interaction compatibility metadata. There is no Turn model,

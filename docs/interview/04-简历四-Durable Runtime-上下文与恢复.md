@@ -26,6 +26,8 @@ Agent 任务比普通 HTTP 请求更长，也更有状态。一次任务可能�
 
 Step Contract 只统一一次迭代的内存输入输出：`StepContext` 引用当前 RunState、控制状态与 Run-level ownership，`StepResult` 返回 `CONTINUE/COMPLETE/WAIT/FAIL` 和轻量 Tool invocation ID。它没有表、Repository、lease 或 fencing；崩溃后丢失 StepResult 是安全的，因为恢复事实仍在 RunState 与 ToolExecution。
 
+完成决策也分层：ProgressDetector 只产出是否继续、恢复或终止的进展证据；CompletionVerifier 只按 CompletionContract 产出 VERIFIED / NOT_VERIFIED / NOT_APPLICABLE / ERROR；纯 `CompletionPolicy` 再结合这些证据、硬 RunBudget/fatal outcome 和 strategy 的通用提议生成统一 NextAction。Runtime 才负责把动作应用到 RunState，并继续走 CAS/fencing。Cancel/Interrupt 是更高优先级的 durable control，不进入 NextAction；REPLAN 和各类 retry 仍属于各自策略/依赖层。
+
 每个 Checkpoint 有版本号。保存时使用 compare-and-swap（CAS，比较并交换）：只有数据库中的版本等于调用方预期版本，才允许写入新版本。SQLite 用 `BEGIN IMMEDIATE` 比较最新 sequence 后追加版本；PostgreSQL 用单条 `UPDATE runs ... WHERE current_sequence = expected RETURNING` 原子推进 head，并在同一短事务追加 Checkpoint 历史。两种实现都能拒绝 stale write，但 CAS 本身不等于持续执行所有权；多 Worker 仍需 lease 和 fencing token。
 
 Tool 恢复是最需要诚实的地方。稳定 invocation ID 由 Run 与 Tool call 身份派生，并保存参数哈希。若记录已是 `SUCCEEDED`，恢复时可以复用结果；若进程在 Tool 外部副作用成功后、写成功记录前崩溃，数据库里可能仍是 `RUNNING`，此时结果未知。已分类的 unsafe timeout 会持久化为 `UNKNOWN + RETRY_SUPPRESSED`，重启不会重新执行；读操作或带下游幂等契约的 Tool 才适合按剩余 attempt 和 UTC backoff deadline 自动重试。这里说“Tool 结果成功持久化”，不要把它叫成 Kafka/Redis Streams 的消息 ACK。
@@ -492,6 +494,8 @@ retry 不能绕开 Budget；恢复时复用已成功 ToolExecution 则不重复�
 **最安全的结论：** verifier 不能绕过已有控制。ReAct 只在契约允许时获得一次有界结构化纠正，下一轮仍照常消费 step、model call、Token、cost 和 wall time；任何外层预算、deadline、cancel 或 no-progress 先到都保持权威。
 
 **回答主线：** 区分 termination proposal、Completion Contract 与最终 Run 状态。通过是 VERIFIED；失败是 NOT_VERIFIED，允许的一次修正会回到普通 loop；再次失败为 `COMPLETION_NOT_VERIFIED`。没有契约的开放任务兼容完成但 verification 为 NOT_APPLICABLE。Plan/Multi-Agent 当前在终止点只验证一次。
+
+源码中的最终通用动作由 `CompletionPolicy` 决定，但它不检查 artifact、Tool 或输出正文，也不计算 Budget/Progress；Verifier、BudgetManager、ProgressDetector 分别提供结构化证据。若同时出现 Cancel 与 VERIFIED，durable Cancel 优先；策略的终态写入仍须通过 ownership-aware CAS/fencing。
 
 **不要说什么：** “verifier 会无限要求模型修正”“为了完成验证可以额外免费调用模型”“没有 contract 也能证明开放任务正确”。
 
