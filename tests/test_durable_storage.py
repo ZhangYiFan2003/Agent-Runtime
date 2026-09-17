@@ -128,6 +128,19 @@ def test_backend_identity_is_reported(durable_storage):
     assert durable_storage.controls.backend == durable_storage.backend
 
 
+def test_step_contract_adds_no_durable_steps_table(durable_storage):
+    if durable_storage.backend == "sqlite":
+        with durable_storage.runtime._connect() as conn:
+            row = conn.execute(
+                "select name from sqlite_master where type = 'table' and name = 'steps'"
+            ).fetchone()
+    else:
+        with durable_storage.runtime.pool.connection() as conn:
+            row = conn.execute("select to_regclass('steps')").fetchone()
+            row = None if row is None or row[0] is None else row
+    assert row is None
+
+
 def test_checkpoint_create_load_and_list_contract(durable_storage):
     state = Checkpoint.create(thread_id="thread-create", run_id="run-create", input="work")
     asyncio.run(durable_storage.runtime.save(state))

@@ -129,6 +129,7 @@ from axiom.runtime.progress import (
     error_fingerprint,
     state_fingerprint,
 )
+from axiom.runtime.steps import NextAction, StepContext, StepResult
 from axiom.runtime.storage import DurableStorage, create_durable_storage
 from axiom.runtime.strategies import ReactExecutionStrategy, RuntimeExecutionStrategy
 from axiom.runtime.supervisor import (
@@ -207,6 +208,9 @@ __all__ = [
     "RuntimeRequestContext",
     "RuntimeTurnContext",
     "RuntimeExecutionStrategy",
+    "NextAction",
+    "StepContext",
+    "StepResult",
     "RuntimeContextSummary",
     "MultiAgentExecutionStrategy",
     "LocalChildRunScheduler",

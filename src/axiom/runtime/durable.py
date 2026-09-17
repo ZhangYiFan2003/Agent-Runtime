@@ -89,6 +89,7 @@ from axiom.runtime.progress import (
     evidence_fingerprint,
     recovery_message,
 )
+from axiom.runtime.steps import StepContext, StepResult
 from axiom.runtime.strategies import RuntimeExecutionStrategy, execution_strategy_from_name
 from axiom.runtime.supervisor import ActiveRunSupervisor, ExecutionHandle
 from axiom.tools.base import Tool, ToolContext, ToolResult
@@ -511,22 +512,46 @@ class DurableAgentRuntime:
             state = await self._refresh(state)
             if state.status != RunStatus.RUNNING:
                 return state
+            result = await self._execute_react_step(self._step_context(state))
+            state = result.run_state
+        return state
 
-            if state.pending_tool_calls and state.next_tool_index < len(state.pending_tool_calls):
-                state = await self._execute_pending_tool(state)
-                continue
+    def _step_context(self, state: Checkpoint) -> StepContext:
+        return StepContext(
+            run_id=state.run_id,
+            step_index=state.step_index,
+            strategy=state.execution_strategy,
+            run_state=state,
+            control_state=state.status,
+            ownership_context=self.ownership,
+        )
 
-            if state.agent_turn >= self.max_turns:
-                return await self._fail(
-                    state,
-                    RuntimeError(f"agent exceeded max_turns={self.max_turns}"),
-                    step="llm",
-                )
-
+    async def _execute_react_step(self, context: StepContext) -> StepResult:
+        """Execute one existing ReAct iteration without creating durable Step state."""
+        state = context.run_state
+        invocation_ids: tuple[str, ...] = ()
+        if state.pending_tool_calls and state.next_tool_index < len(state.pending_tool_calls):
+            call = state.pending_tool_calls[state.next_tool_index]
+            tool_call_id = str(
+                call.get("id") or f"call_{state.agent_turn}_{state.next_tool_index}"
+            )
+            invocation_ids = (f"{state.run_id}:{tool_call_id}",)
+            state = await self._execute_pending_tool(state)
+        elif state.agent_turn >= self.max_turns:
+            state = await self._fail(
+                state,
+                RuntimeError(f"agent exceeded max_turns={self.max_turns}"),
+                step="llm",
+            )
+        else:
             state.pending_tool_calls = []
             state.next_tool_index = 0
             state = await self._execute_llm_step(state)
-        return state
+        return StepResult.from_run_state(
+            step_index=context.step_index,
+            run_state=state,
+            tool_invocation_ids=invocation_ids,
+        )
 
     async def _execute_llm_step(
         self,
