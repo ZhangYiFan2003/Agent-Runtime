@@ -98,6 +98,7 @@ from axiom.tools.registry import ToolRegistry
 from axiom.types import Message
 
 EventSink = Callable[[str, dict[str, Any]], Awaitable[None] | None]
+StepExecutor = Callable[[StepContext], Awaitable[StepResult]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,13 +511,43 @@ class DurableAgentRuntime:
         return await self.execution_strategy.advance(self, state)
 
     async def _advance_react(self, state: Checkpoint) -> Checkpoint:
+        return await self._run_step_loop(state, self._execute_react_step)
+
+    async def _run_step_loop(
+        self,
+        state: Checkpoint,
+        execute_step: StepExecutor,
+    ) -> Checkpoint:
+        """Run common governance around ephemeral strategy iterations."""
         while state.status == RunStatus.RUNNING:
-            state = await self._refresh(state)
-            if state.status != RunStatus.RUNNING:
+            state, context = await self._preflight_step(state)
+            if context is None:
                 return state
-            result = await self._execute_react_step(self._step_context(state))
+            result = await execute_step(context)
+            if result.step_index != context.step_index:
+                raise RuntimeError("StepResult does not match its StepContext index")
+            if result.run_state.run_id != context.run_id:
+                raise RuntimeError("StepResult does not match its StepContext run")
             state = result.run_state
+            if result.next_action != NextAction.CONTINUE:
+                return state
         return state
+
+    async def _preflight_step(
+        self,
+        state: Checkpoint,
+    ) -> tuple[Checkpoint, StepContext | None]:
+        reconciled = await self.reconcile_run_control_state(state.run_id)
+        if reconciled.status != RunStatus.RUNNING:
+            return reconciled, None
+        state = await self._refresh(reconciled)
+        if state.status != RunStatus.RUNNING:
+            return state, None
+        try:
+            await self.budget_manager.ensure_wall_time(state)
+        except BudgetExceededError as exc:
+            return await self._fail(state, exc, step="step_preflight"), None
+        return state, self._step_context(state)
 
     def _step_context(self, state: Checkpoint) -> StepContext:
         return StepContext(

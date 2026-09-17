@@ -8,7 +8,8 @@ from uuid import uuid4
 
 import pytest
 
-from axiom.config import StorageConfig, load_config
+from axiom.config import AxiomConfig, StorageConfig, load_config
+from axiom.runtime.durable import DurableAgentRuntime
 from axiom.runtime.models import (
     BudgetLedgerRecord,
     Checkpoint,
@@ -23,6 +24,18 @@ from axiom.runtime.ownership import (
     OwnershipLostError,
 )
 from axiom.runtime.storage import DurableStorage, create_durable_storage
+from axiom.tools import ToolRegistry
+
+
+class _TakeoverLlm:
+    provider_name = "ownership-test"
+    model_name = "takeover"
+    max_context_window = 10_000
+
+    async def chat(self, _messages, _tools, *, system_prompt):
+        del system_prompt
+        yield {"type": "text_delta", "text": "resumed-through-step-loop"}
+        yield {"type": "message_end", "stop_reason": "end_turn"}
 
 
 @pytest.fixture
@@ -199,6 +212,42 @@ def test_takeover_resumes_latest_durable_checkpoint(postgres_storage):
     assert result is not None
     assert result.status == RunStatus.COMPLETED
     assert result.sequence == 3
+
+
+@pytest.mark.postgres
+def test_takeover_continues_through_unified_step_lifecycle(postgres_storage, tmp_path):
+    async def scenario():
+        state = await _runnable(postgres_storage, "run-step-takeover")
+        first = await postgres_storage.runtime.claim_run(state.run_id, "worker-a", 30)
+        assert first is not None
+        state.output_text = "durable-before-crash:"
+        await postgres_storage.runtime.save(state, ownership=first)
+        _expire(postgres_storage, state.run_id)
+        second = await postgres_storage.runtime.claim_run(state.run_id, "worker-b", 30)
+        assert second is not None and second.fencing_token == first.fencing_token + 1
+
+        config = AxiomConfig()
+        config.policy.audit_log_path = str(tmp_path / "audit.jsonl")
+        runtime = DurableAgentRuntime(
+            llm_client=_TakeoverLlm(),
+            tool_registry=ToolRegistry(),
+            system_prompt="test",
+            cwd=str(tmp_path),
+            config=config,
+            store=postgres_storage.runtime,
+            ownership=second,
+        )
+
+        result = await runtime.resume(state.run_id)
+
+        assert result.status == RunStatus.COMPLETED
+        assert result.output_text == "durable-before-crash:resumed-through-step-loop"
+        stale = deepcopy(result)
+        stale.status = RunStatus.FAILED
+        with pytest.raises(OwnershipLostError):
+            await postgres_storage.runtime.save(stale, ownership=first)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.postgres

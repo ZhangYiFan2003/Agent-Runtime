@@ -23,6 +23,7 @@ from axiom.runtime.progress import (
     stable_fingerprint,
     state_fingerprint,
 )
+from axiom.runtime.steps import StepContext, StepResult
 from axiom.types import Message
 
 if TYPE_CHECKING:
@@ -148,111 +149,118 @@ class PlanExecuteStrategy:
         return cls(planner=Planner(llm_client))
 
     async def advance(self, runtime: DurableAgentRuntime, state: Checkpoint) -> Checkpoint:
-        while state.status == RunStatus.RUNNING:
-            state = await runtime._refresh(state)
-            if state.status != RunStatus.RUNNING:
-                return state
+        return await runtime._run_step_loop(
+            state,
+            partial(self._advance_step, runtime),
+        )
 
-            raw_plan = state.strategy_state.get(_PLAN_KEY)
+    async def _advance_step(
+        self,
+        runtime: DurableAgentRuntime,
+        context: StepContext,
+    ) -> StepResult:
+        state = context.run_state
+        raw_plan = state.strategy_state.get(_PLAN_KEY)
+        plan = self._load_plan(state)
+        if plan is None:
+            state = await self._create_plan(runtime, state)
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
+
+        if _legacy_plan_state(state, raw_plan):
+            self._clear_legacy_parent_task_state(state)
+            self._store_plan(state, plan)
+            await runtime._save_checkpoint(state, operation="plan.schema.migrated")
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
+
+        state = await self._reconcile_children(runtime, state)
+        plan = self._load_plan(state)
+        if plan is None:
+            raise RuntimeError("plan state disappeared during child reconciliation")
+        if plan.is_all_completed():
+            state = await self._complete_plan(runtime, state, plan)
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
+
+        child_states = await self._child_states(runtime, plan)
+        scheduler = self._scheduler(runtime)
+        if plan.has_failed():
+            state = await self._release_unstarted_tasks(runtime, state, plan, child_states)
             plan = self._load_plan(state)
             if plan is None:
-                state = await self._create_plan(runtime, state)
-                if state.status != RunStatus.RUNNING:
-                    return state
-                continue
-
-            if _legacy_plan_state(state, raw_plan):
-                self._clear_legacy_parent_task_state(state)
-                self._store_plan(state, plan)
-                await runtime._save_checkpoint(state, operation="plan.schema.migrated")
-                continue
-
-            state = await self._reconcile_children(runtime, state)
+                raise RuntimeError("plan state disappeared during replan barrier")
+            state = await self._skip_failed_dependents(runtime, state, plan)
             plan = self._load_plan(state)
             if plan is None:
-                raise RuntimeError("plan state disappeared during child reconciliation")
-            if plan.is_all_completed():
-                return await self._complete_plan(runtime, state, plan)
-
+                raise RuntimeError("plan state disappeared while skipping dependents")
             child_states = await self._child_states(runtime, plan)
-            scheduler = self._scheduler(runtime)
-            if plan.has_failed():
-                state = await self._release_unstarted_tasks(runtime, state, plan, child_states)
-                plan = self._load_plan(state)
-                if plan is None:
-                    raise RuntimeError("plan state disappeared during replan barrier")
-                state = await self._skip_failed_dependents(runtime, state, plan)
-                plan = self._load_plan(state)
-                if plan is None:
-                    raise RuntimeError("plan state disappeared while skipping dependents")
-                child_states = await self._child_states(runtime, plan)
-                snapshot = scheduler.snapshot(plan, child_states)
-                if snapshot.active_task_ids or snapshot.waiting_task_ids:
-                    return await self._wait_for_children(runtime, state, plan, snapshot)
-                if plan.replan_count < self.max_replans:
-                    state = await self._replan(runtime, state, plan)
-                    continue
-                return await self._fail_plan(
+            snapshot = scheduler.snapshot(plan, child_states)
+            if snapshot.active_task_ids or snapshot.waiting_task_ids:
+                state = await self._wait_for_children(runtime, state, plan, snapshot)
+            elif plan.replan_count < self.max_replans:
+                state = await self._replan(runtime, state, plan)
+            else:
+                state = await self._fail_plan(
                     runtime,
                     state,
                     plan,
                     "plan failed after exhausting replan attempts",
                 )
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
 
-            snapshot = scheduler.snapshot(plan, child_states)
-            if snapshot.ready_task_ids:
-                state = await self._persist_ready_tasks(
-                    runtime,
-                    state,
-                    plan,
-                    snapshot.ready_task_ids,
-                )
-                plan = self._load_plan(state)
-                if plan is None:
-                    raise RuntimeError("plan state disappeared after task scheduling")
-                child_states = await self._child_states(runtime, plan)
+        snapshot = scheduler.snapshot(plan, child_states)
+        if snapshot.ready_task_ids:
+            state = await self._persist_ready_tasks(
+                runtime,
+                state,
+                plan,
+                snapshot.ready_task_ids,
+            )
+            plan = self._load_plan(state)
+            if plan is None:
+                raise RuntimeError("plan state disappeared after task scheduling")
+            child_states = await self._child_states(runtime, plan)
 
-            launchable = [
-                task
-                for task in _tasks_in_plan_order(plan)
-                if task.status == TaskStatus.RUNNING
-                and task.child_run_id
-                and (
-                    child_states.get(task.id) is None
-                    or child_states[task.id].status == RunStatus.RUNNING
-                )
-            ]
-            if launchable:
-                try:
-                    await runtime.budget_manager.preflight_child(state)
-                except BudgetExceededError as exc:
-                    return await runtime._fail(state, exc, step="child")
+        launchable = [
+            task
+            for task in _tasks_in_plan_order(plan)
+            if task.status == TaskStatus.RUNNING
+            and task.child_run_id
+            and (
+                child_states.get(task.id) is None
+                or child_states[task.id].status == RunStatus.RUNNING
+            )
+        ]
+        if launchable:
+            try:
+                await runtime.budget_manager.preflight_child(state)
+            except BudgetExceededError as exc:
+                state = await runtime._fail(state, exc, step="child")
+            else:
                 await scheduler.execute(
                     launchable,
                     partial(self._start_child, runtime, state, plan),
                     partial(self._observe_scheduled_child, runtime, state.run_id),
                 )
                 state = await runtime._require(state.run_id)
-                if state.status != RunStatus.RUNNING:
-                    return state
-                state = await self._reconcile_children(runtime, state)
-                continue
+                if state.status == RunStatus.RUNNING:
+                    state = await self._reconcile_children(runtime, state)
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
 
-            child_states = await self._child_states(runtime, plan)
-            snapshot = scheduler.snapshot(plan, child_states)
-            if snapshot.active_task_ids or snapshot.waiting_task_ids:
-                return await self._wait_for_children(runtime, state, plan, snapshot)
-            if plan.is_all_completed():
-                return await self._complete_plan(runtime, state, plan)
-            if plan.has_failed():
-                continue
-            return await self._fail_plan(
+        child_states = await self._child_states(runtime, plan)
+        snapshot = scheduler.snapshot(plan, child_states)
+        if snapshot.active_task_ids or snapshot.waiting_task_ids:
+            state = await self._wait_for_children(runtime, state, plan, snapshot)
+        elif plan.is_all_completed():
+            state = await self._complete_plan(runtime, state, plan)
+        elif plan.has_failed():
+            pass
+        else:
+            state = await self._fail_plan(
                 runtime,
                 state,
                 plan,
                 "plan stalled because dependencies were not satisfied",
             )
-        return state
+        return StepResult.from_run_state(step_index=context.step_index, run_state=state)
 
     async def on_cancel(self, runtime: DurableAgentRuntime, state: Checkpoint) -> None:
         plan = self._load_plan(state)

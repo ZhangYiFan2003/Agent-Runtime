@@ -25,6 +25,7 @@ from axiom.runtime.progress import (
     stable_fingerprint,
     state_fingerprint,
 )
+from axiom.runtime.steps import StepContext, StepResult
 from axiom.types import Message
 
 if TYPE_CHECKING:
@@ -281,79 +282,87 @@ class MultiAgentExecutionStrategy:
         runtime: DurableAgentRuntime,
         state: Checkpoint,
     ) -> Checkpoint:
-        while state.status == RunStatus.RUNNING:
-            state = await runtime._refresh(state)
-            if state.status != RunStatus.RUNNING:
-                return state
-            orchestration = self.load_state(state)
-            if orchestration is None:
-                orchestration = MultiAgentState(orchestration_goal=state.input)
-                self.store_state(state, orchestration)
-                await runtime._save_checkpoint(state, operation="multi_agent.started")
-                await runtime._emit("multi_agent.started", self._event(state, orchestration))
-                continue
+        return await runtime._run_step_loop(
+            state,
+            partial(self._advance_step, runtime),
+        )
 
-            if not orchestration.assignments:
-                state = await self._create_assignments(runtime, state, orchestration)
-                continue
+    async def _advance_step(
+        self,
+        runtime: DurableAgentRuntime,
+        context: StepContext,
+    ) -> StepResult:
+        state = context.run_state
+        orchestration = self.load_state(state)
+        if orchestration is None:
+            orchestration = MultiAgentState(orchestration_goal=state.input)
+            self.store_state(state, orchestration)
+            await runtime._save_checkpoint(state, operation="multi_agent.started")
+            await runtime._emit("multi_agent.started", self._event(state, orchestration))
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
 
-            state = await self._reconcile_children(runtime, state)
-            orchestration = self.load_state(state)
-            if orchestration is None:
-                raise RuntimeError("multi-agent state disappeared during reconciliation")
+        if not orchestration.assignments:
+            state = await self._create_assignments(runtime, state, orchestration)
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
 
-            reviewing = next(
-                (
-                    item
-                    for item in orchestration.assignments
-                    if item.status == AssignmentStatus.REVIEWING
-                ),
-                None,
+        state = await self._reconcile_children(runtime, state)
+        orchestration = self.load_state(state)
+        if orchestration is None:
+            raise RuntimeError("multi-agent state disappeared during reconciliation")
+
+        reviewing = next(
+            (
+                item
+                for item in orchestration.assignments
+                if item.status == AssignmentStatus.REVIEWING
+            ),
+            None,
+        )
+        if reviewing is not None:
+            orchestration.current_assignment_id = reviewing.assignment_id
+            state = await self._review(runtime, state, orchestration, reviewing)
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
+
+        state = await self._skip_blocked_assignments(runtime, state, orchestration)
+        orchestration = self.load_state(state)
+        if orchestration is None:
+            raise RuntimeError("multi-agent state disappeared while resolving dependencies")
+
+        child_states = await self._child_states(runtime, orchestration)
+        scheduler = self._scheduler(runtime)
+        snapshot = scheduler.snapshot(orchestration, child_states)
+        if snapshot.ready_assignment_ids:
+            state = await self._persist_ready_assignments(
+                runtime,
+                state,
+                orchestration,
+                snapshot.ready_assignment_ids,
             )
-            if reviewing is not None:
-                orchestration.current_assignment_id = reviewing.assignment_id
-                state = await self._review(runtime, state, orchestration, reviewing)
-                continue
-
-            state = await self._skip_blocked_assignments(runtime, state, orchestration)
             orchestration = self.load_state(state)
             if orchestration is None:
-                raise RuntimeError("multi-agent state disappeared while resolving dependencies")
-
+                raise RuntimeError("multi-agent state disappeared after assignment")
             child_states = await self._child_states(runtime, orchestration)
-            scheduler = self._scheduler(runtime)
-            snapshot = scheduler.snapshot(orchestration, child_states)
-            if snapshot.ready_assignment_ids:
-                state = await self._persist_ready_assignments(
-                    runtime,
-                    state,
-                    orchestration,
-                    snapshot.ready_assignment_ids,
-                )
-                orchestration = self.load_state(state)
-                if orchestration is None:
-                    raise RuntimeError("multi-agent state disappeared after assignment")
-                child_states = await self._child_states(runtime, orchestration)
 
-            launchable = [
-                assignment
-                for assignment in orchestration.assignments
-                if assignment.status
-                in {
-                    AssignmentStatus.ASSIGNED,
-                    AssignmentStatus.WAITING_CHILD,
-                }
-                and assignment.child_run_id
-                and (
-                    child_states.get(assignment.assignment_id) is None
-                    or child_states[assignment.assignment_id].status == RunStatus.RUNNING
-                )
-            ]
-            if launchable:
-                try:
-                    await runtime.budget_manager.preflight_child(state)
-                except BudgetExceededError as exc:
-                    return await runtime._fail(state, exc, step="child")
+        launchable = [
+            assignment
+            for assignment in orchestration.assignments
+            if assignment.status
+            in {
+                AssignmentStatus.ASSIGNED,
+                AssignmentStatus.WAITING_CHILD,
+            }
+            and assignment.child_run_id
+            and (
+                child_states.get(assignment.assignment_id) is None
+                or child_states[assignment.assignment_id].status == RunStatus.RUNNING
+            )
+        ]
+        if launchable:
+            try:
+                await runtime.budget_manager.preflight_child(state)
+            except BudgetExceededError as exc:
+                state = await runtime._fail(state, exc, step="child")
+            else:
                 orchestration.max_parallelism_observed = max(
                     orchestration.max_parallelism_observed,
                     min(len(launchable), scheduler.max_parallel_workers),
@@ -365,19 +374,17 @@ class MultiAgentExecutionStrategy:
                     partial(self._start_child, runtime, state, orchestration),
                 )
                 state = await self._reconcile_children(runtime, state)
-                continue
+            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
 
-            child_states = await self._child_states(runtime, orchestration)
-            snapshot = scheduler.snapshot(orchestration, child_states)
-            if snapshot.active_assignment_ids or snapshot.waiting_assignment_ids:
-                return await self._wait_for_children(runtime, state, orchestration, snapshot)
-
-            if not orchestration.synthesis_result:
-                state = await self._synthesize(runtime, state, orchestration)
-                continue
-
-            return await self._complete(runtime, state, orchestration)
-        return state
+        child_states = await self._child_states(runtime, orchestration)
+        snapshot = scheduler.snapshot(orchestration, child_states)
+        if snapshot.active_assignment_ids or snapshot.waiting_assignment_ids:
+            state = await self._wait_for_children(runtime, state, orchestration, snapshot)
+        elif not orchestration.synthesis_result:
+            state = await self._synthesize(runtime, state, orchestration)
+        else:
+            state = await self._complete(runtime, state, orchestration)
+        return StepResult.from_run_state(step_index=context.step_index, run_state=state)
 
     async def on_cancel(
         self,
