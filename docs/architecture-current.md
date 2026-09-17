@@ -26,6 +26,10 @@ Core runtime choices:
   claims, database-time leases, heartbeat renewal, per-Run fencing generations, expired-lease
   takeover, and ownership-fenced Checkpoint, ToolExecution, and budget writes. SQLite remains the
   local/single-node backend and rejects distributed Worker mode.
+- Optional PostgreSQL capacity governance: atomic external Run admission bounds the runnable
+  backlog, and capacity-aware claims bound valid active leases across Workers. Both limits use a
+  short lock on one coordination row while deriving counts from Run/lease truth; no queue or active
+  counter is persisted.
 
 The default LLM provider is `deepseek`, the default model is
 `deepseek-v4-flash`, and the default provider base URL is
@@ -1004,6 +1008,26 @@ claiming each Child independently. Fencing cannot revoke an already-issued exter
 stable invocation identity, downstream idempotency, status lookup, and `UNKNOWN` semantics remain
 necessary. `ActiveRunSupervisor` still only manages live Tasks inside one process.
 
+### 12.1.1 Admission control and backpressure
+
+External distributed submissions call `DurableAgentRuntime.submit`, which atomically inserts a
+runnable root Run only when the derived queued count is below `capacity.max_queued_runs`. A full
+backlog raises `QUEUE_CAPACITY_EXCEEDED` before any Run exists; the HTTP boundary maps that global
+overload to 503. Cancel, interrupt, resume, and expired-lease takeover operate on existing Runs and
+do not repeat external admission.
+
+`claim_run` and `claim_next` use the same short coordination-row lock, derive active count from
+unexpired ownership leases, and claim only below `capacity.max_active_runs`. The lock serializes
+the count-plus-write decision; lease/fencing still provides long-running ownership after commit.
+Expired leases cease to count without a decrement counter. The Worker remains deliberately serial
+locally and reuses its bounded idle poll when global capacity blocks a claim.
+
+A non-executing `WAITING_CHILD` result releases its lease and is not immediately runnable. A
+terminal Child wakes its waiting Parent, which must compete for active capacity again. Child Runs
+created by the current inline Plan/Multi-Agent schedulers are internal work under the admitted root,
+not fresh external submissions. Capacity bounds do not provide request-rate limiting, fairness,
+priority, bounded latency, autoscaling, redelivery, or DLQ semantics.
+
 ## 12.2 Canonical Runtime domain model
 
 Thread manages conversation scope. Run is the only durable execution/control/ownership unit and
@@ -1142,9 +1166,9 @@ attempts after the first. A restored `SUCCEEDED` Tool execution is reuse, not an
 The core Runtime capability set is now frozen. Future work should prioritize interview
 preparation, source-code review, real-workload evaluation, bug fixes, and evidence-driven
 hardening. New Runtime subsystems should be added only when a concrete requirement demonstrates a
-gap. PostgreSQL-backed runnable discovery, Worker claim, lease/heartbeat/fencing, and expired-lease
-takeover are implemented. Global Admission Control, backpressure, Run-level retry/DLQ,
-fairness/priority scheduling,
+gap. PostgreSQL-backed runnable discovery, Worker claim, lease/heartbeat/fencing, expired-lease
+takeover, global runnable-backlog admission, and global active-lease backpressure are implemented.
+Request-rate limiting, Run-level retry/DLQ, fairness/priority scheduling,
 shared circuit breakers, and global rate limiting remain explicit future decisions rather than
 implied features.
 
