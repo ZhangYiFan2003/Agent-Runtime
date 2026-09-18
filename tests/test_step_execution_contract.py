@@ -92,7 +92,7 @@ def test_next_action_has_only_current_runtime_continuations():
     )
 
 
-def test_one_react_llm_iteration_returns_step_result_without_changing_final_behavior(tmp_path):
+def test_one_react_llm_iteration_proposes_then_runtime_applies_completion(tmp_path):
     async def scenario():
         store = MemoryCheckpointStore()
         runtime = _runtime(tmp_path, store=store)
@@ -103,10 +103,15 @@ def test_one_react_llm_iteration_returns_step_result_without_changing_final_beha
         result = await runtime._execute_react_step(runtime._step_context(state))
 
         assert result.step_index == 0
-        assert result.run_state.status == RunStatus.COMPLETED
+        assert result.run_state.status == RunStatus.RUNNING
         assert result.run_state.output_text == "done"
         assert result.next_action == NextAction.COMPLETE
         assert result.tool_invocation_ids == ()
+
+        applied = await runtime._apply_next_action(result)
+        assert applied.status == RunStatus.COMPLETED
+        persisted = await store.load(state.run_id)
+        assert persisted is not None and persisted.status == RunStatus.COMPLETED
 
     asyncio.run(scenario())
 

@@ -85,12 +85,33 @@ class StepContext:
 
 @dataclass(frozen=True, slots=True)
 class StepResult:
-    """In-memory outcome of one Runtime execution iteration."""
+    """In-memory execution evidence and proposed continuation for one iteration.
+
+    ``run_state`` is the strategy-mutated candidate state.  It is not an
+    authoritative generic lifecycle transition: the Runtime applies
+    ``next_action`` and performs the final CAS/fencing write.
+    """
 
     step_index: int
     run_state: RunState
     next_action: NextAction | None
     tool_invocation_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def propose(
+        cls,
+        *,
+        step_index: int,
+        run_state: RunState,
+        next_action: NextAction,
+        tool_invocation_ids: tuple[str, ...] = (),
+    ) -> StepResult:
+        return cls(
+            step_index=step_index,
+            run_state=run_state,
+            next_action=next_action,
+            tool_invocation_ids=tool_invocation_ids,
+        )
 
     @classmethod
     def from_run_state(

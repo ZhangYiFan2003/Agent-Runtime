@@ -23,7 +23,7 @@ from axiom.runtime.progress import (
     stable_fingerprint,
     state_fingerprint,
 )
-from axiom.runtime.steps import StepContext, StepResult
+from axiom.runtime.steps import NextAction, StepContext, StepResult
 from axiom.types import Message
 
 if TYPE_CHECKING:
@@ -178,7 +178,11 @@ class PlanExecuteStrategy:
             raise RuntimeError("plan state disappeared during child reconciliation")
         if plan.is_all_completed():
             state = await self._complete_plan(runtime, state, plan)
-            return StepResult.from_run_state(step_index=context.step_index, run_state=state)
+            return StepResult.propose(
+                step_index=context.step_index,
+                run_state=state,
+                next_action=NextAction.COMPLETE,
+            )
 
         child_states = await self._child_states(runtime, plan)
         scheduler = self._scheduler(runtime)
@@ -251,6 +255,11 @@ class PlanExecuteStrategy:
             state = await self._wait_for_children(runtime, state, plan, snapshot)
         elif plan.is_all_completed():
             state = await self._complete_plan(runtime, state, plan)
+            return StepResult.propose(
+                step_index=context.step_index,
+                run_state=state,
+                next_action=NextAction.COMPLETE,
+            )
         elif plan.has_failed():
             pass
         else:
@@ -847,31 +856,15 @@ class PlanExecuteStrategy:
         plan: ExecutionPlan,
     ) -> Checkpoint:
         plan.mark_completed()
-        state.status = RunStatus.COMPLETED
         state.output_text = _build_plan_result(plan)
         state.messages.append(Message(role="assistant", content=state.output_text))
         self._store_plan(state, plan)
-        await runtime._apply_completion_verification(state, allow_correction=False)
-        await runtime._save_checkpoint(state, operation="plan.completed")
         await runtime._emit(
             "plan.completed",
             {
                 **self._plan_event(state, plan),
                 "steps": len(plan.tasks),
                 "replan_count": plan.replan_count,
-            },
-        )
-        await runtime._finish_run_trace(state.status)
-        await runtime._emit(
-            "run.completed" if state.status == RunStatus.COMPLETED else "run.failed",
-            {
-                "run_id": state.run_id,
-                "total_tokens": state.total_tokens,
-                **(
-                    {"error": state.error.to_dict() if state.error else None}
-                    if state.status == RunStatus.FAILED
-                    else {}
-                ),
             },
         )
         return state

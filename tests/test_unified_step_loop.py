@@ -10,10 +10,12 @@ from axiom.runtime import (
     Checkpoint,
     DurableAgentRuntime,
     MemoryCheckpointStore,
+    NextAction,
     RunStatus,
     StepResult,
 )
 from axiom.tools import ToolRegistry
+from axiom.types import Message
 
 
 class _UnusedLlm:
@@ -27,7 +29,7 @@ class _UnusedLlm:
             yield {}
 
 
-def _runtime(tmp_path):
+def _runtime(tmp_path, store=None):
     config = AxiomConfig()
     config.policy.audit_log_path = str(tmp_path / "audit.jsonl")
     return DurableAgentRuntime(
@@ -36,7 +38,7 @@ def _runtime(tmp_path):
         system_prompt="test",
         cwd=str(tmp_path),
         config=config,
-        store=MemoryCheckpointStore(),
+        store=store or MemoryCheckpointStore(),
     )
 
 
@@ -47,7 +49,8 @@ async def _persist_initial(runtime: DurableAgentRuntime, state: Checkpoint) -> N
 
 def test_common_loop_preflights_and_advances_each_logical_step_once(tmp_path) -> None:
     async def scenario() -> None:
-        runtime = _runtime(tmp_path)
+        store = MemoryCheckpointStore()
+        runtime = _runtime(tmp_path, store)
         state = Checkpoint.create(thread_id="thread", run_id="run-loop", input="work")
         await _persist_initial(runtime, state)
         observed: list[int] = []
@@ -144,5 +147,83 @@ def test_hard_budget_preflight_preserves_specific_failure(tmp_path) -> None:
         assert result.error is not None
         assert result.error.type == "WALL_TIME_BUDGET_EXCEEDED"
         assert result.error.step == "step_preflight"
+
+    asyncio.run(scenario())
+
+
+def test_runtime_applies_completion_candidate_authoritatively(tmp_path) -> None:
+    async def scenario() -> None:
+        runtime = _runtime(tmp_path)
+        state = Checkpoint.create(thread_id="thread", run_id="run-complete", input="work")
+        await _persist_initial(runtime, state)
+
+        async def execute(context):
+            candidate = context.run_state
+            candidate.output_text = "done"
+            return StepResult.propose(
+                step_index=context.step_index,
+                run_state=candidate,
+                next_action=NextAction.COMPLETE,
+            )
+
+        result = await runtime._run_step_loop(state, execute)
+        persisted = await runtime.store.load(state.run_id)
+
+        assert result.status == RunStatus.COMPLETED
+        assert persisted is not None and persisted.status == RunStatus.COMPLETED
+        assert persisted.output_text == "done"
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_cancel_outranks_stale_complete(tmp_path) -> None:
+    async def scenario() -> None:
+        runtime = _runtime(tmp_path)
+        state = Checkpoint.create(thread_id="thread", run_id="run-cancel-race", input="work")
+        await _persist_initial(runtime, state)
+        stale = await runtime.store.load(state.run_id)
+        assert stale is not None
+
+        cancelled = await runtime.cancel(state.run_id)
+        result = await runtime._apply_next_action(
+            StepResult.propose(
+                step_index=stale.step_index,
+                run_state=stale,
+                next_action=NextAction.COMPLETE,
+            )
+        )
+
+        assert cancelled.status == RunStatus.CANCELLED
+        assert result.status == RunStatus.CANCELLED
+        persisted = await runtime.store.load(state.run_id)
+        assert persisted is not None and persisted.status == RunStatus.CANCELLED
+
+    asyncio.run(scenario())
+
+
+def test_resume_recomputes_lost_completion_policy_without_new_model_call(tmp_path) -> None:
+    async def scenario() -> None:
+        store = MemoryCheckpointStore()
+        runtime = _runtime(tmp_path, store)
+        state = Checkpoint.create(thread_id="thread", run_id="run-policy-crash", input="work")
+        await _persist_initial(runtime, state)
+        state.messages.append(Message(role="assistant", content="durable answer"))
+        state.output_text = "durable answer"
+        state.agent_turn = 1
+        state.step_index = 1
+        await runtime._save_checkpoint(state, operation="llm.completed")
+
+        # Policy evaluation is ephemeral. Simulate process loss before its
+        # authoritative transition write by discarding this return value.
+        assert (
+            await runtime._evaluate_completion(state, allow_correction=True)
+            == NextAction.COMPLETE
+        )
+
+        resumed = await _runtime(tmp_path, store).resume(state.run_id)
+
+        assert resumed.status == RunStatus.COMPLETED
+        assert resumed.output_text == "durable answer"
+        assert resumed.agent_turn == 1
 
     asyncio.run(scenario())

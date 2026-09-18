@@ -144,7 +144,8 @@ def test_llm_trace_records_tokens_ttft_latency_and_model(tmp_path):
         assert metrics.total_tokens == 10
         assert metrics.llm_calls == 1
         assert metrics.step_count == 1
-        assert metrics.checkpoint_count == 2
+        # Start, durable LLM evidence, then the Runtime-owned terminal transition.
+        assert metrics.checkpoint_count == 3
 
     asyncio.run(scenario())
 

@@ -48,7 +48,6 @@ from axiom.runtime.checkpoints import (
 from axiom.runtime.completion import (
     COMPLETION_NOT_VERIFIED,
     CompletionContract,
-    CompletionVerificationResult,
     CompletionVerificationStatus,
     CompletionVerifier,
     verification_feedback,
@@ -621,9 +620,86 @@ class DurableAgentRuntime:
                 raise RuntimeError("StepResult does not match its StepContext index")
             if result.run_state.run_id != context.run_id:
                 raise RuntimeError("StepResult does not match its StepContext run")
-            state = result.run_state
-            if result.next_action != NextAction.CONTINUE:
+            state = await self._apply_next_action(result)
+            if state.status != RunStatus.RUNNING:
                 return state
+        return state
+
+    async def _apply_next_action(self, result: StepResult) -> Checkpoint:
+        """Apply the one authoritative generic Run lifecycle transition.
+
+        Strategies may mutate strategy-specific fields in the candidate state,
+        but COMPLETE/FAIL are committed here only after control, CAS, and
+        ownership fencing have been rechecked.  WAIT preserves the specific
+        durable wait/control status selected by the strategy.
+        """
+        state = result.run_state
+        current = await self._require(state.run_id)
+        if current.status in {RunStatus.CANCELLED, RunStatus.INTERRUPTED}:
+            return current
+        if self.ownership is not None:
+            await self.store.validate_ownership(self.ownership)
+        if current.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            return current
+        if current.sequence != state.sequence:
+            raise CheckpointConflictError(
+                f"stale StepResult for run {state.run_id}: "
+                f"expected sequence {state.sequence}, current sequence {current.sequence}"
+            )
+
+        action = result.next_action
+        if action is None:
+            return state
+        if action == NextAction.COMPLETE:
+            action = await self._evaluate_completion(
+                state,
+                allow_correction=state.execution_strategy == "react",
+            )
+        if action == NextAction.COMPLETE:
+            state.status = RunStatus.COMPLETED
+            state.error = None
+            operation = "run.completed"
+        elif action == NextAction.FAIL:
+            state.status = RunStatus.FAILED
+            if state.error is None:
+                state.error = RunError(
+                    type="RuntimeFailure",
+                    message="Runtime policy rejected the Step outcome",
+                    step="step_transition",
+                )
+            operation = "run.failed"
+        elif action == NextAction.WAIT:
+            if state.status not in {
+                RunStatus.WAITING_CHILD,
+                RunStatus.WAITING_APPROVAL,
+                RunStatus.INTERRUPTED,
+            }:
+                raise RuntimeError("WAIT requires a specific durable wait/control status")
+            operation = "run.waiting"
+        else:
+            state.status = RunStatus.RUNNING
+            operation = "run.continue"
+
+        # Most strategy progress is already durably saved before it is returned.
+        # Persist only when this method actually changed the candidate relative
+        # to the authoritative record (terminal transition, correction feedback,
+        # or an unsaved strategy candidate).
+        if current.to_dict() != state.to_dict():
+            await self._save_checkpoint(state, operation=operation)
+        if state.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            await self._finish_run_trace(state.status)
+            await self._emit(
+                "run.completed" if state.status == RunStatus.COMPLETED else "run.failed",
+                {
+                    "run_id": state.run_id,
+                    "total_tokens": state.total_tokens,
+                    **(
+                        {"error": state.error.to_dict() if state.error else None}
+                        if state.status == RunStatus.FAILED
+                        else {}
+                    ),
+                },
+            )
         return state
 
     async def _preflight_step(
@@ -656,7 +732,19 @@ class DurableAgentRuntime:
         """Execute one existing ReAct iteration without creating durable Step state."""
         state = context.run_state
         invocation_ids: tuple[str, ...] = ()
-        if state.pending_tool_calls and state.next_tool_index < len(state.pending_tool_calls):
+        proposed_action = NextAction.CONTINUE
+        if (
+            not state.pending_tool_calls
+            and state.agent_turn > 0
+            and state.messages
+            and state.messages[-1].role == "assistant"
+            and state.error is None
+        ):
+            # The LLM result is already durable but the process may have died
+            # before the policy decision was committed. Recompute completion;
+            # do not issue another model call.
+            proposed_action = NextAction.COMPLETE
+        elif state.pending_tool_calls and state.next_tool_index < len(state.pending_tool_calls):
             call = state.pending_tool_calls[state.next_tool_index]
             tool_call_id = str(
                 call.get("id") or f"call_{state.agent_turn}_{state.next_tool_index}"
@@ -673,9 +761,24 @@ class DurableAgentRuntime:
             state.pending_tool_calls = []
             state.next_tool_index = 0
             state = await self._execute_llm_step(state, step_context=context)
-        return StepResult.from_run_state(
+            if (
+                state.status == RunStatus.RUNNING
+                and state.error is None
+                and not state.pending_tool_calls
+                and state.messages
+                and state.messages[-1].role == "assistant"
+            ):
+                proposed_action = NextAction.COMPLETE
+        if state.status != RunStatus.RUNNING:
+            return StepResult.from_run_state(
+                step_index=context.step_index,
+                run_state=state,
+                tool_invocation_ids=invocation_ids,
+            )
+        return StepResult.propose(
             step_index=context.step_index,
             run_state=state,
+            next_action=proposed_action,
             tool_invocation_ids=invocation_ids,
         )
 
@@ -723,18 +826,26 @@ class DurableAgentRuntime:
                     },
                 )
                 if fail_run:
-                    state.status = RunStatus.FAILED
-                    await self._save_checkpoint(state, operation="run.failed")
-                    await self._finish_run_trace(state.status)
+                    state = await self._apply_next_action(
+                        StepResult.propose(
+                            step_index=state.step_index,
+                            run_state=state,
+                            next_action=NextAction.FAIL,
+                        )
+                    )
                 else:
                     state.strategy_state["current_task_error"] = state.error.message
                     await self._save_checkpoint(state, operation="plan.step.llm_failed")
                 return state
             if not persisted_retry.get("retryable"):
                 if fail_run:
-                    state.status = RunStatus.FAILED
-                    await self._save_checkpoint(state, operation="run.failed")
-                    await self._finish_run_trace(state.status)
+                    state = await self._apply_next_action(
+                        StepResult.propose(
+                            step_index=state.step_index,
+                            run_state=state,
+                            next_action=NextAction.FAIL,
+                        )
+                    )
                 else:
                     state.strategy_state["current_task_error"] = state.error.message
                     await self._save_checkpoint(state, operation="plan.step.llm_failed")
@@ -755,9 +866,13 @@ class DurableAgentRuntime:
                         },
                     )
                     if fail_run:
-                        state.status = RunStatus.FAILED
-                        await self._save_checkpoint(state, operation="run.failed")
-                        await self._finish_run_trace(state.status)
+                        state = await self._apply_next_action(
+                            StepResult.propose(
+                                step_index=state.step_index,
+                                run_state=state,
+                                next_action=NextAction.FAIL,
+                            )
+                        )
                     else:
                         state.strategy_state["current_task_error"] = state.error.message
                         await self._save_checkpoint(state, operation="plan.step.llm_failed")
@@ -1061,10 +1176,13 @@ class DurableAgentRuntime:
                 )
                 if not decision.retry:
                     if fail_run:
-                        state.status = RunStatus.FAILED
-                        await self._save_checkpoint(state, operation="run.failed")
-                        await self._finish_run_trace(state.status)
-                        await self._emit("run.failed", {"run_id": state.run_id, "error": message})
+                        state = await self._apply_next_action(
+                            StepResult.propose(
+                                step_index=state.step_index,
+                                run_state=state,
+                                next_action=NextAction.FAIL,
+                            )
+                        )
                     else:
                         state.strategy_state["current_task_error"] = message
                         await self._save_checkpoint(state, operation="plan.step.llm_failed")
@@ -1128,15 +1246,8 @@ class DurableAgentRuntime:
             state.step_index += 1
             state.total_tokens += llm_result.prompt_tokens + llm_result.completion_tokens
             candidate_completion = not scoped_tool_calls and llm_result.stop_reason != "tool_use"
-            if candidate_completion:
-                if complete_run:
-                    await self._apply_completion_verification(
-                        state,
-                        allow_correction=True,
-                        parent_span_id=_span_id(step_span),
-                    )
-                else:
-                    state.strategy_state["current_task_complete"] = True
+            if candidate_completion and not complete_run:
+                state.strategy_state["current_task_complete"] = True
             await self._save_checkpoint(
                 state,
                 operation="llm.completed",
@@ -1164,40 +1275,22 @@ class DurableAgentRuntime:
                 "agent.step.completed",
                 {"run_id": state.run_id, "step_index": step_index, "kind": "llm"},
             )
-            if state.status == RunStatus.COMPLETED:
-                await self._finish_run_trace(state.status)
-                await self._emit(
-                    "run.completed",
-                    {"run_id": state.run_id, "total_tokens": state.total_tokens},
-                )
-            elif state.status == RunStatus.FAILED:
-                await self._finish_run_trace(state.status)
-                await self._emit(
-                    "run.failed",
-                    {
-                        "run_id": state.run_id,
-                        "error": state.error.to_dict() if state.error else None,
-                    },
-                )
             return state
 
-    async def _apply_completion_verification(
+    async def _evaluate_completion(
         self,
         state: Checkpoint,
         *,
         allow_correction: bool,
         parent_span_id: str | None = None,
-    ) -> CompletionVerificationResult | None:
+    ) -> NextAction:
         if not state.completion_contract:
             action = self.completion_policy.decide(
                 run_status=state.status,
                 proposed_action=NextAction.COMPLETE,
                 verification_status=CompletionVerificationStatus.NOT_APPLICABLE,
             )
-            if action == NextAction.COMPLETE:
-                state.status = RunStatus.COMPLETED
-                state.error = None
-            return None
+            return action or NextAction.FAIL
         contract = CompletionContract.from_dict(state.completion_contract)
         state.completion_verification_attempts += 1
         attempt = state.completion_verification_attempts
@@ -1256,16 +1349,13 @@ class DurableAgentRuntime:
             max_correction_attempts=contract.max_correction_attempts,
         )
         if action == NextAction.COMPLETE:
-            state.status = RunStatus.COMPLETED
             state.error = None
-            return result
+            return NextAction.COMPLETE
         if action == NextAction.CONTINUE:
-            state.status = RunStatus.RUNNING
             state.messages.append(Message(role="user", content=verification_feedback(result)))
-            return result
+            return NextAction.CONTINUE
         if action is None:
-            return result
-        state.status = RunStatus.FAILED
+            return NextAction.FAIL
         state.error = RunError(
             type=COMPLETION_NOT_VERIFIED,
             message=(
@@ -1280,7 +1370,7 @@ class DurableAgentRuntime:
                 "failed_check_ids": list(result.failed_check_ids),
             },
         )
-        return result
+        return NextAction.FAIL
 
     async def _collect_llm_response(
         self,
@@ -2133,7 +2223,6 @@ class DurableAgentRuntime:
         )
         if action is None:
             return state
-        state.status = RunStatus.FAILED
         state.error = RunError(
             type=exc.code
             if isinstance(exc, (BudgetExceededError, NoProgressError))
@@ -2156,13 +2245,13 @@ class DurableAgentRuntime:
                     "budget.exceeded_used": str(exc.used),
                 },
             )
-        await self._save_checkpoint(state, operation="run.failed")
-        await self._finish_run_trace(state.status)
-        await self._emit(
-            "run.failed",
-            {"run_id": state.run_id, "error": state.error.to_dict()},
+        return await self._apply_next_action(
+            StepResult.propose(
+                step_index=state.step_index,
+                run_state=state,
+                next_action=NextAction.FAIL,
+            )
         )
-        return state
 
     async def _refresh(self, state: Checkpoint) -> Checkpoint:
         if self.ownership is not None:

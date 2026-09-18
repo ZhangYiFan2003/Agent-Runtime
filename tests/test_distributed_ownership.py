@@ -25,6 +25,7 @@ from axiom.runtime.ownership import (
     OwnershipLostError,
 )
 from axiom.runtime.postgres import initialize_postgres_schema
+from axiom.runtime.steps import NextAction, StepResult
 from axiom.runtime.storage import DurableStorage, create_durable_storage
 from axiom.tools import ToolRegistry
 
@@ -464,6 +465,49 @@ def test_old_owner_cannot_checkpoint_after_takeover(postgres_storage):
     asyncio.run(postgres_storage.runtime.save(state, ownership=second))
     with pytest.raises(OwnershipLostError):
         asyncio.run(postgres_storage.runtime.save(stale, ownership=first))
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("action", [NextAction.CONTINUE, NextAction.COMPLETE])
+def test_stale_step_transition_is_rejected_after_takeover(
+    postgres_storage, tmp_path, action
+):
+    async def scenario():
+        state = await _runnable(postgres_storage, f"run-stale-{action.value.lower()}")
+        first = await postgres_storage.runtime.claim_run(state.run_id, "worker-a", 30)
+        assert first is not None
+        stale = deepcopy(state)
+        stale.output_text = "stale-step-evidence"
+        _expire(postgres_storage, state.run_id)
+        second = await postgres_storage.runtime.claim_run(state.run_id, "worker-b", 30)
+        assert second is not None and second.fencing_token == first.fencing_token + 1
+
+        config = AxiomConfig()
+        config.policy.audit_log_path = str(tmp_path / "audit.jsonl")
+        runtime = DurableAgentRuntime(
+            llm_client=_TakeoverLlm(),
+            tool_registry=ToolRegistry(),
+            system_prompt="test",
+            cwd=str(tmp_path),
+            config=config,
+            store=postgres_storage.runtime,
+            ownership=first,
+        )
+        with pytest.raises(OwnershipLostError):
+            await runtime._apply_next_action(
+                StepResult.propose(
+                    step_index=stale.step_index,
+                    run_state=stale,
+                    next_action=action,
+                )
+            )
+
+        current = await postgres_storage.runtime.load(state.run_id)
+        assert current is not None
+        assert current.status == RunStatus.RUNNING
+        assert current.output_text == ""
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.postgres
