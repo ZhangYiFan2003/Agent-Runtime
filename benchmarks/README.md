@@ -90,8 +90,9 @@ Three maintained evidence suites keep different claims separate:
   vector, hybrid RRF, and separately reported graph-context coverage.
 - `agent-runtime/`: 40 read-only fixed tasks. A real provider is required before
   reporting Task Success Rate.
-- `recovery/`: 21 deterministic fault scenarios with two repetitions by
-  default. No provider is required.
+- `recovery/`: 25 deterministic fault scenarios with two repetitions by
+  default. No model provider is required; four distributed-redelivery cases
+  require a real PostgreSQL test DSN.
 
 Committed artifacts are evidence snapshots, not CI performance thresholds.
 Synthetic Tool concurrency remains `ToolExecutor.execute_all` only and is not

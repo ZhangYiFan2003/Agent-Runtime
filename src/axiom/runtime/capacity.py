@@ -26,3 +26,6 @@ class CapacitySnapshot:
     admission_rejections: int = 0
     capacity_blocked_claims: int = 0
     oldest_queued_age_seconds: float | None = None
+    failure_queued_runs: int = 0
+    mean_delivery_attempts: float = 0.0
+    max_delivery_attempts: int = 0

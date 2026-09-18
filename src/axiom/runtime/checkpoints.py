@@ -72,6 +72,7 @@ class DistributedRuntimeStore(RuntimeStore, Protocol):
         worker_id: str,
         lease_seconds: float,
         max_active_runs: int | None = None,
+        max_run_delivery_attempts: int | None = None,
     ) -> RunOwnership | None: ...
 
     async def claim_next(
@@ -79,6 +80,7 @@ class DistributedRuntimeStore(RuntimeStore, Protocol):
         worker_id: str,
         lease_seconds: float,
         max_active_runs: int | None = None,
+        max_run_delivery_attempts: int | None = None,
     ) -> RunOwnership | None: ...
 
     async def renew_lease(

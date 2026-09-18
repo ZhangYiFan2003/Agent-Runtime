@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -66,6 +67,13 @@ def main() -> None:
     )
     args = parser.parse_args()
     matrix = load_scenarios(args.scenarios)
+    if any(
+        item.get("category") == "distributed-redelivery"
+        for item in matrix["scenarios"]
+    ) and not os.environ.get("AXIOM_TEST_POSTGRES_DSN"):
+        raise RuntimeError(
+            "distributed-redelivery scenarios require AXIOM_TEST_POSTGRES_DSN"
+        )
     repetitions = args.repetitions or int(matrix["repetitions"])
     results = []
     for repetition in range(1, repetitions + 1):
@@ -77,7 +85,12 @@ def main() -> None:
                 capture_output=True,
                 text=True,
             )
-            classified = classify_execution(scenario, passed=run.returncode == 0)
+            output = run.stdout + run.stderr
+            passed = run.returncode == 0 and not (
+                scenario["category"] == "distributed-redelivery"
+                and "skipped" in output.casefold()
+            )
+            classified = classify_execution(scenario, passed=passed)
             results.append(
                 {
                     "scenario_id": scenario["id"],
@@ -85,9 +98,7 @@ def main() -> None:
                     "repetition": repetition,
                     "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                     **classified,
-                    "failure_summary": ""
-                    if run.returncode == 0
-                    else (run.stdout + run.stderr)[-2000:],
+                    "failure_summary": "" if passed else output[-2000:],
                 }
             )
     passed = [item for item in results if item["passed"]]

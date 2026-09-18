@@ -129,6 +129,12 @@ class RunState:
     decisions: dict[str, str] = field(default_factory=dict)
     interrupt: Interrupt | None = None
     error: RunError | None = None
+    delivery_attempt: int = 0
+    failure_queued_at: str | None = None
+    last_delivery_failure: str | None = None
+    last_delivery_failed_at: str | None = None
+    last_delivery_worker_id: str | None = None
+    last_delivery_fencing_token: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -207,6 +213,12 @@ class RunState:
             "decisions": dict(self.decisions),
             "interrupt": self.interrupt.to_dict() if self.interrupt else None,
             "error": self.error.to_dict() if self.error else None,
+            "delivery_attempt": self.delivery_attempt,
+            "failure_queued_at": self.failure_queued_at,
+            "last_delivery_failure": self.last_delivery_failure,
+            "last_delivery_failed_at": self.last_delivery_failed_at,
+            "last_delivery_worker_id": self.last_delivery_worker_id,
+            "last_delivery_fencing_token": self.last_delivery_fencing_token,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -258,6 +270,16 @@ class RunState:
             error=RunError.from_dict(data["error"])
             if isinstance(data.get("error"), dict)
             else None,
+            delivery_attempt=max(0, int(data.get("delivery_attempt") or 0)),
+            failure_queued_at=_optional_str(data.get("failure_queued_at")),
+            last_delivery_failure=_optional_str(data.get("last_delivery_failure")),
+            last_delivery_failed_at=_optional_str(data.get("last_delivery_failed_at")),
+            last_delivery_worker_id=_optional_str(data.get("last_delivery_worker_id")),
+            last_delivery_fencing_token=(
+                int(data["last_delivery_fencing_token"])
+                if data.get("last_delivery_fencing_token") is not None
+                else None
+            ),
             created_at=str(data.get("created_at") or datetime.now(UTC).isoformat()),
             updated_at=str(data.get("updated_at") or datetime.now(UTC).isoformat()),
         )
@@ -285,6 +307,12 @@ class RunState:
             "run_kind": self.run_kind,
             "interrupt": self.interrupt.to_dict() if self.interrupt else None,
             "error": self.error.to_dict() if self.error else None,
+            "delivery_attempt": self.delivery_attempt,
+            "failure_queued_at": self.failure_queued_at,
+            "last_delivery_failure": self.last_delivery_failure,
+            "last_delivery_failed_at": self.last_delivery_failed_at,
+            "last_delivery_worker_id": self.last_delivery_worker_id,
+            "last_delivery_fencing_token": self.last_delivery_fencing_token,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

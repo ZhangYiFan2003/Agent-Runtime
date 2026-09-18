@@ -2,11 +2,11 @@
 
 > Deterministic offline recovery evidence.
 
-- Scenarios: 21
+- Scenarios: 25
 - Repetitions: 2
-- Total executions: 42
+- Total executions: 50
 - Recovery rate: 1.0000
-- Expected-safe outcomes: 2
+- Expected-safe outcomes: 4
 - Failures: 0
 - Duplicate Tool executions: 0
 - Duplicate Child Runs: 0
@@ -36,6 +36,10 @@
 | multi_waiting_approval | multi-agent | 1 | recovered | yes |
 | multi_parent_cancel | multi-agent | 1 | recovered | yes |
 | multi_mixed_restart | multi-agent | 1 | recovered | yes |
+| run_bounded_redelivery | distributed-redelivery | 1 | recovered | yes |
+| run_delivery_exhaustion | distributed-redelivery | 1 | expected-safe | yes |
+| run_redelivery_tool_reuse | distributed-redelivery | 1 | recovered | yes |
+| child_redelivery_identity | distributed-redelivery | 1 | recovered | yes |
 | react_run_checkpoint | react | 2 | recovered | yes |
 | react_tool_checkpoint | react | 2 | recovered | yes |
 | react_tool_success_gap | react | 2 | recovered | yes |
@@ -57,3 +61,7 @@
 | multi_waiting_approval | multi-agent | 2 | recovered | yes |
 | multi_parent_cancel | multi-agent | 2 | recovered | yes |
 | multi_mixed_restart | multi-agent | 2 | recovered | yes |
+| run_bounded_redelivery | distributed-redelivery | 2 | recovered | yes |
+| run_delivery_exhaustion | distributed-redelivery | 2 | expected-safe | yes |
+| run_redelivery_tool_reuse | distributed-redelivery | 2 | recovered | yes |
+| child_redelivery_identity | distributed-redelivery | 2 | recovered | yes |

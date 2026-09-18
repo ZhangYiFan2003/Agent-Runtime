@@ -158,7 +158,7 @@ def test_agent_dataset_and_recovery_matrix_validate() -> None:
     agent = validate_dataset(ROOT / "benchmarks/agent-runtime/dataset.json")
     recovery = load_scenarios(ROOT / "benchmarks/recovery/scenarios.json")
     assert agent["case_count"] == 40
-    assert len(recovery["scenarios"]) == 21
+    assert len(recovery["scenarios"]) == 25
 
 
 def test_recovery_result_classification() -> None:

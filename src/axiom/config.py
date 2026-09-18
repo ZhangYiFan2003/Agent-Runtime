@@ -167,6 +167,7 @@ class WorkerConfig:
     lease_seconds: float = 30.0
     heartbeat_interval_seconds: float = 10.0
     poll_interval_seconds: float = 0.5
+    max_run_delivery_attempts: int | None = None
 
 
 @dataclass(slots=True)
@@ -291,6 +292,11 @@ def load_config(
         raise ValueError(
             "distributed Worker requires positive polling and heartbeat shorter than lease"
         )
+    if (
+        config.worker.max_run_delivery_attempts is not None
+        and config.worker.max_run_delivery_attempts <= 0
+    ):
+        raise ValueError("worker.max_run_delivery_attempts must be positive or null")
     for name, value in (
         ("max_queued_runs", config.capacity.max_queued_runs),
         ("max_active_runs", config.capacity.max_active_runs),
@@ -386,6 +392,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("AXIOM_WORKER_LEASE_SECONDS", "lease_seconds", float),
         ("AXIOM_WORKER_HEARTBEAT_INTERVAL_SECONDS", "heartbeat_interval_seconds", float),
         ("AXIOM_WORKER_POLL_INTERVAL_SECONDS", "poll_interval_seconds", float),
+        ("AXIOM_MAX_RUN_DELIVERY_ATTEMPTS", "max_run_delivery_attempts", int),
     ]
     for env_key, config_key, caster in worker_mappings:
         raw = env.get(env_key)

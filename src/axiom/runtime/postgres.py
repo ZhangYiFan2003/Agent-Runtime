@@ -18,10 +18,17 @@ from axiom.runtime.control_plane import (
     operation_request_hash,
 )
 from axiom.runtime.events import RuntimeEvent
-from axiom.runtime.models import BudgetLedgerRecord, Checkpoint, ToolExecutionRecord
+from axiom.runtime.models import (
+    BudgetLedgerRecord,
+    Checkpoint,
+    RunError,
+    RunStatus,
+    ToolExecutionRecord,
+)
 from axiom.runtime.ownership import OwnershipLostError, RunOwnership
 
-POSTGRES_SCHEMA_VERSION = 3
+POSTGRES_SCHEMA_VERSION = 4
+RUN_DELIVERY_EXHAUSTED = "RUN_DELIVERY_EXHAUSTED"
 
 
 class PostgresDependencyError(RuntimeError):
@@ -99,7 +106,7 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()
         version = int(row[0]) if row else POSTGRES_SCHEMA_VERSION
-        if version not in {1, 2, POSTGRES_SCHEMA_VERSION}:
+        if version not in {1, 2, 3, POSTGRES_SCHEMA_VERSION}:
             raise PostgresSchemaError(
                 f"unsupported PostgreSQL runtime schema version: {version}"
             )
@@ -172,11 +179,18 @@ class PostgresRuntimeStore:
         worker_id: str,
         lease_seconds: float,
         max_active_runs: int | None = None,
+        max_run_delivery_attempts: int | None = None,
     ) -> RunOwnership | None:
         _require_positive_lease(lease_seconds)
         _require_optional_limit(max_active_runs, "max_active_runs")
+        _require_optional_limit(max_run_delivery_attempts, "max_run_delivery_attempts")
         return await asyncio.to_thread(
-            self._claim_run, run_id, worker_id, lease_seconds, max_active_runs
+            self._claim_run,
+            run_id,
+            worker_id,
+            lease_seconds,
+            max_active_runs,
+            max_run_delivery_attempts,
         )
 
     async def claim_next(
@@ -184,11 +198,17 @@ class PostgresRuntimeStore:
         worker_id: str,
         lease_seconds: float,
         max_active_runs: int | None = None,
+        max_run_delivery_attempts: int | None = None,
     ) -> RunOwnership | None:
         _require_positive_lease(lease_seconds)
         _require_optional_limit(max_active_runs, "max_active_runs")
+        _require_optional_limit(max_run_delivery_attempts, "max_run_delivery_attempts")
         return await asyncio.to_thread(
-            self._claim_next, worker_id, lease_seconds, max_active_runs
+            self._claim_next,
+            worker_id,
+            lease_seconds,
+            max_active_runs,
+            max_run_delivery_attempts,
         )
 
     async def renew_lease(
@@ -353,17 +373,18 @@ class PostgresRuntimeStore:
     def _load(self, run_id: str) -> Checkpoint | None:
         with self.pool.connection() as conn:
             row = conn.execute(
-                "select state_json from runs where run_id = %s", (run_id,)
+                f"select {_RUN_STATE_SELECT} from runs where run_id = %s", (run_id,)
             ).fetchone()
-        return _checkpoint(row[0]) if row else None
+        return _checkpoint_with_delivery(row) if row else None
 
     def _list(self, thread_id: str) -> list[Checkpoint]:
         with self.pool.connection() as conn:
             rows = conn.execute(
-                "select state_json from runs where thread_id = %s order by created_at, run_id",
+                f"select {_RUN_STATE_SELECT} from runs "
+                "where thread_id = %s order by created_at, run_id",
                 (thread_id,),
             ).fetchall()
-        return [_checkpoint(row[0]) for row in rows]
+        return [_checkpoint_with_delivery(row) for row in rows]
 
     def _save_tool_execution(
         self, record: ToolExecutionRecord, ownership: RunOwnership | None = None
@@ -514,62 +535,136 @@ class PostgresRuntimeStore:
         worker_id: str,
         lease_seconds: float,
         max_active_runs: int | None,
+        max_run_delivery_attempts: int | None,
     ) -> RunOwnership | None:
         with self.pool.connection() as conn:
             if max_active_runs is not None:
                 _lock_capacity_coordination(conn)
-                if _active_count(conn) >= max_active_runs:
-                    self._capacity_blocked_claims += 1
-                    return None
-            row = conn.execute(
+            candidate = conn.execute(
                 f"""
-                update runs as candidate
-                set owner_worker_id = %s,
-                    lease_until = current_timestamp + %s * interval '1 second',
-                    fencing_token = fencing_token + 1,
-                    claimed_at = current_timestamp,
-                    last_heartbeat_at = current_timestamp
-                where run_id = %s
-                  and {_RUN_IS_CLAIMABLE}
-                returning run_id, owner_worker_id, fencing_token, lease_until
+                select candidate.run_id, candidate.owner_worker_id,
+                       candidate.delivery_attempt, candidate.state_json,
+                       candidate.current_sequence, candidate.schema_version,
+                       candidate.thread_id, candidate.turn_id,
+                       candidate.parent_run_id, candidate.fencing_token
+                from runs as candidate
+                where candidate.run_id = %s and {_RUN_IS_CLAIMABLE}
+                for update
                 """,
-                (worker_id, lease_seconds, run_id),
+                (run_id,),
             ).fetchone()
-        return _ownership(row) if row else None
+            if _delivery_is_exhausted(candidate, max_run_delivery_attempts):
+                _mark_delivery_exhausted(
+                    conn,
+                    candidate,
+                    max_run_delivery_attempts=max_run_delivery_attempts,
+                )
+                return None
+            if max_active_runs is not None and _active_count(conn) >= max_active_runs:
+                self._capacity_blocked_claims += 1
+                return None
+            return self._claim_locked_candidate(
+                conn,
+                candidate,
+                worker_id=worker_id,
+                lease_seconds=lease_seconds,
+            )
 
     def _claim_next(
-        self, worker_id: str, lease_seconds: float, max_active_runs: int | None
+        self,
+        worker_id: str,
+        lease_seconds: float,
+        max_active_runs: int | None,
+        max_run_delivery_attempts: int | None,
     ) -> RunOwnership | None:
         with self.pool.connection() as conn:
             if max_active_runs is not None:
                 _lock_capacity_coordination(conn)
-                if _active_count(conn) >= max_active_runs:
-                    self._capacity_blocked_claims += 1
-                    return None
-            row = conn.execute(
+            candidate = conn.execute(
                 f"""
-                with selected as (
-                    select candidate.run_id
-                    from runs as candidate
-                    where {_RUN_IS_CLAIMABLE}
-                    order by created_at, run_id
-                    for update skip locked
-                    limit 1
-                )
-                update runs as claimed
-                set owner_worker_id = %s,
-                    lease_until = current_timestamp + %s * interval '1 second',
-                    fencing_token = fencing_token + 1,
-                    claimed_at = current_timestamp,
-                    last_heartbeat_at = current_timestamp
-                from selected
-                where claimed.run_id = selected.run_id
-                returning claimed.run_id, claimed.owner_worker_id,
-                          claimed.fencing_token, claimed.lease_until
+                select candidate.run_id, candidate.owner_worker_id,
+                       candidate.delivery_attempt, candidate.state_json,
+                       candidate.current_sequence, candidate.schema_version,
+                       candidate.thread_id, candidate.turn_id,
+                       candidate.parent_run_id, candidate.fencing_token
+                from runs as candidate
+                where {_RUN_IS_CLAIMABLE}
+                order by candidate.created_at, candidate.run_id
+                for update skip locked
+                limit 1
                 """,
-                (worker_id, lease_seconds),
             ).fetchone()
-        return _ownership(row) if row else None
+            if _delivery_is_exhausted(candidate, max_run_delivery_attempts):
+                _mark_delivery_exhausted(
+                    conn,
+                    candidate,
+                    max_run_delivery_attempts=max_run_delivery_attempts,
+                )
+                return None
+            if max_active_runs is not None and _active_count(conn) >= max_active_runs:
+                self._capacity_blocked_claims += 1
+                return None
+            return self._claim_locked_candidate(
+                conn,
+                candidate,
+                worker_id=worker_id,
+                lease_seconds=lease_seconds,
+            )
+
+    def _claim_locked_candidate(
+        self,
+        conn,
+        candidate,
+        *,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> RunOwnership | None:
+        if candidate is None:
+            return None
+        previous_worker_id = str(candidate[1]) if candidate[1] is not None else None
+        delivery_attempt = int(candidate[2])
+        takeover = previous_worker_id is not None
+        next_attempt = (
+            delivery_attempt + 1
+            if takeover
+            else 1
+            if delivery_attempt == 0
+            else delivery_attempt
+        )
+        row = conn.execute(
+            """
+            update runs
+            set owner_worker_id = %s,
+                lease_until = current_timestamp + %s * interval '1 second',
+                fencing_token = fencing_token + 1,
+                claimed_at = current_timestamp,
+                last_heartbeat_at = current_timestamp,
+                delivery_attempt = %s,
+                last_delivery_failure = case
+                    when %s then 'lease_expired' else last_delivery_failure end,
+                last_delivery_failed_at = case
+                    when %s then current_timestamp else last_delivery_failed_at end,
+                last_delivery_worker_id = case
+                    when %s then %s else last_delivery_worker_id end,
+                last_delivery_fencing_token = case
+                    when %s then %s else last_delivery_fencing_token end
+            where run_id = %s
+            returning run_id, owner_worker_id, fencing_token, lease_until, delivery_attempt
+            """,
+            (
+                worker_id,
+                lease_seconds,
+                next_attempt,
+                takeover,
+                takeover,
+                takeover,
+                previous_worker_id,
+                takeover,
+                int(candidate[9]),
+                candidate[0],
+            ),
+        ).fetchone()
+        return _ownership(row, takeover=takeover)
 
     def _capacity_snapshot(
         self, max_queued_runs: int | None, max_active_runs: int | None
@@ -581,7 +676,10 @@ class PostgresRuntimeStore:
                     count(*) filter (where {_RUN_IS_QUEUED}),
                     count(*) filter (where {_RUN_IS_ACTIVE}),
                     extract(epoch from current_timestamp - min(created_at)
-                        filter (where {_RUN_IS_QUEUED}))
+                        filter (where {_RUN_IS_QUEUED})),
+                    count(*) filter (where failure_queued_at is not null),
+                    coalesce(avg(delivery_attempt), 0),
+                    coalesce(max(delivery_attempt), 0)
                 from runs as candidate
                 """
             ).fetchone()
@@ -593,6 +691,9 @@ class PostgresRuntimeStore:
             admission_rejections=self._admission_rejections,
             capacity_blocked_claims=self._capacity_blocked_claims,
             oldest_queued_age_seconds=float(row[2]) if row[2] is not None else None,
+            failure_queued_runs=int(row[3]),
+            mean_delivery_attempts=float(row[4]),
+            max_delivery_attempts=int(row[5]),
         )
 
     def _renew_lease(
@@ -607,7 +708,8 @@ class PostgresRuntimeStore:
                 where run_id = %s and owner_worker_id = %s and fencing_token = %s
                   and status in ('RUNNING', 'WAITING_CHILD')
                   and lease_until > current_timestamp
-                returning run_id, owner_worker_id, fencing_token, lease_until
+                returning run_id, owner_worker_id, fencing_token, lease_until,
+                          delivery_attempt
                 """,
                 (
                     lease_seconds,
@@ -644,7 +746,8 @@ class PostgresRuntimeStore:
         with self.pool.connection() as conn:
             row = conn.execute(
                 """
-                select run_id, owner_worker_id, fencing_token, lease_until
+                select run_id, owner_worker_id, fencing_token, lease_until,
+                       delivery_attempt
                 from runs where run_id = %s and owner_worker_id is not null
                 """,
                 (run_id,),
@@ -918,12 +1021,28 @@ select operation_id, idempotency_key, run_id, operation, status,
 from control_operations
 """
 
+_RUN_STATE_SELECT = """
+state_json, delivery_attempt, failure_queued_at, last_delivery_failure,
+last_delivery_failed_at, last_delivery_worker_id, last_delivery_fencing_token
+"""
+
 
 def _checkpoint(value: object) -> Checkpoint:
     data = value if isinstance(value, dict) else json.loads(str(value))
     if not isinstance(data, dict):
         raise ValueError("checkpoint payload must be a JSON object")
     return Checkpoint.from_dict(data)
+
+
+def _checkpoint_with_delivery(row: Sequence[object]) -> Checkpoint:
+    state = _checkpoint(row[0])
+    state.delivery_attempt = int(row[1])
+    state.failure_queued_at = _timestamp(row[2])
+    state.last_delivery_failure = _optional_text(row[3])
+    state.last_delivery_failed_at = _timestamp(row[4])
+    state.last_delivery_worker_id = _optional_text(row[5])
+    state.last_delivery_fencing_token = int(row[6]) if row[6] is not None else None
+    return state
 
 
 def _tool_record(row: Sequence[object]) -> ToolExecutionRecord:
@@ -1001,7 +1120,7 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _ownership(row) -> RunOwnership:
+def _ownership(row, *, takeover: bool | None = None) -> RunOwnership:
     lease_until = row[3]
     if lease_until.tzinfo is None:
         lease_until = lease_until.replace(tzinfo=UTC)
@@ -1011,7 +1130,108 @@ def _ownership(row) -> RunOwnership:
         worker_id=str(row[1]),
         fencing_token=token,
         lease_until=lease_until.astimezone(UTC),
-        takeover=token > 1,
+        takeover=token > 1 if takeover is None else takeover,
+        delivery_attempt=int(row[4]) if len(row) > 4 else 0,
+    )
+
+
+def _mark_delivery_exhausted(
+    conn,
+    candidate,
+    *,
+    max_run_delivery_attempts: int,
+) -> None:
+    state = _checkpoint(candidate[3])
+    expected_sequence = int(candidate[4])
+    now = _timestamp(conn.execute("select current_timestamp").fetchone()[0])
+    if now is None:  # pragma: no cover - PostgreSQL current_timestamp is non-null
+        raise RuntimeError("PostgreSQL did not return current time")
+    state.status = RunStatus.FAILED
+    state.delivery_attempt = int(candidate[2])
+    state.failure_queued_at = now
+    state.last_delivery_failure = "lease_expired"
+    state.last_delivery_failed_at = now
+    state.last_delivery_worker_id = str(candidate[1])
+    state.last_delivery_fencing_token = int(candidate[9])
+    state.error = RunError(
+        type=RUN_DELIVERY_EXHAUSTED,
+        message="automatic Run delivery allowance exhausted after Worker lease loss",
+        step="run_delivery",
+        metadata={
+            "delivery_attempt": state.delivery_attempt,
+            "max_run_delivery_attempts": max_run_delivery_attempts,
+            "last_delivery_failure": "lease_expired",
+            "last_delivery_worker_id": state.last_delivery_worker_id,
+            "last_delivery_fencing_token": state.last_delivery_fencing_token,
+        },
+    )
+    next_sequence = expected_sequence + 1
+    payload = state.to_dict()
+    payload["sequence"] = next_sequence
+    payload["updated_at"] = now
+    row = conn.execute(
+        """
+        update runs
+        set status = 'FAILED', current_sequence = %s, state_json = %s::jsonb,
+            updated_at = %s, runnable = false, owner_worker_id = null,
+            lease_until = null, fencing_token = fencing_token + 1,
+            failure_queued_at = %s, last_delivery_failure = 'lease_expired',
+            last_delivery_failed_at = %s, last_delivery_worker_id = %s,
+            last_delivery_fencing_token = %s
+        where run_id = %s and current_sequence = %s
+        returning run_id
+        """,
+        (
+            next_sequence,
+            _json(payload),
+            now,
+            now,
+            now,
+            state.last_delivery_worker_id,
+            state.last_delivery_fencing_token,
+            state.run_id,
+            expected_sequence,
+        ),
+    ).fetchone()
+    if row is None:
+        raise CheckpointConflictError(
+            f"stale delivery exhaustion transition for {state.run_id}"
+        )
+    conn.execute(
+        """
+        insert into checkpoints(
+            run_id, sequence, schema_version, thread_id, turn_id,
+            status, state_json, created_at
+        ) values (%s, %s, %s, %s, %s, 'FAILED', %s::jsonb, %s)
+        """,
+        (
+            state.run_id,
+            next_sequence,
+            state.schema_version,
+            state.thread_id,
+            state.turn_id,
+            _json(payload),
+            now,
+        ),
+    )
+    if candidate[8] is not None:
+        conn.execute(
+            """
+            update runs
+            set runnable = true
+            where run_id = %s and status = 'WAITING_CHILD'
+              and owner_worker_id is null
+            """,
+            (candidate[8],),
+        )
+
+
+def _delivery_is_exhausted(candidate, max_run_delivery_attempts: int | None) -> bool:
+    return bool(
+        candidate is not None
+        and candidate[1] is not None
+        and max_run_delivery_attempts is not None
+        and int(candidate[2]) >= max_run_delivery_attempts
     )
 
 
@@ -1176,7 +1396,13 @@ _SCHEMA_STATEMENTS = (
         lease_until timestamptz,
         fencing_token bigint not null default 0,
         claimed_at timestamptz,
-        last_heartbeat_at timestamptz
+        last_heartbeat_at timestamptz,
+        delivery_attempt integer not null default 0,
+        last_delivery_failure text,
+        last_delivery_failed_at timestamptz,
+        last_delivery_worker_id text,
+        last_delivery_fencing_token bigint,
+        failure_queued_at timestamptz
     )
     """,
     "create index if not exists idx_runs_thread on runs(thread_id, created_at, run_id)",
@@ -1289,8 +1515,15 @@ _OWNERSHIP_MIGRATION_STATEMENTS = (
     "alter table runs add column if not exists fencing_token bigint not null default 0",
     "alter table runs add column if not exists claimed_at timestamptz",
     "alter table runs add column if not exists last_heartbeat_at timestamptz",
+    "alter table runs add column if not exists delivery_attempt integer not null default 0",
+    "alter table runs add column if not exists last_delivery_failure text",
+    "alter table runs add column if not exists last_delivery_failed_at timestamptz",
+    "alter table runs add column if not exists last_delivery_worker_id text",
+    "alter table runs add column if not exists last_delivery_fencing_token bigint",
+    "alter table runs add column if not exists failure_queued_at timestamptz",
     """
     create index if not exists idx_runs_claimable
     on runs(runnable, status, lease_until, created_at, run_id)
     """,
+    "create index if not exists idx_runs_failure_queue on runs(failure_queued_at, run_id)",
 )

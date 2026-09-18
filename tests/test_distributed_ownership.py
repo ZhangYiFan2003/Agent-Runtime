@@ -15,6 +15,7 @@ from axiom.runtime.models import (
     BudgetLedgerRecord,
     Checkpoint,
     Interrupt,
+    RunError,
     RunStatus,
     ToolExecutionRecord,
     ToolExecutionStatus,
@@ -24,7 +25,7 @@ from axiom.runtime.ownership import (
     DistributedWorkerConfigurationError,
     OwnershipLostError,
 )
-from axiom.runtime.postgres import initialize_postgres_schema
+from axiom.runtime.postgres import RUN_DELIVERY_EXHAUSTED, initialize_postgres_schema
 from axiom.runtime.steps import NextAction, StepResult
 from axiom.runtime.storage import DurableStorage, create_durable_storage
 from axiom.tools import ToolRegistry
@@ -205,8 +206,51 @@ def test_capacity_schema_migrates_v2_with_coordination_only(postgres_storage):
             ).fetchall()
         }
 
-    assert version == 3
+    assert version == 4
     assert columns == {"singleton", "created_at"}
+
+
+@pytest.mark.postgres
+def test_schema_v3_additively_migrates_delivery_metadata(postgres_storage):
+    with postgres_storage._close.connection() as conn:
+        conn.execute("drop index if exists idx_runs_failure_queue")
+        for column in (
+            "failure_queued_at",
+            "last_delivery_worker_id",
+            "last_delivery_fencing_token",
+            "last_delivery_failed_at",
+            "last_delivery_failure",
+            "delivery_attempt",
+        ):
+            conn.execute(f"alter table runs drop column {column}")
+        conn.execute(
+            "update axiom_schema_versions set version = 3 where component = 'runtime'"
+        )
+
+    initialize_postgres_schema(postgres_storage._close)
+
+    with postgres_storage._close.connection() as conn:
+        version = conn.execute(
+            "select version from axiom_schema_versions where component = 'runtime'"
+        ).fetchone()[0]
+        columns = {
+            row[0]
+            for row in conn.execute(
+                """
+                select column_name from information_schema.columns
+                where table_schema = current_schema() and table_name = 'runs'
+                """
+            ).fetchall()
+        }
+    assert version == 4
+    assert {
+        "delivery_attempt",
+        "failure_queued_at",
+        "last_delivery_failure",
+        "last_delivery_failed_at",
+        "last_delivery_worker_id",
+        "last_delivery_fencing_token",
+    } <= columns
 
 
 @pytest.mark.postgres
@@ -316,14 +360,12 @@ def test_wait_releases_slot_and_resume_recompetes_for_capacity(postgres_storage)
         is None
     )
     assert asyncio.run(postgres_storage.runtime.release_lease(other, runnable=False))
-    assert (
-        asyncio.run(
-            postgres_storage.runtime.claim_run(
-                waiting.run_id, "worker-c", 30, max_active_runs=1
-            )
+    resumed_owner = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            waiting.run_id, "worker-c", 30, max_active_runs=1
         )
-        is not None
     )
+    assert resumed_owner is not None and resumed_owner.delivery_attempt == 1
 
 
 @pytest.mark.postgres
@@ -441,6 +483,289 @@ def test_takeover_increments_fencing_token(postgres_storage):
     _expire(postgres_storage, "run-owned")
     second = asyncio.run(postgres_storage.runtime.claim_run("run-owned", "worker-b", 30))
     assert second is not None and second.fencing_token == first.fencing_token + 1
+
+
+@pytest.mark.postgres
+def test_delivery_attempt_counts_initial_and_expired_takeover_only(postgres_storage):
+    state = asyncio.run(_runnable(postgres_storage, "run-delivery-count"))
+    first = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            state.run_id, "worker-a", 30, max_run_delivery_attempts=3
+        )
+    )
+    assert first is not None and first.delivery_attempt == 1 and not first.takeover
+
+    assert asyncio.run(postgres_storage.runtime.release_lease(first, runnable=True))
+    resumed = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            state.run_id, "worker-a", 30, max_run_delivery_attempts=3
+        )
+    )
+    assert resumed is not None and resumed.delivery_attempt == 1 and not resumed.takeover
+
+    _expire(postgres_storage, state.run_id)
+    redelivered = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            state.run_id, "worker-b", 30, max_run_delivery_attempts=3
+        )
+    )
+    assert redelivered is not None
+    assert redelivered.delivery_attempt == 2 and redelivered.takeover
+    loaded = asyncio.run(postgres_storage.runtime.load(state.run_id))
+    assert loaded is not None and loaded.delivery_attempt == 2
+    assert loaded.last_delivery_failure == "lease_expired"
+    assert loaded.last_delivery_worker_id == "worker-a"
+    assert loaded.last_delivery_fencing_token == resumed.fencing_token
+
+
+@pytest.mark.postgres
+def test_approval_resume_does_not_consume_redelivery_allowance(
+    postgres_storage, tmp_path
+):
+    state = asyncio.run(_runnable(postgres_storage, "run-approval-resume"))
+    first = asyncio.run(
+        postgres_storage.runtime.claim_run(state.run_id, "worker-a", 30, None, 2)
+    )
+    assert first is not None and first.delivery_attempt == 1
+    state.status = RunStatus.WAITING_APPROVAL
+    state.interrupt = Interrupt(
+        kind="tool_approval",
+        reason="approval required",
+        invocation_id="approval-call",
+    )
+    asyncio.run(postgres_storage.runtime.save(state, ownership=first))
+    assert asyncio.run(postgres_storage.runtime.release_lease(first, runnable=False))
+
+    config = AxiomConfig()
+    config.policy.audit_log_path = str(tmp_path / "audit.jsonl")
+    runtime = DurableAgentRuntime(
+        llm_client=_TakeoverLlm(),
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=config,
+        store=postgres_storage.runtime,
+    )
+    asyncio.run(runtime.queue_resume(state.run_id, decision="approve"))
+    resumed = asyncio.run(
+        postgres_storage.runtime.claim_run(state.run_id, "worker-b", 30, None, 2)
+    )
+    assert resumed is not None and resumed.delivery_attempt == 1
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("terminal", [RunStatus.COMPLETED, RunStatus.FAILED])
+def test_authoritative_terminal_outcome_is_not_redelivered(postgres_storage, terminal):
+    state = asyncio.run(_runnable(postgres_storage, f"run-{terminal.value.lower()}"))
+    owner = asyncio.run(
+        postgres_storage.runtime.claim_run(state.run_id, "worker-a", 30, None, 1)
+    )
+    assert owner is not None
+    state.status = terminal
+    state.error = (
+        RunError(type="DETERMINISTIC_FAILURE", message="task outcome")
+        if terminal == RunStatus.FAILED
+        else None
+    )
+    asyncio.run(postgres_storage.runtime.save(state, ownership=owner))
+
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(state.run_id, "worker-b", 30, None, 1)
+        )
+        is None
+    )
+    loaded = asyncio.run(postgres_storage.runtime.load(state.run_id))
+    assert loaded is not None and loaded.failure_queued_at is None
+
+
+@pytest.mark.postgres
+def test_parent_and_child_delivery_attempts_are_independent(postgres_storage):
+    parent = asyncio.run(_runnable(postgres_storage, "delivery-parent"))
+    child = Checkpoint.create(
+        thread_id=parent.thread_id,
+        run_id="delivery-child",
+        input="child",
+        parent_run_id=parent.run_id,
+    )
+    asyncio.run(postgres_storage.runtime.save(child))
+    asyncio.run(postgres_storage.runtime.mark_runnable(child.run_id))
+    parent_owner = asyncio.run(
+        postgres_storage.runtime.claim_run(parent.run_id, "parent-worker", 30, None, 3)
+    )
+    child_owner = asyncio.run(
+        postgres_storage.runtime.claim_run(child.run_id, "child-worker-a", 30, None, 3)
+    )
+    assert parent_owner is not None and parent_owner.delivery_attempt == 1
+    assert child_owner is not None and child_owner.delivery_attempt == 1
+    _expire(postgres_storage, child.run_id)
+    child_takeover = asyncio.run(
+        postgres_storage.runtime.claim_run(child.run_id, "child-worker-b", 30, None, 3)
+    )
+    loaded_parent = asyncio.run(postgres_storage.runtime.load(parent.run_id))
+    runs = asyncio.run(postgres_storage.runtime.list(parent.thread_id))
+    assert child_takeover is not None and child_takeover.delivery_attempt == 2
+    assert loaded_parent is not None and loaded_parent.delivery_attempt == 1
+    assert [run.run_id for run in runs].count(child.run_id) == 1
+
+
+@pytest.mark.postgres
+def test_delivery_exhaustion_is_terminal_and_leaves_no_capacity(postgres_storage):
+    state = asyncio.run(_runnable(postgres_storage, "run-delivery-exhausted"))
+    owner = None
+    for attempt in range(1, 4):
+        owner = asyncio.run(
+            postgres_storage.runtime.claim_run(
+                state.run_id,
+                f"worker-{attempt}",
+                30,
+                max_run_delivery_attempts=3,
+            )
+        )
+        assert owner is not None and owner.delivery_attempt == attempt
+        _expire(postgres_storage, state.run_id)
+
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(
+                state.run_id, "worker-4", 30, max_run_delivery_attempts=3
+            )
+        )
+        is None
+    )
+    exhausted = asyncio.run(postgres_storage.runtime.load(state.run_id))
+    assert exhausted is not None and exhausted.status == RunStatus.FAILED
+    assert exhausted.error is not None and exhausted.error.type == RUN_DELIVERY_EXHAUSTED
+    assert exhausted.delivery_attempt == 3 and exhausted.failure_queued_at is not None
+    snapshot = asyncio.run(postgres_storage.runtime.capacity_snapshot())
+    assert snapshot.queued_runs == snapshot.active_runs == 0
+    assert snapshot.failure_queued_runs == 1
+    assert asyncio.run(postgres_storage.runtime.claim_next("worker-5", 30, None, 3)) is None
+
+
+@pytest.mark.postgres
+def test_exhaustion_transition_is_not_blocked_by_active_capacity(postgres_storage):
+    poison = asyncio.run(_runnable(postgres_storage, "run-poison-at-capacity"))
+    holder = asyncio.run(_runnable(postgres_storage, "run-capacity-holder"))
+    poison_owner = asyncio.run(
+        postgres_storage.runtime.claim_run(poison.run_id, "worker-poison", 30, None, 1)
+    )
+    holder_owner = asyncio.run(
+        postgres_storage.runtime.claim_run(holder.run_id, "worker-holder", 30, None, 1)
+    )
+    assert poison_owner is not None and holder_owner is not None
+    _expire(postgres_storage, poison.run_id)
+
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(
+                poison.run_id,
+                "worker-next",
+                30,
+                max_active_runs=1,
+                max_run_delivery_attempts=1,
+            )
+        )
+        is None
+    )
+    exhausted = asyncio.run(postgres_storage.runtime.load(poison.run_id))
+    snapshot = asyncio.run(
+        postgres_storage.runtime.capacity_snapshot(max_active_runs=1)
+    )
+    assert exhausted is not None and exhausted.status == RunStatus.FAILED
+    assert snapshot.active_runs == 1
+    assert snapshot.queued_runs == 0
+    assert snapshot.failure_queued_runs == 1
+
+
+@pytest.mark.postgres
+def test_final_allowed_delivery_is_claimed_once_under_concurrency(postgres_storage):
+    state = asyncio.run(_runnable(postgres_storage, "run-final-delivery"))
+    first = asyncio.run(
+        postgres_storage.runtime.claim_run(state.run_id, "worker-a", 30, None, 3)
+    )
+    assert first is not None
+    _expire(postgres_storage, state.run_id)
+    second = asyncio.run(
+        postgres_storage.runtime.claim_run(state.run_id, "worker-b", 30, None, 3)
+    )
+    assert second is not None and second.delivery_attempt == 2
+    _expire(postgres_storage, state.run_id)
+
+    async def race():
+        return await asyncio.gather(
+            postgres_storage.runtime.claim_run(state.run_id, "worker-c", 30, None, 3),
+            postgres_storage.runtime.claim_run(state.run_id, "worker-d", 30, None, 3),
+        )
+
+    winners = [owner for owner in asyncio.run(race()) if owner is not None]
+    assert len(winners) == 1 and winners[0].delivery_attempt == 3
+
+
+@pytest.mark.postgres
+def test_concurrent_exhaustion_converges_once_and_fences_stale_worker(postgres_storage):
+    state = asyncio.run(_runnable(postgres_storage, "run-exhaustion-race"))
+    owners = []
+    for index in range(3):
+        owner = asyncio.run(
+            postgres_storage.runtime.claim_run(
+                state.run_id, f"worker-{index}", 30, None, 3
+            )
+        )
+        assert owner is not None
+        owners.append(owner)
+        _expire(postgres_storage, state.run_id)
+    stale = deepcopy(state)
+
+    async def race():
+        return await asyncio.gather(
+            postgres_storage.runtime.claim_run(state.run_id, "worker-x", 30, None, 3),
+            postgres_storage.runtime.claim_run(state.run_id, "worker-y", 30, None, 3),
+        )
+
+    assert asyncio.run(race()) == [None, None]
+    exhausted = asyncio.run(postgres_storage.runtime.load(state.run_id))
+    assert exhausted is not None and exhausted.status == RunStatus.FAILED
+    assert exhausted.sequence == state.sequence + 1
+    with pytest.raises(OwnershipLostError):
+        asyncio.run(postgres_storage.runtime.save(stale, ownership=owners[-1]))
+
+
+@pytest.mark.postgres
+def test_worker_failures_converge_to_delivery_exhaustion(postgres_storage):
+    state = asyncio.run(_runnable(postgres_storage, "run-worker-poison"))
+
+    class CrashingRuntime:
+        async def resume(self, _run_id):
+            raise RuntimeError("simulated Worker process failure")
+
+    for worker_id in ("worker-a", "worker-b"):
+        worker = DistributedRunWorker(
+            store=postgres_storage.runtime,
+            runtime_factory=lambda _ownership: CrashingRuntime(),
+            worker_id=worker_id,
+            lease_seconds=30,
+            heartbeat_interval_seconds=10,
+            max_run_delivery_attempts=2,
+        )
+        with pytest.raises(RuntimeError, match="simulated Worker"):
+            asyncio.run(worker.run_once())
+        _expire(postgres_storage, state.run_id)
+
+    final_worker = DistributedRunWorker(
+        store=postgres_storage.runtime,
+        runtime_factory=lambda _ownership: pytest.fail("exhausted Run executed again"),
+        worker_id="worker-c",
+        lease_seconds=30,
+        heartbeat_interval_seconds=10,
+        max_run_delivery_attempts=2,
+    )
+    assert asyncio.run(final_worker.run_once()) is None
+    exhausted = asyncio.run(postgres_storage.runtime.load(state.run_id))
+    assert exhausted is not None
+    assert exhausted.status == RunStatus.FAILED
+    assert exhausted.error is not None
+    assert exhausted.error.type == RUN_DELIVERY_EXHAUSTED
 
 
 @pytest.mark.postgres

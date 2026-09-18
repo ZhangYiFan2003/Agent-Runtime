@@ -83,3 +83,23 @@ def test_capacity_limits_must_be_positive(tmp_path):
             overrides={"capacity": {"max_active_runs": 0}},
             env={},
         )
+
+
+def test_run_delivery_limit_is_optional_and_configurable(tmp_path):
+    default = load_config(project_root=tmp_path, env={})
+    configured = load_config(
+        project_root=tmp_path,
+        env={"AXIOM_MAX_RUN_DELIVERY_ATTEMPTS": "3"},
+    )
+
+    assert default.worker.max_run_delivery_attempts is None
+    assert configured.worker.max_run_delivery_attempts == 3
+
+
+def test_run_delivery_limit_must_be_positive(tmp_path):
+    with pytest.raises(ValueError, match="max_run_delivery_attempts"):
+        load_config(
+            project_root=tmp_path,
+            overrides={"worker": {"max_run_delivery_attempts": 0}},
+            env={},
+        )

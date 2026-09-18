@@ -1,8 +1,10 @@
 # Durable Recovery Fault-Injection Evaluation
 
-The matrix maps maintained deterministic crash/restart tests into 21 named
-ReAct, Plan, and Multi-Agent scenarios. Each runs twice by default, producing
-42 executions without a model provider or timing races.
+The matrix maps maintained deterministic crash/restart tests into 25 named
+ReAct, Plan, Multi-Agent, and distributed-redelivery scenarios. Each runs twice
+by default, producing 50 executions without a model provider or timing races.
+The distributed-redelivery cases require `AXIOM_TEST_POSTGRES_DSN` and a real
+PostgreSQL database; they are not mock concurrency evidence.
 
 ```powershell
 uv run python -m benchmarks.recovery.run_fault_injection
