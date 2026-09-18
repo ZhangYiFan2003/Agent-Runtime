@@ -5,6 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from axiom.policy.network import NetworkPolicy, NetworkPolicyError
 from axiom.policy.path_guard import PathGuard, PathPolicyError
 
 
@@ -65,6 +66,26 @@ class DefaultPermissionPolicy:
     def __init__(self, workspace: str | Path, *, hitl_mode: str = "auto") -> None:
         self.workspace = Path(workspace).resolve()
         self.hitl_mode = hitl_mode
+        self.network_policy = NetworkPolicy()
+        self.sensitive_path_patterns = (
+            ".env",
+            ".env.*",
+            "*.pem",
+            "*.key",
+            "*credentials*",
+            "*token*",
+        )
+
+    @classmethod
+    def from_config(cls, workspace: str | Path, config: Any) -> DefaultPermissionPolicy:
+        policy = cls(workspace, hitl_mode=config.policy.hitl_mode)
+        policy.network_policy = NetworkPolicy(
+            access=config.policy.network_access,
+            allowed_hosts=tuple(config.policy.allowed_network_hosts),
+            deny_private_addresses=config.policy.deny_private_networks,
+        )
+        policy.sensitive_path_patterns = tuple(config.policy.sensitive_path_patterns)
+        return policy
 
     async def evaluate(self, request: PermissionRequest) -> PermissionDecision:
         capabilities = set(request.capabilities)
@@ -82,12 +103,33 @@ class DefaultPermissionPolicy:
             Capability.FILESYSTEM_WRITE.value,
         }
         if capabilities & filesystem:
+            sensitive = self._sensitive_path(request.resource_paths)
+            if sensitive is not None:
+                return PermissionDecision(
+                    PermissionAction.DENY,
+                    f"sensitive path is protected by policy: {sensitive}",
+                    "filesystem.sensitive_path",
+                )
             outside = self._outside_workspace(request.resource_paths)
             if outside is not None:
                 return PermissionDecision(
                     PermissionAction.DENY,
                     f"filesystem path is outside workspace: {outside}",
                     "filesystem.outside_workspace",
+                )
+
+        if capabilities & {Capability.NETWORK_READ.value, Capability.NETWORK_WRITE.value}:
+            try:
+                self.network_policy.validate_arguments(request.arguments)
+                if self.network_policy.access == "allowlist" and not _has_url(request.arguments):
+                    raise NetworkPolicyError("network target is missing from the tool request")
+                if self.network_policy.access == "disabled":
+                    raise NetworkPolicyError("network access is disabled by policy")
+            except NetworkPolicyError as exc:
+                return PermissionDecision(
+                    PermissionAction.DENY,
+                    str(exc),
+                    "network.policy",
                 )
 
         if self.hitl_mode == "always":
@@ -137,3 +179,24 @@ class DefaultPermissionPolicy:
             except PathPolicyError:
                 return value
         return None
+
+    def _sensitive_path(self, paths: tuple[str, ...]) -> str | None:
+        from fnmatch import fnmatch
+
+        for value in paths:
+            name = Path(value).name.casefold()
+            if any(fnmatch(name, pattern.casefold()) for pattern in self.sensitive_path_patterns):
+                return value
+        return None
+
+
+def _has_url(value: object) -> bool:
+    if isinstance(value, dict):
+        return any(
+            _has_url(child)
+            for key, child in value.items()
+            if str(key).casefold() in {"url", "uri"}
+        )
+    if isinstance(value, list):
+        return any(_has_url(child) for child in value)
+    return isinstance(value, str) and "://" in value

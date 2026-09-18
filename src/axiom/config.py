@@ -225,6 +225,12 @@ class PolicyConfig:
         ]
     )
     audit_log_path: str = "~/.axiom/audit.jsonl"
+    network_access: str = "public"
+    allowed_network_hosts: list[str] = field(default_factory=list)
+    deny_private_networks: bool = True
+    sensitive_path_patterns: list[str] = field(
+        default_factory=lambda: [".env", ".env.*", "*.pem", "*.key", "*credentials*", "*token*"]
+    )
 
 
 @dataclass(slots=True)
@@ -351,6 +357,12 @@ def load_config(
             raise ValueError(f"traffic.{name} must be positive or null")
     if config.traffic.aging_interval_seconds <= 0 or config.traffic.aging_boost_cap < 0:
         raise ValueError("traffic aging interval must be positive and boost cap non-negative")
+    if config.policy.network_access not in {"disabled", "public", "allowlist"}:
+        raise ValueError("policy.network_access must be disabled, public, or allowlist")
+    if config.policy.network_access == "allowlist" and not any(
+        host.strip() for host in config.policy.allowed_network_hosts
+    ):
+        raise ValueError("policy.allowed_network_hosts is required for allowlist network access")
     return config
 
 
@@ -421,6 +433,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     worker = result.setdefault("worker", {})
     capacity = result.setdefault("capacity", {})
     traffic = result.setdefault("traffic", {})
+    policy = result.setdefault("policy", {})
 
     storage_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_STORAGE_BACKEND", "backend", str),
@@ -586,6 +599,18 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
 
     if env.get("AXIOM_TUI") == "true":
         result["render_mode"] = "inline"
+
+    network_access = env.get("AXIOM_NETWORK_ACCESS")
+    if network_access in {"disabled", "public", "allowlist"}:
+        policy["network_access"] = network_access
+    network_hosts = env.get("AXIOM_NETWORK_ALLOWED_HOSTS")
+    if network_hosts is not None:
+        policy["allowed_network_hosts"] = [
+            host.strip() for host in network_hosts.split(",") if host.strip()
+        ]
+    deny_private = env.get("AXIOM_NETWORK_DENY_PRIVATE")
+    if deny_private in {"true", "false"}:
+        policy["deny_private_networks"] = deny_private == "true"
 
     for env_key, feature_key in [
         ("AXIOM_MCP", "mcp"),

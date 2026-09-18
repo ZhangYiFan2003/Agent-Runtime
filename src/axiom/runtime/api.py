@@ -21,6 +21,7 @@ from axiom.bootstrap import build_tool_registry
 from axiom.config import AxiomConfig
 from axiom.llm import create_llm_client
 from axiom.memory import MemoryService, SummaryPolicy
+from axiom.policy import redact_secrets
 from axiom.runtime.capacity import AdmissionRejectedError
 from axiom.runtime.checkpoints import (
     CheckpointConflictError,
@@ -803,12 +804,14 @@ class RuntimeApiServer:
                     delta = str(event.get("text") or "")
                     text += delta
                 elif event_type == "tool_call":
-                    await self._append_event_async(thread_id, "tool_call", _jsonable(event))
+                    await self._append_event_async(
+                        thread_id, "tool_call", redact_secrets(_jsonable(event))
+                    )
                 elif event_type == "tool_result":
                     event_id = await self._append_event_async(
                         thread_id,
                         "tool_result",
-                        _jsonable(event),
+                        redact_secrets(_jsonable(event)),
                     )
                     self._derive_tool_result_memory(
                         thread_id,
@@ -818,7 +821,9 @@ class RuntimeApiServer:
                         source_event_id=event_id,
                     )
                 elif event_type == "error":
-                    await self._append_event_async(thread_id, "error", _jsonable(event))
+                    await self._append_event_async(
+                        thread_id, "error", redact_secrets(_jsonable(event))
+                    )
                 elif event_type == "done":
                     done_payload = _jsonable(event)
         except Exception as exc:
@@ -1366,7 +1371,7 @@ class RuntimeApiServer:
 
     def _runtime_event_sink(self, thread_id: str):
         async def emit(event_type: str, payload: dict[str, Any]) -> None:
-            enriched = await self._enrich_runtime_event(thread_id, payload)
+            enriched = redact_secrets(await self._enrich_runtime_event(thread_id, payload))
             await self._append_event_async(thread_id, event_type, enriched)
             hierarchy = {
                 key: enriched.get(key)
@@ -1386,7 +1391,7 @@ class RuntimeApiServer:
                     {
                         **hierarchy,
                         "name": payload.get("tool_name"),
-                        "input": payload.get("arguments", {}),
+                        "input": redact_secrets(payload.get("arguments", {})),
                         "tool_call_id": payload.get("tool_call_id"),
                         "invocation_id": payload.get("invocation_id"),
                     },

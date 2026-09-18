@@ -1,22 +1,34 @@
 from __future__ import annotations
 
 import html
-import ipaddress
 import re
-import socket
-from urllib.parse import urlparse
 
 import httpx
 
-
-class NetworkPolicyError(ValueError):
-    pass
+from axiom.policy.network import NetworkPolicy, NetworkPolicyError
 
 
 async def fetch_url(url: str, max_length: int = 10_000, timeout: float = 15.0) -> str:
-    _validate_public_url(url)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        response = await client.get(url, headers={"user-agent": "axiom-agent/0.1.0"})
+    policy = NetworkPolicy()
+    policy.validate_url(url)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        response = None
+        current_url = url
+        for _ in range(5):
+            policy.validate_url(current_url)
+            response = await client.get(
+                current_url,
+                headers={"user-agent": "axiom-agent/0.1.0"},
+            )
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                break
+            location = response.headers.get("location")
+            if not location:
+                break
+            current_url = str(response.url.join(location))
+        else:
+            raise NetworkPolicyError("too many redirects")
+        assert response is not None
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
         text = response.text
@@ -33,33 +45,3 @@ def extract_text_from_html(raw_html: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
-
-
-def _validate_public_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise NetworkPolicyError("only http/https URLs are allowed")
-    if not parsed.hostname:
-        raise NetworkPolicyError("URL must include a hostname")
-    host = parsed.hostname
-    try:
-        ip = ipaddress.ip_address(host)
-        _reject_private_ip(ip)
-        return
-    except ValueError:
-        pass
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror as exc:
-        raise NetworkPolicyError(f"cannot resolve host: {host}") from exc
-    for info in infos:
-        address = info[4][0]
-        try:
-            _reject_private_ip(ipaddress.ip_address(address))
-        except ValueError:
-            continue
-
-
-def _reject_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
-        raise NetworkPolicyError("URL resolves to a private or local address")

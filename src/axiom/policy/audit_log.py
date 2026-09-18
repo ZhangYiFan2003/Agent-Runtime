@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SENSITIVE_KEYS = ("token", "key", "password", "secret", "authorization", "bearer")
+from axiom.policy.redaction import redact_secrets
 
 
 class AuditLog:
@@ -25,7 +25,7 @@ class AuditLog:
         event = {
             "timestamp": datetime.now(UTC).isoformat(),
             "tool_name": tool_name,
-            "input": self._redact(input_data),
+            "input": redact_secrets(input_data),
             "outcome": outcome,
             "approver": approver,
             "cwd": cwd,
@@ -44,16 +44,3 @@ class AuditLog:
             except json.JSONDecodeError:
                 continue
         return events
-
-    def _redact(self, value: Any) -> Any:
-        if isinstance(value, dict):
-            redacted = {}
-            for key, item in value.items():
-                if any(marker in key.lower() for marker in SENSITIVE_KEYS):
-                    redacted[key] = "***"
-                else:
-                    redacted[key] = self._redact(item)
-            return redacted
-        if isinstance(value, list):
-            return [self._redact(item) for item in value]
-        return value

@@ -223,9 +223,8 @@ class ToolExecutor:
                 "invocation.preauthorized",
             )
         else:
-            policy = context.permission_policy or DefaultPermissionPolicy(
-                request.workspace,
-                hitl_mode=context.config.policy.hitl_mode,
+            policy = context.permission_policy or DefaultPermissionPolicy.from_config(
+                request.workspace, context.config
             )
             decision = await policy.evaluate(request)
         if context.permission_event_sink is not None:

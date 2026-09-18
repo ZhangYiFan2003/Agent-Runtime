@@ -291,6 +291,7 @@ def test_outside_workspace_is_denied_without_execution(tmp_path):
 
         tool_messages = [str(item.content) for item in completed.messages if item.role == "tool"]
         assert completed.status == RunStatus.COMPLETED
+        assert completed.delivery_attempt == 0
         assert any("outside workspace" in message for message in tool_messages)
         assert executions == 0
 
