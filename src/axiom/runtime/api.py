@@ -97,6 +97,8 @@ class RuntimeApiServer:
         retry_policy: RetryPolicy | None = None,
         active_run_supervisor: ActiveRunSupervisor | None = None,
         shutdown_timeout: float = 5.0,
+        sse_poll_interval: float = 0.25,
+        sse_keepalive_interval: float = 15.0,
     ):
         self.cwd = str(Path(cwd).resolve())
         self.config = config
@@ -149,6 +151,11 @@ class RuntimeApiServer:
         self.retry_policy = retry_policy or RetryPolicy.from_config(config.dependency)
         self.active_run_supervisor = active_run_supervisor or ActiveRunSupervisor()
         self.shutdown_timeout = max(0.0, shutdown_timeout)
+        self.sse_poll_interval = max(0.01, sse_poll_interval)
+        self.sse_keepalive_interval = max(self.sse_poll_interval, sse_keepalive_interval)
+        self._active_sse_followers = 0
+        self._sse_reconnects = 0
+        self._sse_metrics_lock = threading.Lock()
         self.task_manager = task_manager or DurableTaskManager(self.data_dir / "tasks.db")
         self.memory_service = memory_service or MemoryService(
             self.data_dir / "memory.db",
@@ -340,6 +347,7 @@ class RuntimeApiServer:
                     "workers": self.workers,
                     "database": "ok" if self.repository.database_ok() else "error",
                     "storage_backend": self.storage_backend,
+                    "sse": self._sse_health(),
                     **({"capacity": capacity} if capacity is not None else {}),
                 },
             )
@@ -361,12 +369,32 @@ class RuntimeApiServer:
                 if not message:
                     _send_json(request, 400, {"error": "message is required"})
                     return
-                lock = self._thread_lock(thread_id)
-                if not lock.acquire(blocking=False):
+                submission_key = _idempotency_key(request, body)
+                idempotent_submission = submission_key is not None
+                if idempotent_submission and not (
+                    self.storage_backend == "postgres"
+                    and self.config.worker.distributed_enabled
+                ):
+                    raise ApiError(
+                        "submission_idempotency_requires_postgres",
+                        "root submission idempotency requires distributed PostgreSQL mode",
+                        422,
+                    )
+                lock = None if idempotent_submission else self._thread_lock(thread_id)
+                if lock is not None and not lock.acquire(blocking=False):
                     _send_json(request, 409, {"error": "thread turn already running"})
                     return
                 try:
-                    result = asyncio.run(self._run_turn(thread_id, message))
+                    if submission_key is None:
+                        result = asyncio.run(self._run_turn(thread_id, message))
+                    else:
+                        result = asyncio.run(
+                            self._run_turn(
+                                thread_id,
+                                message,
+                                idempotency_key=submission_key,
+                            )
+                        )
                     response_status = (
                         202
                         if result.get("queued")
@@ -380,11 +408,15 @@ class RuntimeApiServer:
                     )
                     _send_json(request, response_status, result)
                 finally:
-                    lock.release()
+                    if lock is not None:
+                        lock.release()
             elif method == "GET" and path.startswith("/v1/threads/") and path.endswith("/events"):
                 thread_id = path.split("/")[3]
                 after_id = _first_int(query.get("after_id"))
+                if after_id is None:
+                    after_id = _header_int(request, "Last-Event-ID")
                 run_filter = _first_text(query.get("run_id"))
+                follow = _first_bool(query.get("follow"))
                 if not self.repository.thread_exists(thread_id):
                     _send_json(request, 404, {"error": "thread not found"})
                     return
@@ -393,6 +425,7 @@ class RuntimeApiServer:
                     thread_id,
                     after_id=after_id,
                     run_id=run_filter,
+                    follow=follow,
                 )
             elif method == "GET" and path == "/v1/runs":
                 runs = asyncio.run(self._list_run_views())
@@ -477,6 +510,15 @@ class RuntimeApiServer:
                     requested_operation=ControlOperationName.CANCEL,
                 )
                 _send_json(request, 200, result)
+            elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/requeue"):
+                run_id = path.split("/")[3]
+                result = self._execute_control_operation(
+                    request,
+                    run_id,
+                    body,
+                    requested_operation=ControlOperationName.REQUEUE,
+                )
+                _send_json(request, 202, result)
             elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/interrupt"):
                 run_id = path.split("/")[3]
                 reason = str(body.get("reason") or "manual interrupt")
@@ -542,7 +584,20 @@ class RuntimeApiServer:
             return {"status": "unavailable"}
         return asdict(value)
 
-    async def _run_turn(self, thread_id: str, message: str) -> dict[str, Any]:
+    def _sse_health(self) -> dict[str, int]:
+        with self._sse_metrics_lock:
+            return {
+                "active_followers": self._active_sse_followers,
+                "reconnects": self._sse_reconnects,
+            }
+
+    async def _run_turn(
+        self,
+        thread_id: str,
+        message: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         history_events = await self._list_events_async(thread_id)
         history = self.memory_service.history_from_runtime_events(history_events)
         turn_id = f"turn_{uuid4().hex}"
@@ -556,20 +611,8 @@ class RuntimeApiServer:
             turn_id=turn_id,
             run_id=run_id,
         )
-        await self._append_event_async(
-            thread_id,
-            "turn.started",
-            {"turn_id": turn_id, "run_id": run_id, "message_chars": len(message)},
-        )
-        user_event_id = await self._append_event_async(
-            thread_id, "user.message", {"text": message}
-        )
-        self._derive_conversation_memory(
-            thread_id,
-            role="user",
-            content=message,
-            event_id=user_event_id,
-        )
+        if idempotency_key is None:
+            await self._record_user_turn(thread_id, turn_id, run_id, message)
         engine = await self._engine(context)
         run_lock = self._run_lock(run_id)
         if not run_lock.acquire(blocking=False):
@@ -582,19 +625,46 @@ class RuntimeApiServer:
                     execution_strategy=_execution_strategy_name(engine.config.prompt.agent_mode),
                 )
                 if self.config.worker.distributed_enabled:
-                    state = await runtime.submit(
-                        thread_id=thread_id,
-                        input=message,
-                        history=history,
-                        run_id=run_id,
-                        turn_id=turn_id,
-                        max_queued_runs=self.config.capacity.max_queued_runs,
-                    )
+                    if idempotency_key is None:
+                        state = await runtime.submit(
+                            thread_id=thread_id,
+                            input=message,
+                            history=history,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            max_queued_runs=self.config.capacity.max_queued_runs,
+                        )
+                    else:
+                        state, created = await runtime.submit_idempotent(
+                            thread_id=thread_id,
+                            input=message,
+                            history=history,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            idempotency_key=idempotency_key,
+                            max_queued_runs=self.config.capacity.max_queued_runs,
+                        )
+                        if created:
+                            await self._record_user_turn(
+                                thread_id,
+                                state.turn_id,
+                                state.run_id,
+                                message,
+                            )
+                            await self._append_event_async(
+                                thread_id,
+                                "run.admitted",
+                                {
+                                    "run_id": state.run_id,
+                                    "turn_id": state.turn_id,
+                                    "status": state.status.value,
+                                },
+                            )
                     return {
                         "thread_id": state.thread_id,
                         "run_id": state.run_id,
                         "status": state.status.value,
-                        "queued": True,
+                        "queued": not state.finished,
                     }
                 state = await runtime.start(
                     thread_id=thread_id,
@@ -614,6 +684,24 @@ class RuntimeApiServer:
             )
         finally:
             run_lock.release()
+
+    async def _record_user_turn(
+        self, thread_id: str, turn_id: str, run_id: str, message: str
+    ) -> None:
+        await self._append_event_async(
+            thread_id,
+            "turn.started",
+            {"turn_id": turn_id, "run_id": run_id, "message_chars": len(message)},
+        )
+        user_event_id = await self._append_event_async(
+            thread_id, "user.message", {"text": message, "run_id": run_id, "turn_id": turn_id}
+        )
+        self._derive_conversation_memory(
+            thread_id,
+            role="user",
+            content=message,
+            event_id=user_event_id,
+        )
 
     async def _run_legacy_turn(
         self,
@@ -815,7 +903,9 @@ class RuntimeApiServer:
                 request=normalized,
             )
             self._validate_control_operation(state, operation, normalized)
-            if operation == ControlOperationName.CANCEL:
+            if operation == ControlOperationName.REQUEUE:
+                result = asyncio.run(self._requeue_failed_run(state))
+            elif operation == ControlOperationName.CANCEL:
                 result = asyncio.run(self._cancel_run(state))
             else:
                 decision = (
@@ -918,6 +1008,22 @@ class RuntimeApiServer:
         operation: ControlOperationName,
         request: dict[str, Any],
     ) -> None:
+        if operation == ControlOperationName.REQUEUE:
+            if not (
+                state.status == RunStatus.FAILED
+                and state.error is not None
+                and state.error.type == "RUN_DELIVERY_EXHAUSTED"
+                and state.failure_queued_at is not None
+            ):
+                raise ApiError(
+                    "invalid_run_transition",
+                    "only a delivery-exhausted Run may be manually requeued",
+                    409,
+                    run_id=state.run_id,
+                    status=state.status.value,
+                    operation=operation.value,
+                )
+            return
         invocation_id = _optional_text(request.get("invocation_id"))
         if operation in {ControlOperationName.APPROVE, ControlOperationName.REJECT}:
             if state.status != RunStatus.WAITING_APPROVAL or state.interrupt is None:
@@ -973,6 +1079,32 @@ class RuntimeApiServer:
                     operation=operation.value,
                     details={"active_child_run_ids": active},
                 )
+
+    async def _requeue_failed_run(self, state: Checkpoint) -> dict[str, Any]:
+        requeue = getattr(self.checkpoint_store, "requeue_delivery_exhausted", None)
+        if requeue is None or self.storage_backend != "postgres":
+            raise ApiError(
+                "requeue_requires_postgres",
+                "failure-queue requeue requires PostgreSQL storage",
+                422,
+                run_id=state.run_id,
+                operation=ControlOperationName.REQUEUE.value,
+            )
+        previous_attempt = state.delivery_attempt
+        requeued = await requeue(state.run_id)
+        await self._append_event_async(
+            requeued.thread_id,
+            "run.requeued",
+            {
+                "run_id": requeued.run_id,
+                "turn_id": requeued.turn_id,
+                "previous_delivery_attempt": previous_attempt,
+                "delivery_attempt": requeued.delivery_attempt,
+            },
+        )
+        result = await self._run_view(requeued)
+        result["queued"] = True
+        return result
 
     async def _cancel_run(self, state: Checkpoint) -> dict[str, Any]:
         if state.status == RunStatus.CANCELLED:
@@ -1571,18 +1703,68 @@ class RuntimeApiServer:
         *,
         after_id: int | None = None,
         run_id: str | None = None,
+        follow: bool = False,
     ) -> None:
-        rows = self.repository.list_events(thread_id, after_id=after_id, run_id=run_id)
-        body = "".join(
-            f"id: {event.id}\nevent: {event.type}\ndata: "
-            f"{json.dumps(_event_envelope(event), ensure_ascii=False)}\n\n"
-            for event in rows
-        ).encode("utf-8")
+        if not follow:
+            rows = self.repository.list_events(thread_id, after_id=after_id, run_id=run_id)
+            body = "".join(_sse_event(event) for event in rows).encode("utf-8")
+            request.send_response(200)
+            request.send_header("content-type", "text/event-stream")
+            request.send_header("content-length", str(len(body)))
+            request.end_headers()
+            request.wfile.write(body)
+            return
+        if run_id is None:
+            raise ApiError(
+                "invalid_request",
+                "SSE follow mode requires a run_id filter",
+                400,
+            )
+        state = asyncio.run(self.checkpoint_store.load(run_id))
+        if state is None or state.thread_id != thread_id:
+            raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
         request.send_response(200)
         request.send_header("content-type", "text/event-stream")
-        request.send_header("content-length", str(len(body)))
+        request.send_header("cache-control", "no-cache")
         request.end_headers()
-        request.wfile.write(body)
+        cursor = after_id
+        last_write = time.monotonic()
+        terminal_observed = False
+        with self._sse_metrics_lock:
+            self._active_sse_followers += 1
+            if after_id is not None:
+                self._sse_reconnects += 1
+        try:
+            while not self._stop.is_set():
+                rows = self.repository.list_events(
+                    thread_id,
+                    after_id=cursor,
+                    run_id=run_id,
+                )
+                if rows:
+                    for event in rows:
+                        request.wfile.write(_sse_event(event).encode("utf-8"))
+                        cursor = event.id
+                    _flush(request)
+                    last_write = time.monotonic()
+                state = asyncio.run(self.checkpoint_store.load(run_id))
+                if state is None:
+                    return
+                if state.finished:
+                    if terminal_observed and not rows:
+                        return
+                    terminal_observed = True
+                if time.monotonic() - last_write >= self.sse_keepalive_interval:
+                    request.wfile.write(b": keepalive\n\n")
+                    _flush(request)
+                    last_write = time.monotonic()
+                if self._stop.wait(self.sse_poll_interval):
+                    return
+        except (BrokenPipeError, ConnectionError, OSError, ValueError):
+            return
+        finally:
+            with self._sse_metrics_lock:
+                self._active_sse_followers -= 1
 
 class _RunningRuntimeServer:
     def __init__(self, server: RuntimeApiServer):
@@ -1614,6 +1796,36 @@ def _send_json(request: BaseHTTPRequestHandler, status: int, payload: dict[str, 
     request.send_header("content-length", str(len(body)))
     request.end_headers()
     request.wfile.write(body)
+
+
+def _sse_event(event: RuntimeEvent) -> str:
+    return (
+        f"id: {event.id}\nevent: {event.type}\ndata: "
+        f"{json.dumps(_event_envelope(event), ensure_ascii=False)}\n\n"
+    )
+
+
+def _flush(request: BaseHTTPRequestHandler) -> None:
+    flush = getattr(request.wfile, "flush", None)
+    if flush is not None:
+        flush()
+
+
+def _header_int(request: BaseHTTPRequestHandler, name: str) -> int | None:
+    value = request.headers.get(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _first_bool(values: list[str] | None) -> bool:
+    if not values:
+        return False
+    return values[0].strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _idempotency_key(

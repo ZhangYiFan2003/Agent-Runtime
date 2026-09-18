@@ -29,3 +29,6 @@ class CapacitySnapshot:
     failure_queued_runs: int = 0
     mean_delivery_attempts: float = 0.0
     max_delivery_attempts: int = 0
+    idempotent_submission_replays: int = 0
+    idempotency_conflicts: int = 0
+    manual_requeues: int = 0

@@ -64,6 +64,17 @@ class DistributedRuntimeStore(RuntimeStore, Protocol):
         self, checkpoint: Checkpoint, max_queued_runs: int | None = None
     ) -> None: ...
 
+    async def admit_submission(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+        max_queued_runs: int | None = None,
+    ) -> tuple[Checkpoint, bool]: ...
+
+    async def requeue_delivery_exhausted(self, run_id: str) -> Checkpoint: ...
+
     async def mark_runnable(self, run_id: str) -> None: ...
 
     async def claim_run(

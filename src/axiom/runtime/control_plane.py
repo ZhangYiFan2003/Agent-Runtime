@@ -20,6 +20,7 @@ class ControlOperationName(StrEnum):
     APPROVE = "approve"
     REJECT = "reject"
     CANCEL = "cancel"
+    REQUEUE = "requeue"
 
 
 class ControlOperationStatus(StrEnum):
@@ -349,6 +350,14 @@ def run_view(
         if item.status
         in {RunStatus.WAITING_APPROVAL, RunStatus.WAITING_CHILD, RunStatus.INTERRUPTED}
     ]
+    operations = set(allowed_operations(state.status))
+    if (
+        state.status == RunStatus.FAILED
+        and state.error is not None
+        and state.error.type == "RUN_DELIVERY_EXHAUSTED"
+        and state.failure_queued_at is not None
+    ):
+        operations.add(ControlOperationName.REQUEUE)
     return {
         "run_id": state.run_id,
         "thread_id": state.thread_id,
@@ -374,7 +383,7 @@ def run_view(
         "active_child_run_ids": [item.run_id for item in active_children],
         "pending_interrupts": pending,
         "assignment": metadata.get(state.run_id),
-        "allowed_operations": sorted(item.value for item in allowed_operations(state.status)),
+        "allowed_operations": sorted(item.value for item in operations),
     }
 
 

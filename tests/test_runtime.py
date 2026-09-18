@@ -282,6 +282,7 @@ def test_runtime_api_live_http_lifecycle_auth_threads_events_and_tasks(tmp_path)
                 "workers": 0,
                 "database": "ok",
                 "storage_backend": "sqlite",
+                "sse": {"active_followers": 0, "reconnects": 0},
             }
 
             assert client.get("/v1/tasks").status_code == 401

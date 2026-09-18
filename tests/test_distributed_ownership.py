@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import threading
+import time
 from collections.abc import Iterator
 from copy import deepcopy
+from io import BytesIO
 from uuid import uuid4
 
 import pytest
 
+import axiom.runtime.postgres as postgres_module
+from axiom.agent import QueryEngine
 from axiom.config import AxiomConfig, StorageConfig, load_config
+from axiom.runtime.api import RuntimeApiServer, RuntimeTurnContext
 from axiom.runtime.capacity import AdmissionRejectedError
+from axiom.runtime.control_plane import ApiError
 from axiom.runtime.durable import DurableAgentRuntime
 from axiom.runtime.models import (
     BudgetLedgerRecord,
@@ -19,6 +27,7 @@ from axiom.runtime.models import (
     RunStatus,
     ToolExecutionRecord,
     ToolExecutionStatus,
+    ToolRetryState,
 )
 from axiom.runtime.ownership import (
     DistributedRunWorker,
@@ -40,6 +49,40 @@ class _TakeoverLlm:
         del system_prompt
         yield {"type": "text_delta", "text": "resumed-through-step-loop"}
         yield {"type": "message_end", "stop_reason": "end_turn"}
+
+
+class _ApiRequest:
+    def __init__(
+        self,
+        path: str,
+        *,
+        key: str,
+        payload: dict | None = None,
+        method: str = "POST",
+    ):
+        body = json.dumps(payload or {}).encode()
+        self.command = method
+        self.path = path
+        self.headers = {
+            "content-length": str(len(body)),
+            "x-api-key": "test-key",
+            "Idempotency-Key": key,
+        }
+        self.rfile = BytesIO(body)
+        self.wfile = BytesIO()
+        self.status = 0
+
+    def send_response(self, status: int) -> None:
+        self.status = status
+
+    def send_header(self, _name: str, _value: str) -> None:
+        return
+
+    def end_headers(self) -> None:
+        return
+
+    def json(self):
+        return json.loads(self.wfile.getvalue())
 
 
 @pytest.fixture
@@ -80,6 +123,30 @@ def _expire(storage: DurableStorage, run_id: str) -> None:
             "where run_id = %s",
             (run_id,),
         )
+
+
+async def _exhaust(storage: DurableStorage, run_id: str, *, attempts: int = 1):
+    await _runnable(storage, run_id)
+    owner = None
+    for index in range(attempts):
+        owner = await storage.runtime.claim_run(
+            run_id,
+            f"worker-exhaust-{index}",
+            30,
+            max_run_delivery_attempts=attempts,
+        )
+        assert owner is not None
+        _expire(storage, run_id)
+    assert (
+        await storage.runtime.claim_run(
+            run_id,
+            "worker-exhaust-final",
+            30,
+            max_run_delivery_attempts=attempts,
+        )
+        is None
+    )
+    return owner, await storage.runtime.load(run_id)
 
 
 async def _admit(
@@ -206,7 +273,7 @@ def test_capacity_schema_migrates_v2_with_coordination_only(postgres_storage):
             ).fetchall()
         }
 
-    assert version == 4
+    assert version == 5
     assert columns == {"singleton", "created_at"}
 
 
@@ -242,7 +309,7 @@ def test_schema_v3_additively_migrates_delivery_metadata(postgres_storage):
                 """
             ).fetchall()
         }
-    assert version == 4
+    assert version == 5
     assert {
         "delivery_attempt",
         "failure_queued_at",
@@ -251,6 +318,40 @@ def test_schema_v3_additively_migrates_delivery_metadata(postgres_storage):
         "last_delivery_worker_id",
         "last_delivery_fencing_token",
     } <= columns
+
+
+@pytest.mark.postgres
+def test_schema_v4_additively_migrates_submission_idempotency(postgres_storage):
+    with postgres_storage._close.connection() as conn:
+        conn.execute("drop table submission_idempotency")
+        conn.execute(
+            "update axiom_schema_versions set version = 4 where component = 'runtime'"
+        )
+
+    initialize_postgres_schema(postgres_storage._close)
+
+    with postgres_storage._close.connection() as conn:
+        version = conn.execute(
+            "select version from axiom_schema_versions where component = 'runtime'"
+        ).fetchone()[0]
+        columns = {
+            row[0]
+            for row in conn.execute(
+                """
+                select column_name from information_schema.columns
+                where table_schema = current_schema()
+                  and table_name = 'submission_idempotency'
+                """
+            ).fetchall()
+        }
+    assert version == 5
+    assert columns == {
+        "thread_id",
+        "idempotency_key",
+        "request_fingerprint",
+        "run_id",
+        "created_at",
+    }
 
 
 @pytest.mark.postgres
@@ -790,6 +891,401 @@ def test_old_owner_cannot_checkpoint_after_takeover(postgres_storage):
     asyncio.run(postgres_storage.runtime.save(state, ownership=second))
     with pytest.raises(OwnershipLostError):
         asyncio.run(postgres_storage.runtime.save(stale, ownership=first))
+
+
+@pytest.mark.postgres
+def test_submission_idempotency_replays_and_conflicts(postgres_storage, tmp_path):
+    runtime = DurableAgentRuntime(
+        llm_client=_TakeoverLlm(),
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=AxiomConfig(),
+        store=postgres_storage.runtime,
+        execution_strategy="react",
+    )
+
+    first, created = asyncio.run(
+        runtime.submit_idempotent(
+            thread_id="thread-idempotent",
+            run_id="run-idempotent-a",
+            turn_id="turn-idempotent-a",
+            input="same work",
+            idempotency_key="request-1",
+            max_queued_runs=5,
+        )
+    )
+    replay, replay_created = asyncio.run(
+        runtime.submit_idempotent(
+            thread_id="thread-idempotent",
+            run_id="run-idempotent-b",
+            turn_id="turn-idempotent-b",
+            input="same work",
+            idempotency_key="request-1",
+            max_queued_runs=5,
+        )
+    )
+
+    assert created is True and replay_created is False
+    assert replay.run_id == first.run_id == "run-idempotent-a"
+    with pytest.raises(ApiError) as exc_info:
+        asyncio.run(
+            runtime.submit_idempotent(
+                thread_id="thread-idempotent",
+                run_id="run-idempotent-c",
+                input="different work",
+                idempotency_key="request-1",
+                max_queued_runs=5,
+            )
+        )
+    assert exc_info.value.code == "IDEMPOTENCY_KEY_CONFLICT"
+    assert exc_info.value.http_status == 409
+    snapshot = asyncio.run(postgres_storage.runtime.capacity_snapshot())
+    assert snapshot.idempotent_submission_replays == 1
+    assert snapshot.idempotency_conflicts == 1
+
+
+@pytest.mark.postgres
+def test_ten_concurrent_idempotent_submissions_create_one_run(postgres_storage, tmp_path):
+    runtime = DurableAgentRuntime(
+        llm_client=_TakeoverLlm(),
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=AxiomConfig(),
+        store=postgres_storage.runtime,
+        execution_strategy="react",
+    )
+
+    async def submit(index: int):
+        return await runtime.submit_idempotent(
+            thread_id="thread-race",
+            run_id=f"run-race-{index}",
+            turn_id=f"turn-race-{index}",
+            input="one logical request",
+            idempotency_key="request-race",
+            max_queued_runs=20,
+        )
+
+    async def race():
+        return await asyncio.gather(*(submit(index) for index in range(10)))
+
+    results = asyncio.run(race())
+    assert len({state.run_id for state, _created in results}) == 1
+    assert sum(created for _state, created in results) == 1
+    assert len(asyncio.run(postgres_storage.runtime.list("thread-race"))) == 1
+
+
+@pytest.mark.postgres
+def test_rejected_idempotent_submission_does_not_bind_key(postgres_storage, tmp_path):
+    asyncio.run(_admit(postgres_storage, "queue-holder", limit=1))
+    runtime = DurableAgentRuntime(
+        llm_client=_TakeoverLlm(),
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=AxiomConfig(),
+        store=postgres_storage.runtime,
+    )
+    with pytest.raises(AdmissionRejectedError):
+        asyncio.run(
+            runtime.submit_idempotent(
+                thread_id="thread-retry",
+                run_id="run-rejected",
+                input="work",
+                idempotency_key="retryable-key",
+                max_queued_runs=1,
+            )
+        )
+    holder = asyncio.run(postgres_storage.runtime.load("queue-holder"))
+    assert holder is not None
+    holder.status = RunStatus.CANCELLED
+    asyncio.run(postgres_storage.runtime.save(holder))
+    accepted, created = asyncio.run(
+        runtime.submit_idempotent(
+            thread_id="thread-retry",
+            run_id="run-accepted",
+            input="work",
+            idempotency_key="retryable-key",
+            max_queued_runs=1,
+        )
+    )
+    assert created is True and accepted.run_id == "run-accepted"
+    assert asyncio.run(postgres_storage.runtime.load("run-rejected")) is None
+
+
+@pytest.mark.postgres
+def test_submission_transaction_failure_rolls_back_mapping(
+    postgres_storage, tmp_path, monkeypatch
+):
+    runtime = DurableAgentRuntime(
+        llm_client=_TakeoverLlm(),
+        tool_registry=ToolRegistry(),
+        system_prompt="test",
+        cwd=str(tmp_path),
+        config=AxiomConfig(),
+        store=postgres_storage.runtime,
+    )
+    original = postgres_module._insert_initial_run
+
+    def fail_after_insert(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("transaction fault")
+
+    monkeypatch.setattr(postgres_module, "_insert_initial_run", fail_after_insert)
+    with pytest.raises(RuntimeError, match="transaction fault"):
+        asyncio.run(
+            runtime.submit_idempotent(
+                thread_id="thread-rollback",
+                run_id="run-rolled-back",
+                input="work",
+                idempotency_key="rollback-key",
+            )
+        )
+    assert asyncio.run(postgres_storage.runtime.load("run-rolled-back")) is None
+    monkeypatch.setattr(postgres_module, "_insert_initial_run", original)
+    accepted, created = asyncio.run(
+        runtime.submit_idempotent(
+            thread_id="thread-rollback",
+            run_id="run-after-rollback",
+            input="work",
+            idempotency_key="rollback-key",
+        )
+    )
+    assert created is True and accepted.run_id == "run-after-rollback"
+
+    duplicate = Checkpoint.create(
+        thread_id="thread-rollback", run_id=accepted.run_id, input="explicit duplicate"
+    )
+    with pytest.raises(ValueError, match="already exists"):
+        asyncio.run(postgres_storage.runtime.admit_run(duplicate))
+
+
+@pytest.mark.postgres
+def test_manual_requeue_starts_new_cycle_and_fences_stale_owner(postgres_storage):
+    stale_owner, exhausted = asyncio.run(_exhaust(postgres_storage, "run-requeue"))
+    assert stale_owner is not None and exhausted is not None
+    historical_sequence = exhausted.sequence
+    stale = deepcopy(exhausted)
+
+    requeued = asyncio.run(
+        postgres_storage.runtime.requeue_delivery_exhausted(exhausted.run_id)
+    )
+
+    assert requeued.run_id == exhausted.run_id
+    assert requeued.status == RunStatus.RUNNING
+    assert requeued.sequence == historical_sequence + 1
+    assert requeued.delivery_attempt == 0
+    assert requeued.error is None and requeued.failure_queued_at is None
+    assert asyncio.run(postgres_storage.runtime.capacity_snapshot()).manual_requeues == 1
+    with pytest.raises(OwnershipLostError):
+        asyncio.run(postgres_storage.runtime.save(stale, ownership=stale_owner))
+    claimed = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            requeued.run_id, "worker-new-cycle", 30, max_run_delivery_attempts=1
+        )
+    )
+    assert claimed is not None and claimed.delivery_attempt == 1
+
+
+@pytest.mark.postgres
+def test_requeued_run_still_respects_active_capacity(postgres_storage):
+    holder = asyncio.run(_runnable(postgres_storage, "run-active-holder"))
+    active = asyncio.run(
+        postgres_storage.runtime.claim_run(holder.run_id, "worker-holder", 30)
+    )
+    assert active is not None
+    _owner, exhausted = asyncio.run(_exhaust(postgres_storage, "run-requeue-capacity"))
+    assert exhausted is not None
+    asyncio.run(postgres_storage.runtime.requeue_delivery_exhausted(exhausted.run_id))
+
+    blocked = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            exhausted.run_id,
+            "worker-blocked",
+            30,
+            max_active_runs=1,
+            max_run_delivery_attempts=1,
+        )
+    )
+
+    assert blocked is None
+    still_queued = asyncio.run(postgres_storage.runtime.load(exhausted.run_id))
+    assert still_queued is not None and still_queued.delivery_attempt == 0
+
+
+@pytest.mark.postgres
+def test_manual_requeue_preserves_tool_execution_evidence(postgres_storage):
+    _owner, exhausted = asyncio.run(_exhaust(postgres_storage, "run-tools-requeue"))
+    assert exhausted is not None
+    succeeded = ToolExecutionRecord(
+        invocation_id="inv-success",
+        run_id=exhausted.run_id,
+        tool_call_id="call-success",
+        tool_name="write",
+        arguments_hash="hash-success",
+        status=ToolExecutionStatus.SUCCEEDED,
+        attempt=1,
+        result="done",
+    )
+    unknown = ToolExecutionRecord(
+        invocation_id="inv-unknown",
+        run_id=exhausted.run_id,
+        tool_call_id="call-unknown",
+        tool_name="unsafe-write",
+        arguments_hash="hash-unknown",
+        status=ToolExecutionStatus.UNKNOWN,
+        attempt=1,
+        retry_state=ToolRetryState.RETRY_SUPPRESSED,
+        retry_suppressed_reason="unsafe ambiguous outcome",
+    )
+    asyncio.run(postgres_storage.runtime.save_tool_execution(succeeded))
+    asyncio.run(postgres_storage.runtime.save_tool_execution(unknown))
+
+    asyncio.run(postgres_storage.runtime.requeue_delivery_exhausted(exhausted.run_id))
+
+    restored_success = asyncio.run(
+        postgres_storage.runtime.load_tool_execution(succeeded.invocation_id)
+    )
+    restored_unknown = asyncio.run(
+        postgres_storage.runtime.load_tool_execution(unknown.invocation_id)
+    )
+    assert restored_success is not None
+    assert restored_success.status == ToolExecutionStatus.SUCCEEDED
+    assert restored_success.result == "done" and restored_success.attempt == 1
+    assert restored_unknown is not None
+    assert restored_unknown.status == ToolExecutionStatus.UNKNOWN
+    assert restored_unknown.retry_state == ToolRetryState.RETRY_SUPPRESSED
+    assert restored_unknown.retry_suppressed_reason == "unsafe ambiguous outcome"
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.COMPLETED, RunStatus.CANCELLED])
+def test_manual_requeue_rejects_non_failure_queue_states(postgres_storage, status):
+    state = Checkpoint.create(
+        thread_id="thread-ineligible", run_id=f"run-{status.value.lower()}", input="work"
+    )
+    state.status = status
+    if status == RunStatus.FAILED:
+        state.error = RunError(type="NO_PROGRESS", message="deterministic failure")
+    asyncio.run(postgres_storage.runtime.save(state))
+    with pytest.raises(ValueError, match="not in the delivery failure queue"):
+        asyncio.run(postgres_storage.runtime.requeue_delivery_exhausted(state.run_id))
+
+
+@pytest.mark.postgres
+def test_operational_control_flow_keeps_one_run_and_requeues_same_state(
+    postgres_storage, tmp_path
+):
+    config = AxiomConfig()
+    config.worker.distributed_enabled = True
+    config.capacity.max_queued_runs = 10
+    registry = ToolRegistry()
+
+    def factory(context: RuntimeTurnContext) -> QueryEngine:
+        return QueryEngine(
+            llm_client=_TakeoverLlm(),
+            tool_registry=registry,
+            config=context.config,
+            cwd=context.cwd,
+        )
+
+    server = RuntimeApiServer(
+        cwd=str(tmp_path),
+        config=config,
+        api_key="test-key",
+        workers=0,
+        data_dir=tmp_path / "api",
+        engine_factory=factory,
+        durable_storage=postgres_storage,
+    )
+    thread_id = server.repository.create_thread()
+    first_request = _ApiRequest(
+        f"/v1/threads/{thread_id}/turns",
+        key="submit-key",
+        payload={"message": "control flow"},
+    )
+    replay_request = _ApiRequest(
+        f"/v1/threads/{thread_id}/turns",
+        key="submit-key",
+        payload={"message": "control flow"},
+    )
+    server._handle(first_request)
+    server._handle(replay_request)
+    first = first_request.json()
+    replay = replay_request.json()
+    assert first_request.status == replay_request.status == 202
+    assert replay["run_id"] == first["run_id"]
+    assert len(asyncio.run(postgres_storage.runtime.list(thread_id))) == 1
+    tool = ToolExecutionRecord(
+        invocation_id="inv-control-flow",
+        run_id=first["run_id"],
+        tool_call_id="call-control-flow",
+        tool_name="safe-read",
+        arguments_hash="hash-control-flow",
+        status=ToolExecutionStatus.SUCCEEDED,
+        attempt=1,
+        result="preserved",
+    )
+    asyncio.run(postgres_storage.runtime.save_tool_execution(tool))
+    live = _ApiRequest(
+        f"/v1/threads/{thread_id}/events?run_id={first['run_id']}&follow=true",
+        key="unused-for-sse",
+        method="GET",
+    )
+    follower = threading.Thread(target=server._handle, args=(live,))
+    follower.start()
+    deadline = time.monotonic() + 2
+    while server._sse_health()["active_followers"] != 1:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    owner = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            first["run_id"], "worker-control", 30, max_run_delivery_attempts=1
+        )
+    )
+    assert owner is not None
+    streamed_event_id = server.repository.append_event(
+        thread_id, "worker.claimed", {"run_id": first["run_id"]}
+    )
+    _expire(postgres_storage, first["run_id"])
+    assert (
+        asyncio.run(
+            postgres_storage.runtime.claim_run(
+                first["run_id"], "worker-after-loss", 30, max_run_delivery_attempts=1
+            )
+        )
+        is None
+    )
+    follower.join(timeout=2)
+    assert not follower.is_alive()
+    assert f"id: {streamed_event_id}\n".encode() in live.wfile.getvalue()
+    request = _ApiRequest(f"/v1/runs/{first['run_id']}/requeue", key="requeue-key")
+    server._handle(request)
+    duplicate = _ApiRequest(f"/v1/runs/{first['run_id']}/requeue", key="requeue-key")
+    server._handle(duplicate)
+
+    assert request.status == duplicate.status == 202
+    assert request.json()["run_id"] == duplicate.json()["run_id"] == first["run_id"]
+    requeued = asyncio.run(postgres_storage.runtime.load(first["run_id"]))
+    assert requeued is not None and requeued.delivery_attempt == 0
+    assert len(
+        [
+            event
+            for event in server.repository.list_events(thread_id, run_id=first["run_id"])
+            if event.type == "run.requeued"
+        ]
+    ) == 1
+    reclaimed = asyncio.run(
+        postgres_storage.runtime.claim_run(
+            first["run_id"], "worker-requeued", 30, max_run_delivery_attempts=1
+        )
+    )
+    assert reclaimed is not None and reclaimed.delivery_attempt == 1
+    restored = asyncio.run(
+        postgres_storage.runtime.load_tool_execution(tool.invocation_id)
+    )
+    assert restored is not None and restored.result == "preserved"
 
 
 @pytest.mark.postgres

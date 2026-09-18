@@ -27,7 +27,7 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.ownership import OwnershipLostError, RunOwnership
 
-POSTGRES_SCHEMA_VERSION = 4
+POSTGRES_SCHEMA_VERSION = 5
 RUN_DELIVERY_EXHAUSTED = "RUN_DELIVERY_EXHAUSTED"
 
 
@@ -106,7 +106,7 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()
         version = int(row[0]) if row else POSTGRES_SCHEMA_VERSION
-        if version not in {1, 2, 3, POSTGRES_SCHEMA_VERSION}:
+        if version not in {1, 2, 3, 4, POSTGRES_SCHEMA_VERSION}:
             raise PostgresSchemaError(
                 f"unsupported PostgreSQL runtime schema version: {version}"
             )
@@ -133,12 +133,35 @@ class PostgresRuntimeStore:
         self.pool = pool
         self._admission_rejections = 0
         self._capacity_blocked_claims = 0
+        self._idempotent_submission_replays = 0
+        self._idempotency_conflicts = 0
+        self._manual_requeues = 0
 
     async def admit_run(
         self, checkpoint: Checkpoint, max_queued_runs: int | None = None
     ) -> None:
         _require_optional_limit(max_queued_runs, "max_queued_runs")
         await asyncio.to_thread(self._admit_run, checkpoint, max_queued_runs)
+
+    async def admit_submission(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+        max_queued_runs: int | None = None,
+    ) -> tuple[Checkpoint, bool]:
+        _require_optional_limit(max_queued_runs, "max_queued_runs")
+        return await asyncio.to_thread(
+            self._admit_submission,
+            checkpoint,
+            idempotency_key,
+            request_fingerprint,
+            max_queued_runs,
+        )
+
+    async def requeue_delivery_exhausted(self, run_id: str) -> Checkpoint:
+        return await asyncio.to_thread(self._requeue_delivery_exhausted, run_id)
 
     async def save(
         self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None
@@ -257,6 +280,140 @@ class PostgresRuntimeStore:
             _insert_initial_run(conn, checkpoint, updated_at=updated_at, runnable=True)
         checkpoint.sequence = 1
         checkpoint.updated_at = updated_at
+
+    def _admit_submission(
+        self,
+        checkpoint: Checkpoint,
+        idempotency_key: str,
+        request_fingerprint: str,
+        max_queued_runs: int | None,
+    ) -> tuple[Checkpoint, bool]:
+        if checkpoint.sequence != 0 or checkpoint.parent_run_id is not None:
+            raise ValueError("only a new root Run may pass submission admission")
+        updated_at = _now()
+        with self.pool.connection() as conn:
+            _lock_capacity_coordination(conn)
+            existing = conn.execute(
+                """
+                select request_fingerprint, run_id
+                from submission_idempotency
+                where thread_id = %s and idempotency_key = %s
+                """,
+                (checkpoint.thread_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) != request_fingerprint:
+                    self._idempotency_conflicts += 1
+                    raise ApiError(
+                        "IDEMPOTENCY_KEY_CONFLICT",
+                        "idempotency key was already used with a different submission",
+                        409,
+                    )
+                row = conn.execute(
+                    f"select {_RUN_STATE_SELECT} from runs where run_id = %s",
+                    (str(existing[1]),),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("submission idempotency mapping references a missing Run")
+                self._idempotent_submission_replays += 1
+                return _checkpoint_with_delivery(row), False
+            if conn.execute(
+                "select 1 from runs where run_id = %s", (checkpoint.run_id,)
+            ).fetchone():
+                raise ValueError(f"run already exists: {checkpoint.run_id}")
+            queued = _queued_count(conn)
+            if max_queued_runs is not None and queued >= max_queued_runs:
+                self._admission_rejections += 1
+                raise AdmissionRejectedError(
+                    queued_runs=queued, max_queued_runs=max_queued_runs
+                )
+            _insert_initial_run(conn, checkpoint, updated_at=updated_at, runnable=True)
+            conn.execute(
+                """
+                insert into submission_idempotency(
+                    thread_id, idempotency_key, request_fingerprint, run_id, created_at
+                ) values (%s, %s, %s, %s, %s)
+                """,
+                (
+                    checkpoint.thread_id,
+                    idempotency_key,
+                    request_fingerprint,
+                    checkpoint.run_id,
+                    updated_at,
+                ),
+            )
+        checkpoint.sequence = 1
+        checkpoint.updated_at = updated_at
+        return checkpoint, True
+
+    def _requeue_delivery_exhausted(self, run_id: str) -> Checkpoint:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                select {_RUN_STATE_SELECT}, current_sequence, fencing_token
+                from runs where run_id = %s for update
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("run not found")
+            state = _checkpoint_with_delivery(row[:7])
+            if not (
+                state.status == RunStatus.FAILED
+                and state.error is not None
+                and state.error.type == RUN_DELIVERY_EXHAUSTED
+                and state.failure_queued_at is not None
+            ):
+                raise ValueError("run is not in the delivery failure queue")
+            now = _timestamp(conn.execute("select current_timestamp").fetchone()[0])
+            if now is None:  # pragma: no cover
+                raise RuntimeError("PostgreSQL did not return current time")
+            state.status = RunStatus.RUNNING
+            state.error = None
+            state.delivery_attempt = 0
+            state.failure_queued_at = None
+            state.last_delivery_failure = None
+            state.last_delivery_failed_at = None
+            state.last_delivery_worker_id = None
+            state.last_delivery_fencing_token = None
+            next_sequence = int(row[7]) + 1
+            payload = state.to_dict()
+            payload["sequence"] = next_sequence
+            payload["updated_at"] = now
+            conn.execute(
+                """
+                update runs set status = 'RUNNING', current_sequence = %s,
+                    state_json = %s::jsonb, updated_at = %s, runnable = true,
+                    owner_worker_id = null, lease_until = null,
+                    fencing_token = fencing_token + 1, delivery_attempt = 0,
+                    failure_queued_at = null, last_delivery_failure = null,
+                    last_delivery_failed_at = null, last_delivery_worker_id = null,
+                    last_delivery_fencing_token = null
+                where run_id = %s
+                """,
+                (next_sequence, _json(payload), now, run_id),
+            )
+            conn.execute(
+                """
+                insert into checkpoints(
+                    run_id, sequence, schema_version, thread_id, turn_id,
+                    status, state_json, created_at
+                ) values (%s, %s, %s, %s, %s, 'RUNNING', %s::jsonb, %s)
+                """,
+                (
+                    run_id,
+                    next_sequence,
+                    state.schema_version,
+                    state.thread_id,
+                    state.turn_id,
+                    _json(payload),
+                    now,
+                ),
+            )
+        state.sequence = next_sequence
+        state.updated_at = now
+        self._manual_requeues += 1
+        return state
 
     def _save(self, checkpoint: Checkpoint, ownership: RunOwnership | None = None) -> None:
         expected = checkpoint.sequence
@@ -694,6 +851,9 @@ class PostgresRuntimeStore:
             failure_queued_runs=int(row[3]),
             mean_delivery_attempts=float(row[4]),
             max_delivery_attempts=int(row[5]),
+            idempotent_submission_replays=self._idempotent_submission_replays,
+            idempotency_conflicts=self._idempotency_conflicts,
+            manual_requeues=self._manual_requeues,
         )
 
     def _renew_lease(
@@ -1421,6 +1581,17 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     "create index if not exists idx_checkpoints_thread on checkpoints(thread_id, run_id, sequence)",
+    """
+    create table if not exists submission_idempotency (
+        thread_id text not null,
+        idempotency_key text not null,
+        request_fingerprint text not null,
+        run_id text not null references runs(run_id) on delete cascade,
+        created_at timestamptz not null,
+        primary key(thread_id, idempotency_key),
+        unique(run_id)
+    )
+    """,
     """
     create table if not exists tool_executions (
         invocation_id text primary key,

@@ -292,6 +292,47 @@ class DurableAgentRuntime:
         )
         return state
 
+    async def submit_idempotent(
+        self,
+        *,
+        thread_id: str,
+        input: str,
+        idempotency_key: str,
+        history: list[Message] | None = None,
+        run_id: str | None = None,
+        turn_id: str | None = None,
+        max_queued_runs: int | None = None,
+    ) -> tuple[Checkpoint, bool]:
+        """Atomically admit or replay one PostgreSQL root submission."""
+        admit = getattr(self.store, "admit_submission", None)
+        if admit is None or getattr(self.store, "backend", None) != "postgres":
+            raise ValueError("idempotent distributed submission requires PostgreSQL storage")
+        state = await self._new_run_state(
+            thread_id=thread_id,
+            input=input,
+            history=history,
+            run_id=run_id,
+            turn_id=turn_id,
+        )
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "thread_id": thread_id,
+                    "input": input,
+                    "execution_strategy": state.execution_strategy,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return await admit(
+            state,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+            max_queued_runs=max_queued_runs,
+        )
+
     async def _new_run_state(
         self,
         *,

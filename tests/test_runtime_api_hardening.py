@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any
@@ -33,6 +35,7 @@ class FakeRequest:
         payload: dict[str, Any] | None = None,
         *,
         idempotency_key: str | None = None,
+        last_event_id: int | None = None,
     ) -> None:
         body = json.dumps(payload or {}).encode()
         self.command = method
@@ -43,6 +46,8 @@ class FakeRequest:
         }
         if idempotency_key:
             self.headers["Idempotency-Key"] = idempotency_key
+        if last_event_id is not None:
+            self.headers["Last-Event-ID"] = str(last_event_id)
         self.rfile = BytesIO(body)
         self.wfile = BytesIO()
         self.status = 0
@@ -59,6 +64,11 @@ class FakeRequest:
 
     def json(self) -> dict[str, Any]:
         return json.loads(self.wfile.getvalue())
+
+
+class DisconnectingStream(BytesIO):
+    def write(self, _data: bytes) -> int:
+        raise BrokenPipeError("client disconnected")
 
 
 class StaticClient:
@@ -843,6 +853,146 @@ def test_sse_run_filter_keeps_thread_wide_replay_compatible(tmp_path):
         "run-a",
         "run-b",
     }
+
+
+def test_sse_follow_replays_history_tails_new_events_and_closes_on_terminal(tmp_path):
+    server, _ = _server(tmp_path)
+    server.sse_poll_interval = 0.01
+    thread_id = _thread(server)
+    state = _checkpoint(thread_id, "run-live")
+    _save(server, state)
+    server.repository.append_event(thread_id, "historical", {"run_id": state.run_id})
+    request = FakeRequest(
+        "GET", f"/v1/threads/{thread_id}/events?run_id={state.run_id}&follow=true"
+    )
+    follower = threading.Thread(target=server._handle, args=(request,))
+    follower.start()
+    _wait_until(lambda: server._sse_health()["active_followers"] == 1)
+
+    server.repository.append_event(thread_id, "live", {"run_id": state.run_id})
+    state.status = RunStatus.COMPLETED
+    _save(server, state)
+    follower.join(timeout=2)
+
+    assert not follower.is_alive()
+    assert [item["event_type"] for item in _sse_data(request.wfile.getvalue().decode())] == [
+        "historical",
+        "live",
+    ]
+    assert server._sse_health()["active_followers"] == 0
+
+
+def test_sse_last_event_id_resumes_without_duplicates_and_handles_gaps(tmp_path):
+    server, _ = _server(tmp_path)
+    thread_id = _thread(server)
+    state = _checkpoint(thread_id, "run-reconnect", status=RunStatus.COMPLETED)
+    _save(server, state)
+    first_id = server.repository.append_event(
+        thread_id, "first", {"run_id": state.run_id}
+    )
+    server.repository.append_event(thread_id, "unrelated", {"run_id": "other-run"})
+    final_id = server.repository.append_event(
+        thread_id, "final", {"run_id": state.run_id}
+    )
+    request = FakeRequest(
+        "GET",
+        f"/v1/threads/{thread_id}/events?run_id={state.run_id}&follow=true",
+        last_event_id=first_id,
+    )
+
+    server._handle(request)
+
+    events = _sse_data(request.wfile.getvalue().decode())
+    assert [item["event_id"] for item in events] == [final_id]
+    assert server._sse_health()["reconnects"] == 1
+
+
+def test_two_sse_followers_independently_receive_same_event(tmp_path):
+    server, _ = _server(tmp_path)
+    server.sse_poll_interval = 0.01
+    thread_id = _thread(server)
+    state = _checkpoint(thread_id, "run-two-clients")
+    _save(server, state)
+    requests = [
+        FakeRequest(
+            "GET", f"/v1/threads/{thread_id}/events?run_id={state.run_id}&follow=1"
+        )
+        for _ in range(2)
+    ]
+    followers = [threading.Thread(target=server._handle, args=(request,)) for request in requests]
+    for follower in followers:
+        follower.start()
+    _wait_until(lambda: server._sse_health()["active_followers"] == 2)
+    event_id = server.repository.append_event(
+        thread_id, "shared", {"run_id": state.run_id}
+    )
+    state.status = RunStatus.COMPLETED
+    _save(server, state)
+    for follower in followers:
+        follower.join(timeout=2)
+
+    assert all(not follower.is_alive() for follower in followers)
+    assert [
+        [item["event_id"] for item in _sse_data(request.wfile.getvalue().decode())]
+        for request in requests
+    ] == [[event_id], [event_id]]
+
+
+def test_sse_keepalive_is_transport_only_and_polling_is_bounded(tmp_path):
+    server, _ = _server(tmp_path)
+    server.sse_poll_interval = 0.02
+    server.sse_keepalive_interval = 0.02
+    thread_id = _thread(server)
+    state = _checkpoint(thread_id, "run-keepalive")
+    _save(server, state)
+    before = len(server.repository.list_events(thread_id))
+    request = FakeRequest(
+        "GET", f"/v1/threads/{thread_id}/events?run_id={state.run_id}&follow=true"
+    )
+    calls = 0
+    original = server.repository.list_events
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    server.repository.list_events = counted
+    follower = threading.Thread(target=server._handle, args=(request,))
+    follower.start()
+    _wait_until(lambda: b": keepalive\n\n" in request.wfile.getvalue())
+    state.status = RunStatus.COMPLETED
+    _save(server, state)
+    follower.join(timeout=2)
+
+    assert len(original(thread_id)) == before
+    assert calls < 20
+
+
+def test_sse_client_disconnect_stops_follower(tmp_path):
+    server, _ = _server(tmp_path)
+    server.sse_poll_interval = 0.01
+    server.sse_keepalive_interval = 0.01
+    thread_id = _thread(server)
+    state = _checkpoint(thread_id, "run-disconnect")
+    _save(server, state)
+    request = FakeRequest(
+        "GET", f"/v1/threads/{thread_id}/events?run_id={state.run_id}&follow=true"
+    )
+    request.wfile = DisconnectingStream()
+
+    server._handle(request)
+
+    assert server._sse_health()["active_followers"] == 0
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError("condition was not reached before timeout")
 
 
 def test_run_model_represents_future_parallel_child_states(tmp_path):
