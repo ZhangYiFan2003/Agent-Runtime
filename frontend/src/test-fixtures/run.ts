@@ -40,3 +40,21 @@ export function makeRunViewDto(overrides: Record<string, unknown> = {}) {
 export function makeRunView(overrides: Record<string, unknown> = {}): RunView {
   return adaptRunView(runViewSchema.parse(makeRunViewDto(overrides)));
 }
+
+/** Minimal valid ChildRun DTO — mirrors the `/children` projection. */
+export function makeChildRunDto(overrides: Record<string, unknown> = {}) {
+  return {
+    child_run_id: "run_child1",
+    run_kind: "plan_task",
+    status: "COMPLETED",
+    parent_run_id: "run_abc123",
+    parent_step_id: "step_1",
+    assignment_id: "assign_1",
+    worker_role: null,
+    attempt: 1,
+    interrupt: null,
+    created_at: "2026-09-17T10:00:01+00:00",
+    updated_at: "2026-09-17T10:00:09+00:00",
+    ...overrides,
+  };
+}

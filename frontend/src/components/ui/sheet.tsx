@@ -4,25 +4,33 @@ import { X } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 /**
- * Sheet — side panel built on the Dialog primitive (shadcn pattern).
- * Phase 1 keeps it minimal; mobile inspectors arrive in later phases.
+ * Sheet — side/bottom panel built on the Dialog primitive (shadcn pattern).
+ * `bottom` is the mobile inspector; `left`/`right` are desktop drawers.
  */
 export const Sheet = DialogPrimitive.Root;
 export const SheetTrigger = DialogPrimitive.Trigger;
 export const SheetClose = DialogPrimitive.Close;
 export const SheetTitle = DialogPrimitive.Title;
 
+const SIDE_CLASSES: Record<"right" | "left" | "bottom", string> = {
+  right: "inset-y-0 right-0 w-80 max-w-[85vw] border-l",
+  left: "inset-y-0 left-0 w-80 max-w-[85vw] border-r",
+  bottom: "inset-x-0 bottom-0 h-[75dvh] w-full rounded-t-lg border-t",
+};
+
 export const SheetContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & { side?: "right" | "left" }
+  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
+    side?: "right" | "left" | "bottom";
+  }
 >(({ className, children, side = "right", ...props }, ref) => (
   <DialogPrimitive.Portal>
     <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/60" />
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed inset-y-0 z-50 w-80 max-w-[85vw] border-border bg-bg-1 p-4 shadow-pop",
-        side === "right" ? "right-0 border-l" : "left-0 border-r",
+        "fixed z-50 border-border bg-bg-1 p-4 shadow-pop",
+        SIDE_CLASSES[side],
         className,
       )}
       {...props}

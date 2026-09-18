@@ -8,6 +8,7 @@ import { WorkbenchPage } from "./routes/workbench";
 import { RunsPage } from "./routes/runs";
 import { RunDetailPage } from "./routes/run-detail";
 import { SettingsPage } from "./routes/settings";
+import { parseRunDetailSearch } from "./lib/run-detail-view";
 
 const rootRoute = createRootRoute({ component: AppShell });
 
@@ -27,6 +28,9 @@ const runDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/runs/$runId",
   component: RunDetailPage,
+  // Span selection lives in the URL (?span=…) so views are shareable and
+  // back/forward compatible.
+  validateSearch: parseRunDetailSearch,
 });
 
 const settingsRoute = createRoute({

@@ -127,6 +127,7 @@ export interface ChildRun {
   assignmentId: string | null;
   workerRole: string | null;
   attempt: number | null;
+  interrupt: InterruptSummary | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -142,6 +143,7 @@ export function adaptChildRun(dto: ChildRunDto): ChildRun {
     assignmentId: dto.assignment_id,
     workerRole: dto.worker_role,
     attempt: dto.attempt,
+    interrupt: dto.interrupt ? adaptInterrupt(dto.interrupt) : null,
     createdAt: dto.created_at,
     updatedAt: dto.updated_at,
   };
