@@ -1041,7 +1041,8 @@ identity, attempts, ambiguous outcomes, and external side effects need stronger 
 One Step begins from an authoritative `RunState`. `StepContext` carries Run correlation, the current
 control state, strategy, and inherited Run ownership context; the strategy/runtime performs one
 existing iteration and returns `StepResult` with a small continuation decision plus lightweight
-Tool invocation IDs. The Runtime still owns control checks, budgets, ownership validation, and
+Tool invocation IDs. `StepResult.run_state` is a strategy-mutated candidate, not an authoritative
+generic lifecycle write. The Runtime still owns control checks, budgets, ownership validation, and
 RunState CAS. The deterministic `CompletionPolicy` resolves structured verifier, progress, budget,
 and strategy evidence into `NextAction`, which remains limited to `CONTINUE`, `COMPLETE`, `WAIT`,
 and `FAIL`; cancellation and interrupt remain authoritative Run control states. A Step is not
@@ -1052,8 +1053,12 @@ All three execution strategies now enter the same small Runtime step skeleton. B
 an ordinary `StepContext`, Runtime reconciles ancestor cancellation, requires `RUNNING`, validates
 the current Run ownership/fence through refresh, and checks remaining wall-time budget. It then
 invokes one strategy-specific iteration and validates the returned Run/index correlation. Only
-`CONTINUE` begins another ordinary iteration; `WAIT`, `COMPLETE`, `FAIL`, or authoritative control
-state returns to the caller. This prevents Parent `WAITING_CHILD` and HITL states from busy-spinning.
+the Runtime's `_apply_next_action` may commit normal generic `COMPLETED`/`FAILED` transitions.
+It reloads durable control state, validates ownership, applies verification/policy, then writes via
+the existing sequence CAS plus fencing path. `CONTINUE` begins another ordinary iteration;
+`WAIT`, terminal outcomes, or authoritative control state return to the caller. This prevents
+Parent `WAITING_CHILD` and HITL states from busy-spinning, and a concurrent cancel or newer fence
+outranks a stale Step outcome.
 The helper does not charge budgets, increment `step_index`, execute Tools, or persist a second kind
 of state: existing successful model/Tool boundaries remain the sole owners of their accounting,
 index advancement, ToolExecution truth, and versioned RunState writes.
@@ -1069,8 +1074,17 @@ ProgressDetector → CompletionVerifier (completion candidates only)
         ↓
 CompletionPolicy → NextAction
         ↓
-existing ownership-aware RunState CAS
+Runtime `_apply_next_action`
+        ↓
+ownership-aware RunState CAS
 ```
+
+ReAct persists model or Tool evidence before the final transition. If the process dies after a
+model completion candidate or policy evaluation but before the terminal CAS, recovery recognizes
+the durable assistant evidence and recomputes verification/policy without another model call.
+Plan-and-Execute and Multi-Agent retain ownership of plan graphs, assignment/reviewer state, and
+Child Run orchestration, but their successful terminal candidates converge through the same Runtime
+transition authority. No StepResult, NextAction, policy decision, or transition record is persisted.
 
 `turn_id` remains correlation and HTTP interaction compatibility metadata. There is no Turn model,
 TurnRepository, Turn state machine, or `turns` table, and recovery does not load or replay a Turn.
