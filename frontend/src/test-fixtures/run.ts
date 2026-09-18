@@ -1,3 +1,6 @@
+import { runViewSchema } from "../api/dto/run";
+import { adaptRunView, type RunView } from "../api/adapters/run";
+
 /**
  * Minimal valid RunView fixture — mirrors `run_view()` in
  * src/axiom/runtime/control_plane.py. Tests add / mutate fields on top.
@@ -31,4 +34,9 @@ export function makeRunViewDto(overrides: Record<string, unknown> = {}) {
     allowed_operations: ["resume", "cancel"],
     ...overrides,
   };
+}
+
+/** Adapted view-model fixture for view-layer tests (filter/sort/format). */
+export function makeRunView(overrides: Record<string, unknown> = {}): RunView {
+  return adaptRunView(runViewSchema.parse(makeRunViewDto(overrides)));
 }

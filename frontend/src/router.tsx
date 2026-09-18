@@ -6,6 +6,7 @@ import {
 import { AppShell } from "./routes/root";
 import { WorkbenchPage } from "./routes/workbench";
 import { RunsPage } from "./routes/runs";
+import { RunDetailPage } from "./routes/run-detail";
 import { SettingsPage } from "./routes/settings";
 
 const rootRoute = createRootRoute({ component: AppShell });
@@ -22,13 +23,24 @@ const runsRoute = createRoute({
   component: RunsPage,
 });
 
+const runDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/runs/$runId",
+  component: RunDetailPage,
+});
+
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings",
   component: SettingsPage,
 });
 
-const routeTree = rootRoute.addChildren([workbenchRoute, runsRoute, settingsRoute]);
+const routeTree = rootRoute.addChildren([
+  workbenchRoute,
+  runsRoute,
+  runDetailRoute,
+  settingsRoute,
+]);
 
 export const router = createRouter({ routeTree });
 
