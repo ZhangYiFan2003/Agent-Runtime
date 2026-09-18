@@ -21,7 +21,8 @@ Core runtime choices:
 - Durable Runtime persistence: SQLite by default for local/single-node use, with an optional
   PostgreSQL shared-store backend (`psycopg` + bounded pool) for cross-process durable truth.
   SQLite is locally verified, and the PostgreSQL contract and concurrency suite has passed
-  against a real local PostgreSQL 15.12 instance. Ordinary CI does not yet provision PostgreSQL.
+  against a real local PostgreSQL 15.12 instance. The required GitHub integration job now
+  provisions PostgreSQL 15 and reruns the storage/ownership contract with a zero-skip guard.
 - Distributed Run ownership on PostgreSQL: durable runnable metadata, atomic short-transaction
   claims, database-time leases, heartbeat renewal, per-Run fencing generations, expired-lease
   takeover, and ownership-fenced Checkpoint, ToolExecution, and budget writes. SQLite remains the
@@ -1082,6 +1083,30 @@ Independent clients receive the same stream, transport keepalives are comments r
 Events, and a terminal Run closes after a final quiet poll. Built context, client cursors, SSE
 connections, polls, and keepalives are not persisted. PostgreSQL polling may later be optimized by
 LISTEN/NOTIFY, but Redis or a broker is not required for correctness.
+
+### 12.1.4 Continuous PostgreSQL verification and operational configuration
+
+The ordinary Ubuntu unit suite remains PostgreSQL-independent, while the separate required
+`postgres-integration` job provisions an ephemeral PostgreSQL 15 service and executes the durable
+storage plus distributed-ownership contract. It fails if any selected test skips. This continuously
+checks fresh schema bootstrap, v4-to-v5 migration, future-schema rejection, CAS, concurrent claims,
+lease renewal/takeover, fencing, admission and active-capacity ceilings, bounded redelivery,
+submission idempotency, and manual requeue. The 25-scenario recovery matrix takes roughly a minute
+locally and therefore runs nightly or through `workflow_dispatch`, rather than slowing every unit
+job. The blocking contract currently takes about 30 seconds against the local PostgreSQL service;
+actual cold-run GitHub setup timing is recorded only after the workflow is published. Developers
+without PostgreSQL can still run the normal unit suite; local integration tests
+remain conditionally skipped unless their existing test DSN is configured.
+
+Distributed configuration fails fast when the backend is not PostgreSQL, the PostgreSQL DSN is
+missing, pool sizes/timeouts are invalid, capacity or delivery limits are non-positive, or the
+heartbeat is not positive and shorter than the lease. `max_run_delivery_attempts = null` remains
+an intentional development-compatible default: delivery is unbounded until an operator chooses a
+finite limit. Distributed `/health` diagnostics expose backend/schema, ownership timing, capacity,
+and whether redelivery is bounded, but never the DSN. Queue saturation and failure-queued Runs are
+operational state, not process-health failure. Readiness means PostgreSQL correctness authority is
+reachable; the Runtime still fails closed and never falls back to SQLite when that authority is
+unavailable. A heartbeat renewal error cancels local execution rather than assuming ownership.
 
 ## 12.2 Canonical Runtime domain model
 
