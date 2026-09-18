@@ -281,7 +281,20 @@ def load_config(
     config = _dict_to_config(data)
     config.memory.long_term_db_path = _expand_home(config.memory.long_term_db_path)
     config.policy.audit_log_path = _expand_home(config.policy.audit_log_path)
-    if config.worker.distributed_enabled and config.storage.backend.strip().lower() != "postgres":
+    storage_backend = config.storage.backend.strip().lower()
+    if storage_backend not in {"sqlite", "postgres"}:
+        raise ValueError("storage.backend must be sqlite or postgres")
+    if storage_backend == "postgres" and not config.storage.postgres_dsn.strip():
+        raise ValueError("storage.postgres_dsn is required for the postgres backend")
+    if storage_backend == "postgres" and (
+        config.storage.pool_min_size <= 0
+        or config.storage.pool_max_size < config.storage.pool_min_size
+        or config.storage.connect_timeout_seconds <= 0
+    ):
+        raise ValueError(
+            "PostgreSQL pool sizes must be positive and ordered, with a positive connect timeout"
+        )
+    if config.worker.distributed_enabled and storage_backend != "postgres":
         raise ValueError("distributed Worker ownership requires storage.backend=postgres")
     if config.worker.distributed_enabled and (
         config.worker.lease_seconds <= 0

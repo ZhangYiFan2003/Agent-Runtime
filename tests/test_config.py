@@ -103,3 +103,58 @@ def test_run_delivery_limit_must_be_positive(tmp_path):
             overrides={"worker": {"max_run_delivery_attempts": 0}},
             env={},
         )
+
+
+@pytest.mark.parametrize(
+    ("worker", "message"),
+    [
+        ({"lease_seconds": 0}, "heartbeat shorter than lease"),
+        (
+            {"lease_seconds": 10, "heartbeat_interval_seconds": 10},
+            "heartbeat shorter than lease",
+        ),
+        ({"poll_interval_seconds": 0}, "positive polling"),
+    ],
+)
+def test_distributed_worker_rejects_unsafe_timing(tmp_path, worker, message):
+    with pytest.raises(ValueError, match=message):
+        load_config(
+            project_root=tmp_path,
+            overrides={
+                "storage": {"backend": "postgres", "postgres_dsn": "postgresql://local/test"},
+                "worker": {"distributed_enabled": True, **worker},
+            },
+            env={},
+        )
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        {"backend": "postgres", "postgres_dsn": ""},
+        {"backend": "postgres", "postgres_dsn": "postgresql://local/test", "pool_min_size": 0},
+        {
+            "backend": "postgres",
+            "postgres_dsn": "postgresql://local/test",
+            "pool_min_size": 3,
+            "pool_max_size": 2,
+        },
+        {
+            "backend": "postgres",
+            "postgres_dsn": "postgresql://local/test",
+            "connect_timeout_seconds": 0,
+        },
+    ],
+)
+def test_postgres_storage_configuration_fails_fast(tmp_path, storage):
+    with pytest.raises(ValueError, match="postgres|PostgreSQL"):
+        load_config(project_root=tmp_path, overrides={"storage": storage}, env={})
+
+
+def test_sqlite_does_not_require_postgres_pool_configuration(tmp_path):
+    config = load_config(
+        project_root=tmp_path,
+        overrides={"storage": {"backend": "sqlite", "pool_min_size": 0}},
+        env={},
+    )
+    assert config.storage.backend == "sqlite"

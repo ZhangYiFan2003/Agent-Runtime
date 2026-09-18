@@ -339,6 +339,7 @@ class RuntimeApiServer:
         query = parse_qs(parsed.query)
         if method == "GET" and path == "/health":
             capacity = self._capacity_health()
+            distributed = self._distributed_health()
             _send_json(
                 request,
                 200,
@@ -349,6 +350,11 @@ class RuntimeApiServer:
                     "storage_backend": self.storage_backend,
                     "sse": self._sse_health(),
                     **({"capacity": capacity} if capacity is not None else {}),
+                    **(
+                        {"distributed_runtime": distributed}
+                        if distributed is not None
+                        else {}
+                    ),
                 },
             )
             return
@@ -590,6 +596,25 @@ class RuntimeApiServer:
                 "active_followers": self._active_sse_followers,
                 "reconnects": self._sse_reconnects,
             }
+
+    def _distributed_health(self) -> dict[str, object] | None:
+        if not self.config.worker.distributed_enabled:
+            return None
+        from axiom.runtime.postgres import POSTGRES_SCHEMA_VERSION
+
+        delivery_limit = self.config.worker.max_run_delivery_attempts
+        return {
+            "ownership_enabled": True,
+            "storage_backend": self.storage_backend,
+            "schema_version": POSTGRES_SCHEMA_VERSION,
+            "lease_seconds": self.config.worker.lease_seconds,
+            "heartbeat_interval_seconds": self.config.worker.heartbeat_interval_seconds,
+            "poll_interval_seconds": self.config.worker.poll_interval_seconds,
+            "max_queued_runs": self.config.capacity.max_queued_runs,
+            "max_active_runs": self.config.capacity.max_active_runs,
+            "max_run_delivery_attempts": delivery_limit,
+            "redelivery_bounded": delivery_limit is not None,
+        }
 
     async def _run_turn(
         self,

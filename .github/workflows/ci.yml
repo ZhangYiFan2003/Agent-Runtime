@@ -39,6 +39,61 @@ jobs:
       - name: Run tests
         run: uv run --locked pytest
 
+  postgres-integration:
+    name: postgres-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: axiom_ci
+          POSTGRES_PASSWORD: axiom_ci
+          POSTGRES_DB: axiom_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U axiom_ci -d axiom_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      AXIOM_TEST_POSTGRES_DSN: postgresql://axiom_ci:axiom_ci@127.0.0.1:5432/axiom_ci
+      AXIOM_POSTGRES_CI_REQUIRED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+
+      - name: Sync PostgreSQL test dependencies
+        run: uv sync --extra dev --extra postgres --locked
+
+      - name: Report safe PostgreSQL diagnostics
+        run: |
+          uv run --locked python -c "import os, psycopg; conn = psycopg.connect(os.environ['AXIOM_TEST_POSTGRES_DSN']); print('PostgreSQL server:', conn.execute('show server_version').fetchone()[0]); conn.close()"
+          uv run --locked python -c "from axiom.runtime.postgres import POSTGRES_SCHEMA_VERSION; print('Axiom Runtime schema:', POSTGRES_SCHEMA_VERSION)"
+
+      - name: Run blocking PostgreSQL correctness contract
+        run: >-
+          uv run --locked pytest
+          tests/test_durable_storage.py
+          tests/test_distributed_ownership.py
+          -o addopts=''
+          --strict-config
+          --strict-markers
+          -ra
+
   mcp-windows:
     runs-on: windows-latest
     timeout-minutes: 15

@@ -302,7 +302,7 @@ class PostgresRuntimeStore:
                 (checkpoint.thread_id, idempotency_key),
             ).fetchone()
             if existing is not None:
-                if str(existing[0]) != request_fingerprint:
+                if _text(existing[0]) != request_fingerprint:
                     self._idempotency_conflicts += 1
                     raise ApiError(
                         "IDEMPOTENCY_KEY_CONFLICT",
@@ -311,7 +311,7 @@ class PostgresRuntimeStore:
                     )
                 row = conn.execute(
                     f"select {_RUN_STATE_SELECT} from runs where run_id = %s",
-                    (str(existing[1]),),
+                    (_text(existing[1]),),
                 ).fetchone()
                 if row is None:
                     raise RuntimeError("submission idempotency mapping references a missing Run")
@@ -778,7 +778,7 @@ class PostgresRuntimeStore:
     ) -> RunOwnership | None:
         if candidate is None:
             return None
-        previous_worker_id = str(candidate[1]) if candidate[1] is not None else None
+        previous_worker_id = _optional_text(candidate[1])
         delivery_attempt = int(candidate[2])
         takeover = previous_worker_id is not None
         next_attempt = (
@@ -818,7 +818,7 @@ class PostgresRuntimeStore:
                 previous_worker_id,
                 takeover,
                 int(candidate[9]),
-                candidate[0],
+                _text(candidate[0]),
             ),
         ).fetchone()
         return _ownership(row, takeover=takeover)
@@ -954,7 +954,7 @@ class PostgresEventRepository:
     def list_threads(self) -> list[str]:
         with self.pool.connection() as conn:
             rows = conn.execute("select id from threads order by created_at, id").fetchall()
-        return [str(row[0]) for row in rows]
+            return [_text(row[0]) for row in rows]
 
     def append_event(self, thread_id: str, event_type: str, payload: dict[str, Any]) -> int:
         with self.pool.connection() as conn:
@@ -1014,8 +1014,8 @@ class PostgresEventRepository:
         return [
             RuntimeEvent(
                 id=int(row[0]),
-                thread_id=str(row[1]),
-                type=str(row[2]),
+                thread_id=_text(row[1]),
+                type=_text(row[2]),
                 payload=dict(row[3]),
                 created_at=_timestamp(row[4]) or "",
                 turn_id=_optional_text(row[5]),
@@ -1208,20 +1208,20 @@ def _checkpoint_with_delivery(row: Sequence[object]) -> Checkpoint:
 def _tool_record(row: Sequence[object]) -> ToolExecutionRecord:
     return ToolExecutionRecord.from_dict(
         {
-            "invocation_id": row[0],
-            "run_id": row[1],
-            "tool_call_id": row[2],
-            "tool_name": row[3],
-            "arguments_hash": row[4],
-            "status": row[5],
+            "invocation_id": _text(row[0]),
+            "run_id": _text(row[1]),
+            "tool_call_id": _text(row[2]),
+            "tool_name": _text(row[3]),
+            "arguments_hash": _text(row[4]),
+            "status": _text(row[5]),
             "attempt": row[6],
-            "result": row[7],
+            "result": _optional_text(row[7]),
             "is_error": bool(row[8]),
-            "error": row[9],
-            "last_failure_category": row[10],
-            "last_error_code": row[11],
-            "retry_state": row[12],
-            "retry_suppressed_reason": row[13],
+            "error": _optional_text(row[9]),
+            "last_failure_category": _optional_text(row[10]),
+            "last_error_code": _optional_text(row[11]),
+            "retry_state": _text(row[12]),
+            "retry_suppressed_reason": _optional_text(row[13]),
             "next_retry_at": _timestamp(row[14]),
             "retry_backoff_seconds": row[15],
             "started_at": _timestamp(row[16]),
@@ -1233,13 +1233,13 @@ def _tool_record(row: Sequence[object]) -> ToolExecutionRecord:
 
 def _control_record(row: Sequence[object]) -> ControlOperationRecord:
     return ControlOperationRecord(
-        operation_id=str(row[0]),
-        idempotency_key=str(row[1]),
-        run_id=str(row[2]),
-        operation=ControlOperationName(str(row[3])),
-        status=ControlOperationStatus(str(row[4])),
+        operation_id=_text(row[0]),
+        idempotency_key=_text(row[1]),
+        run_id=_text(row[2]),
+        operation=ControlOperationName(_text(row[3])),
+        status=ControlOperationStatus(_text(row[4])),
         request=dict(row[6]),
-        request_hash=str(row[5]),
+        request_hash=_text(row[5]),
         result=dict(row[7]) if row[7] is not None else None,
         error=dict(row[8]) if row[8] is not None else None,
         created_at=_timestamp(row[9]) or "",
@@ -1269,11 +1269,18 @@ def _timestamp(value: object) -> str | None:
         return None
     if isinstance(value, datetime):
         return value.isoformat()
+    return _text(value)
+
+
+def _text(value: object) -> str:
+    """Normalize PostgreSQL text values across psycopg text/binary protocols."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
     return str(value)
 
 
 def _optional_text(value: object) -> str | None:
-    return str(value) if value is not None else None
+    return _text(value) if value is not None else None
 
 
 def _now() -> str:
@@ -1286,8 +1293,8 @@ def _ownership(row, *, takeover: bool | None = None) -> RunOwnership:
         lease_until = lease_until.replace(tzinfo=UTC)
     token = int(row[2])
     return RunOwnership(
-        run_id=str(row[0]),
-        worker_id=str(row[1]),
+        run_id=_text(row[0]),
+        worker_id=_text(row[1]),
         fencing_token=token,
         lease_until=lease_until.astimezone(UTC),
         takeover=token > 1 if takeover is None else takeover,
@@ -1311,7 +1318,7 @@ def _mark_delivery_exhausted(
     state.failure_queued_at = now
     state.last_delivery_failure = "lease_expired"
     state.last_delivery_failed_at = now
-    state.last_delivery_worker_id = str(candidate[1])
+    state.last_delivery_worker_id = _optional_text(candidate[1])
     state.last_delivery_fencing_token = int(candidate[9])
     state.error = RunError(
         type=RUN_DELIVERY_EXHAUSTED,

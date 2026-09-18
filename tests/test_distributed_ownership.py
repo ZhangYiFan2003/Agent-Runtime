@@ -263,7 +263,7 @@ def test_capacity_schema_migrates_v2_with_coordination_only(postgres_storage):
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()[0]
         columns = {
-            row[0]
+            row[0].decode() if isinstance(row[0], bytes) else row[0]
             for row in conn.execute(
                 """
                 select column_name from information_schema.columns
@@ -301,7 +301,7 @@ def test_schema_v3_additively_migrates_delivery_metadata(postgres_storage):
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()[0]
         columns = {
-            row[0]
+            row[0].decode() if isinstance(row[0], bytes) else row[0]
             for row in conn.execute(
                 """
                 select column_name from information_schema.columns
@@ -335,7 +335,7 @@ def test_schema_v4_additively_migrates_submission_idempotency(postgres_storage):
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()[0]
         columns = {
-            row[0]
+            row[0].decode() if isinstance(row[0], bytes) else row[0]
             for row in conn.execute(
                 """
                 select column_name from information_schema.columns
@@ -546,6 +546,30 @@ def test_capacity_blocked_worker_reuses_bounded_idle_polling():
 
     assert store.claims == 1
     assert sleeps == [0.25]
+
+
+def test_claim_database_failure_does_not_start_execution():
+    started = False
+
+    class UnavailableStore:
+        backend = "postgres"
+
+        async def claim_next(self, *_args):
+            raise ConnectionError("database unavailable")
+
+    def runtime_factory(_ownership):
+        nonlocal started
+        started = True
+        raise AssertionError("execution must not start without a durable claim")
+
+    worker = DistributedRunWorker(
+        store=UnavailableStore(),
+        runtime_factory=runtime_factory,
+    )
+
+    with pytest.raises(ConnectionError, match="database unavailable"):
+        asyncio.run(worker.run_once())
+    assert started is False
 
 
 @pytest.mark.postgres
@@ -1199,6 +1223,14 @@ def test_operational_control_flow_keeps_one_run_and_requeues_same_state(
         engine_factory=factory,
         durable_storage=postgres_storage,
     )
+    health = _ApiRequest("/health", key="unused-for-health", method="GET")
+    server._handle(health)
+    diagnostics = health.json()["distributed_runtime"]
+    assert diagnostics["storage_backend"] == "postgres"
+    assert diagnostics["schema_version"] == 5
+    assert diagnostics["ownership_enabled"] is True
+    assert diagnostics["redelivery_bounded"] is False
+    assert "postgres_dsn" not in json.dumps(diagnostics)
     thread_id = server.repository.create_thread()
     first_request = _ApiRequest(
         f"/v1/threads/{thread_id}/turns",

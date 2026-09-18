@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -26,23 +27,15 @@ from axiom.runtime.storage import DurableStorage, create_durable_storage
 from axiom.tools import ToolRegistry
 
 
-@pytest.fixture(params=("sqlite", "postgres"))
-def durable_storage(request, tmp_path) -> Iterator[DurableStorage]:
-    if request.param == "sqlite":
-        storage = create_durable_storage(
-            StorageConfig(), default_sqlite_path=tmp_path / "runtime.db"
-        )
-        yield storage
-        storage.close()
-        return
-
+@contextmanager
+def _isolated_postgres_storage(tmp_path, prefix: str) -> Iterator[DurableStorage]:
     dsn = os.environ.get("AXIOM_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("AXIOM_TEST_POSTGRES_DSN is not configured")
     psycopg = pytest.importorskip("psycopg")
     sql = pytest.importorskip("psycopg.sql")
     conninfo = pytest.importorskip("psycopg.conninfo")
-    schema = f"axiom_test_{uuid4().hex}"
+    schema = f"{prefix}_{uuid4().hex}"
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute(sql.SQL("create schema {}").format(sql.Identifier(schema)))
     isolated_dsn = conninfo.make_conninfo(dsn, options=f"-c search_path={schema}")
@@ -56,6 +49,25 @@ def durable_storage(request, tmp_path) -> Iterator[DurableStorage]:
         storage.close()
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(sql.SQL("drop schema {} cascade").format(sql.Identifier(schema)))
+
+
+@pytest.fixture(params=("sqlite", "postgres"))
+def durable_storage(request, tmp_path) -> Iterator[DurableStorage]:
+    if request.param == "sqlite":
+        storage = create_durable_storage(
+            StorageConfig(), default_sqlite_path=tmp_path / "runtime.db"
+        )
+        yield storage
+        storage.close()
+        return
+    with _isolated_postgres_storage(tmp_path, "axiom_test") as storage:
+        yield storage
+
+
+@pytest.fixture
+def postgres_storage(tmp_path) -> Iterator[DurableStorage]:
+    with _isolated_postgres_storage(tmp_path, "axiom_postgres_contract") as storage:
+        yield storage
 
 
 def test_storage_configuration_defaults_to_sqlite_and_redacts_dsn(tmp_path):
@@ -399,9 +411,8 @@ def test_cancelled_ancestor_reconciliation_contract(durable_storage, tmp_path):
 
 
 @pytest.mark.postgres
-def test_postgres_concurrent_checkpoint_cas_has_one_winner(durable_storage):
-    if durable_storage.backend != "postgres":
-        pytest.skip("PostgreSQL-only concurrency contract")
+def test_postgres_concurrent_checkpoint_cas_has_one_winner(postgres_storage):
+    durable_storage = postgres_storage
     state = Checkpoint.create(
         thread_id="thread-concurrent-cas", run_id="run-concurrent-cas", input="work"
     )
@@ -428,9 +439,8 @@ def test_postgres_concurrent_checkpoint_cas_has_one_winner(durable_storage):
 
 
 @pytest.mark.postgres
-def test_postgres_concurrent_tool_insert_keeps_one_durable_row(durable_storage):
-    if durable_storage.backend != "postgres":
-        pytest.skip("PostgreSQL-only concurrency contract")
+def test_postgres_concurrent_tool_insert_keeps_one_durable_row(postgres_storage):
+    durable_storage = postgres_storage
     first = _tool_record(invocation_id="invocation-concurrent")
     second = deepcopy(first)
     first.result = "first"
@@ -453,9 +463,8 @@ def test_postgres_concurrent_tool_insert_keeps_one_durable_row(durable_storage):
 
 
 @pytest.mark.postgres
-def test_postgres_rejects_future_schema_version(durable_storage):
-    if durable_storage.backend != "postgres":
-        pytest.skip("PostgreSQL-only schema contract")
+def test_postgres_rejects_future_schema_version(postgres_storage):
+    durable_storage = postgres_storage
     from axiom.runtime.postgres import PostgresSchemaError, initialize_postgres_schema
 
     pool = durable_storage._close
