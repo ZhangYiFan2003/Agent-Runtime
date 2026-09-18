@@ -1108,6 +1108,32 @@ operational state, not process-health failure. Readiness means PostgreSQL correc
 reachable; the Runtime still fails closed and never falls back to SQLite when that authority is
 unavailable. A heartbeat renewal error cancels local execution rather than assuming ownership.
 
+### 12.1.5 Traffic governance v1
+
+Distributed root submission governance is layered and intentionally separate. A PostgreSQL-backed
+token bucket limits new root-submission frequency and burst size; it is not an edge DDoS shield and
+does not apply to health, SSE, control operations, Worker polling, or internal Child Runs. An
+already-existing idempotency replay uses the request-frequency interpretation and therefore still
+passes through the HTTP submission limiter, while it never creates a second Run. Rate rejection is
+`429 RATE_LIMITED` with a retry hint; global backlog admission remains `503`, and principal queue
+quota rejection is `429 PRINCIPAL_QUEUE_QUOTA_EXCEEDED`.
+
+Runs persist an opaque `principal_key`, bounded base priority (`LOW`, `NORMAL`, `HIGH` represented
+as 0, 1, and 2), and `runnable_since` in the durable state head. Public API submissions use the
+fixed `default` principal and `NORMAL` priority because this Runtime has no authenticated identity
+boundary; the key is scheduling/accounting metadata, not tenant security. Claim ordering applies
+bounded aging to base priority, then earliest runnable time and Run ID as a stable tie-breaker.
+Waiting/resume and manual requeue start a fresh runnable interval; lease takeover preserves the
+principal and base priority. Principal queue quota applies only to externally admitted Root Runs.
+Principal active quota applies to independently claimed Runs, including Children, and is checked
+alongside the existing global active ceiling. This provides priority scheduling with aging and
+principal isolation, not strict weighted fairness or preemption.
+
+The v1 PostgreSQL bucket and existing singleton capacity row are deliberately simple coordination
+hotspots suitable for current Runtime scale. A gateway, Redis, or dedicated rate-limit service may
+be appropriate at substantially higher QPS, but is outside this milestone. SQLite remains compatible
+for local execution; distributed token and principal-quota guarantees are PostgreSQL-only.
+
 ## 12.2 Canonical Runtime domain model
 
 Thread manages conversation scope. Run is the only durable execution/control/ownership unit and
