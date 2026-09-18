@@ -124,6 +124,9 @@ class RunState:
     completion_verification: dict[str, Any] = field(default_factory=dict)
     completion_verification_attempts: int = 0
     run_kind: str = "agent"
+    principal_key: str = "default"
+    base_priority: int = 1
+    runnable_since: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     next_tool_index: int = 0
     decisions: dict[str, str] = field(default_factory=dict)
@@ -151,6 +154,8 @@ class RunState:
         parent_run_id: str | None = None,
         parent_step_id: str | None = None,
         run_kind: str = "agent",
+        principal_key: str = "default",
+        base_priority: int = 1,
         budget_owner_run_id: str | None = None,
         budget_policy: dict[str, Any] | None = None,
         progress_policy: dict[str, Any] | None = None,
@@ -167,6 +172,9 @@ class RunState:
             parent_run_id=parent_run_id,
             parent_step_id=parent_step_id,
             run_kind=run_kind,
+            principal_key=principal_key or "default",
+            base_priority=base_priority,
+            runnable_since=datetime.now(UTC).isoformat(),
             budget_owner_run_id=budget_owner_run_id,
             budget_policy=dict(budget_policy or {}),
             progress_policy=dict(progress_policy or {}),
@@ -208,6 +216,9 @@ class RunState:
             "completion_verification": _json_value(self.completion_verification),
             "completion_verification_attempts": self.completion_verification_attempts,
             "run_kind": self.run_kind,
+            "principal_key": self.principal_key,
+            "base_priority": self.base_priority,
+            "runnable_since": self.runnable_since,
             "pending_tool_calls": _json_value(self.pending_tool_calls),
             "next_tool_index": self.next_tool_index,
             "decisions": dict(self.decisions),
@@ -259,6 +270,15 @@ class RunState:
                 0, int(data.get("completion_verification_attempts") or 0)
             ),
             run_kind=str(data.get("run_kind") or "agent"),
+            principal_key=str(data.get("principal_key") or "default"),
+            base_priority=int(
+                data.get("base_priority") if data.get("base_priority") is not None else 1
+            ),
+            runnable_since=str(
+                data.get("runnable_since")
+                or data.get("created_at")
+                or datetime.now(UTC).isoformat()
+            ),
             pending_tool_calls=[item for item in raw_calls if isinstance(item, dict)]
             if isinstance(raw_calls, list)
             else [],

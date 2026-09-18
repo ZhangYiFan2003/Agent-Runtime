@@ -27,7 +27,7 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.ownership import OwnershipLostError, RunOwnership
 
-POSTGRES_SCHEMA_VERSION = 5
+POSTGRES_SCHEMA_VERSION = 6
 RUN_DELIVERY_EXHAUSTED = "RUN_DELIVERY_EXHAUSTED"
 
 
@@ -106,7 +106,7 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()
         version = int(row[0]) if row else POSTGRES_SCHEMA_VERSION
-        if version not in {1, 2, 3, 4, POSTGRES_SCHEMA_VERSION}:
+        if version not in {1, 2, 3, 4, 5, POSTGRES_SCHEMA_VERSION}:
             raise PostgresSchemaError(
                 f"unsupported PostgreSQL runtime schema version: {version}"
             )
@@ -138,10 +138,16 @@ class PostgresRuntimeStore:
         self._manual_requeues = 0
 
     async def admit_run(
-        self, checkpoint: Checkpoint, max_queued_runs: int | None = None
+        self,
+        checkpoint: Checkpoint,
+        max_queued_runs: int | None = None,
+        *,
+        max_queued_runs_per_principal: int | None = None,
     ) -> None:
         _require_optional_limit(max_queued_runs, "max_queued_runs")
-        await asyncio.to_thread(self._admit_run, checkpoint, max_queued_runs)
+        await asyncio.to_thread(
+            self._admit_run, checkpoint, max_queued_runs, max_queued_runs_per_principal
+        )
 
     async def admit_submission(
         self,
@@ -150,6 +156,7 @@ class PostgresRuntimeStore:
         idempotency_key: str,
         request_fingerprint: str,
         max_queued_runs: int | None = None,
+        max_queued_runs_per_principal: int | None = None,
     ) -> tuple[Checkpoint, bool]:
         _require_optional_limit(max_queued_runs, "max_queued_runs")
         return await asyncio.to_thread(
@@ -158,6 +165,7 @@ class PostgresRuntimeStore:
             idempotency_key,
             request_fingerprint,
             max_queued_runs,
+            max_queued_runs_per_principal,
         )
 
     async def requeue_delivery_exhausted(self, run_id: str) -> Checkpoint:
@@ -203,6 +211,9 @@ class PostgresRuntimeStore:
         lease_seconds: float,
         max_active_runs: int | None = None,
         max_run_delivery_attempts: int | None = None,
+        max_active_runs_per_principal: int | None = None,
+        aging_interval_seconds: float = 300.0,
+        aging_boost_cap: int = 2,
     ) -> RunOwnership | None:
         _require_positive_lease(lease_seconds)
         _require_optional_limit(max_active_runs, "max_active_runs")
@@ -214,6 +225,9 @@ class PostgresRuntimeStore:
             lease_seconds,
             max_active_runs,
             max_run_delivery_attempts,
+            max_active_runs_per_principal,
+            aging_interval_seconds,
+            aging_boost_cap,
         )
 
     async def claim_next(
@@ -222,6 +236,9 @@ class PostgresRuntimeStore:
         lease_seconds: float,
         max_active_runs: int | None = None,
         max_run_delivery_attempts: int | None = None,
+        max_active_runs_per_principal: int | None = None,
+        aging_interval_seconds: float = 300.0,
+        aging_boost_cap: int = 2,
     ) -> RunOwnership | None:
         _require_positive_lease(lease_seconds)
         _require_optional_limit(max_active_runs, "max_active_runs")
@@ -232,6 +249,9 @@ class PostgresRuntimeStore:
             lease_seconds,
             max_active_runs,
             max_run_delivery_attempts,
+            max_active_runs_per_principal,
+            aging_interval_seconds,
+            aging_boost_cap,
         )
 
     async def renew_lease(
@@ -261,7 +281,32 @@ class PostgresRuntimeStore:
             self._capacity_snapshot, max_queued_runs, max_active_runs
         )
 
-    def _admit_run(self, checkpoint: Checkpoint, max_queued_runs: int | None) -> None:
+    async def consume_submission_tokens(
+        self,
+        principal_key: str,
+        *,
+        global_rate: float | None,
+        global_burst: int | None,
+        principal_rate: float | None,
+        principal_burst: int | None,
+    ) -> float | None:
+        """Consume one distributed new-root token; return retry seconds if blocked."""
+        return await asyncio.to_thread(
+            _consume_submission_tokens,
+            self,
+            principal_key,
+            global_rate,
+            global_burst,
+            principal_rate,
+            principal_burst,
+        )
+
+    def _admit_run(
+        self,
+        checkpoint: Checkpoint,
+        max_queued_runs: int | None,
+        max_queued_runs_per_principal: int | None,
+    ) -> None:
         if checkpoint.sequence != 0:
             raise ValueError("only a new Run may pass external admission")
         updated_at = _now()
@@ -277,6 +322,9 @@ class PostgresRuntimeStore:
                 raise AdmissionRejectedError(
                     queued_runs=queued, max_queued_runs=max_queued_runs
                 )
+            _check_principal_queue_quota(
+                conn, checkpoint.principal_key, max_queued_runs_per_principal
+            )
             _insert_initial_run(conn, checkpoint, updated_at=updated_at, runnable=True)
         checkpoint.sequence = 1
         checkpoint.updated_at = updated_at
@@ -287,6 +335,7 @@ class PostgresRuntimeStore:
         idempotency_key: str,
         request_fingerprint: str,
         max_queued_runs: int | None,
+        max_queued_runs_per_principal: int | None,
     ) -> tuple[Checkpoint, bool]:
         if checkpoint.sequence != 0 or checkpoint.parent_run_id is not None:
             raise ValueError("only a new root Run may pass submission admission")
@@ -327,6 +376,9 @@ class PostgresRuntimeStore:
                 raise AdmissionRejectedError(
                     queued_runs=queued, max_queued_runs=max_queued_runs
                 )
+            _check_principal_queue_quota(
+                conn, checkpoint.principal_key, max_queued_runs_per_principal
+            )
             _insert_initial_run(conn, checkpoint, updated_at=updated_at, runnable=True)
             conn.execute(
                 """
@@ -518,7 +570,13 @@ class PostgresRuntimeStore:
                     conn.execute(
                         """
                         update runs
-                        set runnable = true
+                        set runnable = true,
+                            state_json = jsonb_set(
+                                state_json,
+                                ARRAY['runnable_since'],
+                                to_jsonb(current_timestamp::text),
+                                true
+                            )
                         where run_id = %s and status = 'WAITING_CHILD'
                           and owner_worker_id is null
                         """,
@@ -674,7 +732,10 @@ class PostgresRuntimeStore:
             row = conn.execute(
                 f"""
                 update runs as candidate
-                set runnable = true
+                set runnable = true,
+                    state_json = jsonb_set(
+                        state_json, ARRAY['runnable_since'], to_jsonb(current_timestamp::text), true
+                    )
                 where run_id = %s
                   and status in ('RUNNING', 'WAITING_CHILD')
                   and {_DEADLINE_IS_LIVE}
@@ -693,6 +754,9 @@ class PostgresRuntimeStore:
         lease_seconds: float,
         max_active_runs: int | None,
         max_run_delivery_attempts: int | None,
+        max_active_runs_per_principal: int | None,
+        aging_interval_seconds: float,
+        aging_boost_cap: int,
     ) -> RunOwnership | None:
         with self.pool.connection() as conn:
             if max_active_runs is not None:
@@ -706,9 +770,15 @@ class PostgresRuntimeStore:
                        candidate.parent_run_id, candidate.fencing_token
                 from runs as candidate
                 where candidate.run_id = %s and {_RUN_IS_CLAIMABLE}
+                  and (%s::integer is null or (
+                    select count(*) from runs as active
+                    where {_RUN_IS_ACTIVE.replace('candidate.', 'active.')}
+                      and active.state_json ->> 'principal_key'
+                          = candidate.state_json ->> 'principal_key'
+                  ) < %s::integer)
                 for update
                 """,
-                (run_id,),
+                (run_id, max_active_runs_per_principal, max_active_runs_per_principal),
             ).fetchone()
             if _delivery_is_exhausted(candidate, max_run_delivery_attempts):
                 _mark_delivery_exhausted(
@@ -733,6 +803,9 @@ class PostgresRuntimeStore:
         lease_seconds: float,
         max_active_runs: int | None,
         max_run_delivery_attempts: int | None,
+        max_active_runs_per_principal: int | None,
+        aging_interval_seconds: float,
+        aging_boost_cap: int,
     ) -> RunOwnership | None:
         with self.pool.connection() as conn:
             if max_active_runs is not None:
@@ -746,10 +819,30 @@ class PostgresRuntimeStore:
                        candidate.parent_run_id, candidate.fencing_token
                 from runs as candidate
                 where {_RUN_IS_CLAIMABLE}
-                order by candidate.created_at, candidate.run_id
+                  and (%s::integer is null or (
+                    select count(*) from runs as active
+                    where {_RUN_IS_ACTIVE.replace('candidate.', 'active.')}
+                      and active.state_json ->> 'principal_key'
+                          = candidate.state_json ->> 'principal_key'
+                  ) < %s::integer)
+                order by
+                    (
+                      coalesce((candidate.state_json ->> 'base_priority')::integer, 1)
+                      + least(
+                          %s,
+                          floor(extract(epoch from current_timestamp -
+                            coalesce((candidate.state_json ->> 'runnable_since')::timestamptz,
+                                     candidate.created_at)) / %s)
+                        )
+                    ) desc,
+                    coalesce((candidate.state_json ->> 'runnable_since')::timestamptz,
+                             candidate.created_at),
+                    candidate.run_id
                 for update skip locked
                 limit 1
                 """,
+                (max_active_runs_per_principal, max_active_runs_per_principal,
+                 aging_boost_cap, aging_interval_seconds),
             ).fetchone()
             if _delivery_is_exhausted(candidate, max_run_delivery_attempts):
                 _mark_delivery_exhausted(
@@ -889,11 +982,20 @@ class PostgresRuntimeStore:
                     runnable = case
                         when status = 'RUNNING' then %s
                         else false
-                    end
+                    end,
+                    state_json = case when status = 'RUNNING' and %s
+                        then jsonb_set(
+                            state_json,
+                            ARRAY['runnable_since'],
+                            to_jsonb(current_timestamp::text),
+                            true
+                        )
+                        else state_json end
                 where run_id = %s and owner_worker_id = %s and fencing_token = %s
                 returning run_id
                 """,
                 (
+                    runnable,
                     runnable,
                     ownership.run_id,
                     ownership.worker_id,
@@ -1437,6 +1539,88 @@ def _active_count(conn) -> int:
     return int(row[0])
 
 
+def _check_principal_queue_quota(conn, principal_key: str, limit: int | None) -> None:
+    if limit is None:
+        return
+    row = conn.execute(
+        f"""
+        select count(*) from runs as candidate
+        where {_RUN_IS_QUEUED}
+          and candidate.parent_run_id is null
+          and candidate.state_json ->> 'principal_key' = %s
+        """,
+        (principal_key,),
+    ).fetchone()
+    if int(row[0]) >= limit:
+        raise ApiError(
+            "PRINCIPAL_QUEUE_QUOTA_EXCEEDED",
+            "principal queued Run quota exceeded",
+            429,
+            details={"queued_runs": int(row[0]), "max_queued_runs_per_principal": limit},
+        )
+
+
+def _consume_bucket(
+    conn, scope: str, scope_key: str, rate: float, burst: int
+) -> tuple[float, float]:
+    conn.execute(
+        """
+        insert into traffic_rate_buckets(scope, scope_key, tokens, last_refill_at)
+        values (%s, %s, %s, current_timestamp)
+        on conflict(scope, scope_key) do nothing
+        """,
+        (scope, scope_key, float(burst)),
+    )
+    row = conn.execute(
+        """
+        select tokens, extract(epoch from current_timestamp - last_refill_at)
+        from traffic_rate_buckets
+        where scope = %s and scope_key = %s
+        for update
+        """,
+        (scope, scope_key),
+    ).fetchone()
+    tokens = min(float(burst), float(row[0]) + max(0.0, float(row[1])) * rate)
+    return tokens, rate
+
+
+def _consume_submission_tokens(
+    self,
+    principal_key: str,
+    global_rate: float | None,
+    global_burst: int | None,
+    principal_rate: float | None,
+    principal_burst: int | None,
+) -> float | None:
+    buckets: list[tuple[str, str, float, int]] = []
+    if global_rate is not None and global_burst is not None:
+        buckets.append(("global", "root_submission", global_rate, global_burst))
+    if principal_rate is not None and principal_burst is not None:
+        buckets.append(("principal", principal_key, principal_rate, principal_burst))
+    if not buckets:
+        return None
+    with self.pool.connection() as conn:
+        states = [_consume_bucket(conn, *bucket) for bucket in buckets]
+        if any(tokens < 1.0 for tokens, _ in states):
+            waits = [
+                max(0.0, (1.0 - tokens) / bucket[2])
+                for (tokens, _), bucket in zip(states, buckets, strict=True)
+            ]
+            return max(waits) if waits else None
+        for (scope, scope_key, _rate, _burst), (tokens, _rate_value) in zip(
+            buckets, states, strict=True
+        ):
+            conn.execute(
+                """
+                update traffic_rate_buckets
+                set tokens = %s - 1, last_refill_at = current_timestamp
+                where scope = %s and scope_key = %s
+                """,
+                (tokens, scope, scope_key),
+            )
+    return None
+
+
 def _insert_initial_run(conn, checkpoint: Checkpoint, *, updated_at: str, runnable: bool) -> None:
     state = checkpoint.to_dict()
     state["sequence"] = 1
@@ -1679,6 +1863,15 @@ _SCHEMA_STATEMENTS = (
     insert into runtime_capacity_coordination(singleton)
     values (true)
     on conflict(singleton) do nothing
+    """,
+    """
+    create table if not exists traffic_rate_buckets (
+        scope text not null,
+        scope_key text not null,
+        tokens double precision not null,
+        last_refill_at timestamptz not null,
+        primary key(scope, scope_key)
+    )
     """,
     """
     create index if not exists idx_control_operations_interrupt

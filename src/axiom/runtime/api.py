@@ -375,6 +375,7 @@ class RuntimeApiServer:
                 if not message:
                     _send_json(request, 400, {"error": "message is required"})
                     return
+                principal_key = "default"
                 submission_key = _idempotency_key(request, body)
                 idempotent_submission = submission_key is not None
                 if idempotent_submission and not (
@@ -391,6 +392,27 @@ class RuntimeApiServer:
                     _send_json(request, 409, {"error": "thread turn already running"})
                     return
                 try:
+                    if self.config.worker.distributed_enabled:
+                        limiter = getattr(self.checkpoint_store, "consume_submission_tokens", None)
+                        if limiter is not None:
+                            retry_after = asyncio.run(
+                                limiter(
+                                    principal_key,
+                                    global_rate=self.config.traffic.global_submission_rate,
+                                    global_burst=self.config.traffic.global_submission_burst,
+                                    principal_rate=self.config.traffic.principal_submission_rate,
+                                    principal_burst=self.config.traffic.principal_submission_burst,
+                                )
+                            )
+                            if retry_after is not None:
+                                raise ApiError(
+                                    "RATE_LIMITED",
+                                    "new Root Run submission rate limit exceeded",
+                                    429,
+                                    details={
+                                        "retry_after_seconds": max(1, int(retry_after + 0.999))
+                                    },
+                                )
                     if submission_key is None:
                         result = asyncio.run(self._run_turn(thread_id, message))
                     else:
@@ -554,7 +576,17 @@ class RuntimeApiServer:
             else:
                 _send_json(request, 404, {"error": "not found"})
         except ApiError as exc:
-            _send_json(request, exc.http_status, exc.to_dict())
+            retry_after = exc.details.get("retry_after_seconds")
+            _send_json(
+                request,
+                exc.http_status,
+                exc.to_dict(),
+                headers=(
+                    {"retry-after": str(max(1, int(retry_after)))}
+                    if retry_after is not None
+                    else None
+                ),
+            )
         except AdmissionRejectedError as exc:
             error = ApiError(
                 exc.reason,
@@ -624,6 +656,7 @@ class RuntimeApiServer:
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         history_events = await self._list_events_async(thread_id)
+        principal_key = "default"
         history = self.memory_service.history_from_runtime_events(history_events)
         turn_id = f"turn_{uuid4().hex}"
         run_id = f"run_{uuid4().hex}"
@@ -658,6 +691,8 @@ class RuntimeApiServer:
                             run_id=run_id,
                             turn_id=turn_id,
                             max_queued_runs=self.config.capacity.max_queued_runs,
+                            principal_key=principal_key,
+                            base_priority=1,
                         )
                     else:
                         state, created = await runtime.submit_idempotent(
@@ -668,6 +703,8 @@ class RuntimeApiServer:
                             turn_id=turn_id,
                             idempotency_key=idempotency_key,
                             max_queued_runs=self.config.capacity.max_queued_runs,
+                            principal_key=principal_key,
+                            base_priority=1,
                         )
                         if created:
                             await self._record_user_turn(
@@ -1814,11 +1851,19 @@ def _read_json(request: BaseHTTPRequestHandler) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _send_json(request: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+def _send_json(
+    request: BaseHTTPRequestHandler,
+    status: int,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request.send_response(status)
     request.send_header("content-type", "application/json")
     request.send_header("content-length", str(len(body)))
+    for name, value in (headers or {}).items():
+        request.send_header(name, value)
     request.end_headers()
     request.wfile.write(body)
 

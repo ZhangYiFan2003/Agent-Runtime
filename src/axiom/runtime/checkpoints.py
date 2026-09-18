@@ -61,7 +61,11 @@ class RuntimeStore(RunStateStore, ToolExecutionStore, Protocol):
 
 class DistributedRuntimeStore(RuntimeStore, Protocol):
     async def admit_run(
-        self, checkpoint: Checkpoint, max_queued_runs: int | None = None
+        self,
+        checkpoint: Checkpoint,
+        max_queued_runs: int | None = None,
+        *,
+        max_queued_runs_per_principal: int | None = None,
     ) -> None: ...
 
     async def admit_submission(
@@ -71,6 +75,7 @@ class DistributedRuntimeStore(RuntimeStore, Protocol):
         idempotency_key: str,
         request_fingerprint: str,
         max_queued_runs: int | None = None,
+        max_queued_runs_per_principal: int | None = None,
     ) -> tuple[Checkpoint, bool]: ...
 
     async def requeue_delivery_exhausted(self, run_id: str) -> Checkpoint: ...
@@ -83,6 +88,7 @@ class DistributedRuntimeStore(RuntimeStore, Protocol):
         worker_id: str,
         lease_seconds: float,
         max_active_runs: int | None = None,
+        max_active_runs_per_principal: int | None = None,
         max_run_delivery_attempts: int | None = None,
     ) -> RunOwnership | None: ...
 
@@ -91,6 +97,7 @@ class DistributedRuntimeStore(RuntimeStore, Protocol):
         worker_id: str,
         lease_seconds: float,
         max_active_runs: int | None = None,
+        max_active_runs_per_principal: int | None = None,
         max_run_delivery_attempts: int | None = None,
     ) -> RunOwnership | None: ...
 

@@ -269,6 +269,8 @@ class DurableAgentRuntime:
         run_id: str | None = None,
         turn_id: str | None = None,
         max_queued_runs: int | None = None,
+        principal_key: str = "default",
+        base_priority: int = 1,
     ) -> Checkpoint:
         """Atomically admit a new root Run to the PostgreSQL runnable backlog."""
         admit = getattr(self.store, "admit_run", None)
@@ -280,8 +282,16 @@ class DurableAgentRuntime:
             history=history,
             run_id=run_id,
             turn_id=turn_id,
+            principal_key=principal_key,
+            base_priority=base_priority,
         )
-        await admit(state, max_queued_runs)
+        await admit(
+            state,
+            max_queued_runs,
+            max_queued_runs_per_principal=getattr(
+                self.config.capacity, "max_queued_runs_per_principal", None
+            ),
+        )
         await self._emit(
             "run.admitted",
             {
@@ -302,6 +312,8 @@ class DurableAgentRuntime:
         run_id: str | None = None,
         turn_id: str | None = None,
         max_queued_runs: int | None = None,
+        principal_key: str = "default",
+        base_priority: int = 1,
     ) -> tuple[Checkpoint, bool]:
         """Atomically admit or replay one PostgreSQL root submission."""
         admit = getattr(self.store, "admit_submission", None)
@@ -313,6 +325,8 @@ class DurableAgentRuntime:
             history=history,
             run_id=run_id,
             turn_id=turn_id,
+            principal_key=principal_key,
+            base_priority=base_priority,
         )
         fingerprint = hashlib.sha256(
             json.dumps(
@@ -331,6 +345,9 @@ class DurableAgentRuntime:
             idempotency_key=idempotency_key,
             request_fingerprint=fingerprint,
             max_queued_runs=max_queued_runs,
+            max_queued_runs_per_principal=getattr(
+                self.config.capacity, "max_queued_runs_per_principal", None
+            ),
         )
 
     async def _new_run_state(
@@ -346,6 +363,8 @@ class DurableAgentRuntime:
         run_kind: str = "agent",
         budget_owner_run_id: str | None = None,
         completion_contract: CompletionContract | None = None,
+        principal_key: str = "default",
+        base_priority: int = 1,
     ) -> Checkpoint:
         if run_kind == "agent" and self.execution_strategy.name == "multi_agent":
             run_kind = "orchestrator"
@@ -355,6 +374,9 @@ class DurableAgentRuntime:
             resolved_budget_owner = (
                 parent.budget_owner_run_id or parent.run_id if parent is not None else parent_run_id
             )
+            if parent is not None:
+                principal_key = parent.principal_key
+                base_priority = parent.base_priority
         return Checkpoint.create(
             thread_id=thread_id,
             input=input,
@@ -372,6 +394,8 @@ class DurableAgentRuntime:
             completion_contract=(
                 completion_contract.to_dict() if completion_contract is not None else None
             ),
+            principal_key=principal_key,
+            base_priority=base_priority,
         )
 
     async def budget_snapshot(self, state: Checkpoint) -> RunBudgetState:

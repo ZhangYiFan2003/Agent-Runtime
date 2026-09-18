@@ -89,6 +89,7 @@ jobs:
           uv run --locked pytest
           tests/test_durable_storage.py
           tests/test_distributed_ownership.py
+          tests/test_traffic_governance.py
           -o addopts=''
           --strict-config
           --strict-markers

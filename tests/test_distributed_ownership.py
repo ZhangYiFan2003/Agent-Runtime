@@ -273,7 +273,7 @@ def test_capacity_schema_migrates_v2_with_coordination_only(postgres_storage):
             ).fetchall()
         }
 
-    assert version == 5
+    assert version == 6
     assert columns == {"singleton", "created_at"}
 
 
@@ -309,7 +309,7 @@ def test_schema_v3_additively_migrates_delivery_metadata(postgres_storage):
                 """
             ).fetchall()
         }
-    assert version == 5
+    assert version == 6
     assert {
         "delivery_attempt",
         "failure_queued_at",
@@ -344,7 +344,7 @@ def test_schema_v4_additively_migrates_submission_idempotency(postgres_storage):
                 """
             ).fetchall()
         }
-    assert version == 5
+    assert version == 6
     assert columns == {
         "thread_id",
         "idempotency_key",
@@ -1227,7 +1227,7 @@ def test_operational_control_flow_keeps_one_run_and_requeues_same_state(
     server._handle(health)
     diagnostics = health.json()["distributed_runtime"]
     assert diagnostics["storage_backend"] == "postgres"
-    assert diagnostics["schema_version"] == 5
+    assert diagnostics["schema_version"] == 6
     assert diagnostics["ownership_enabled"] is True
     assert diagnostics["redelivery_bounded"] is False
     assert "postgres_dsn" not in json.dumps(diagnostics)

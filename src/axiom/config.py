@@ -176,6 +176,20 @@ class CapacityConfig:
 
     max_queued_runs: int | None = None
     max_active_runs: int | None = None
+    max_queued_runs_per_principal: int | None = None
+    max_active_runs_per_principal: int | None = None
+
+
+@dataclass(slots=True)
+class TrafficGovernanceConfig:
+    """Optional distributed submission and scheduling governance."""
+
+    global_submission_rate: float | None = None
+    global_submission_burst: int | None = None
+    principal_submission_rate: float | None = None
+    principal_submission_burst: int | None = None
+    aging_interval_seconds: float = 300.0
+    aging_boost_cap: int = 2
 
 
 @dataclass(slots=True)
@@ -247,6 +261,7 @@ class AxiomConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     capacity: CapacityConfig = field(default_factory=CapacityConfig)
+    traffic: TrafficGovernanceConfig = field(default_factory=TrafficGovernanceConfig)
     progress: ProgressConfig = field(default_factory=ProgressConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
@@ -316,6 +331,26 @@ def load_config(
     ):
         if value is not None and value <= 0:
             raise ValueError(f"capacity.{name} must be positive or null")
+    for name, value in (
+        ("max_queued_runs_per_principal", config.capacity.max_queued_runs_per_principal),
+        ("max_active_runs_per_principal", config.capacity.max_active_runs_per_principal),
+    ):
+        if value is not None and value <= 0:
+            raise ValueError(f"capacity.{name} must be positive or null")
+    for name, value in (
+        ("global_submission_rate", config.traffic.global_submission_rate),
+        ("principal_submission_rate", config.traffic.principal_submission_rate),
+    ):
+        if value is not None and value <= 0:
+            raise ValueError(f"traffic.{name} must be positive or null")
+    for name, value in (
+        ("global_submission_burst", config.traffic.global_submission_burst),
+        ("principal_submission_burst", config.traffic.principal_submission_burst),
+    ):
+        if value is not None and value <= 0:
+            raise ValueError(f"traffic.{name} must be positive or null")
+    if config.traffic.aging_interval_seconds <= 0 or config.traffic.aging_boost_cap < 0:
+        raise ValueError("traffic aging interval must be positive and boost cap non-negative")
     return config
 
 
@@ -385,6 +420,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     storage = result.setdefault("storage", {})
     worker = result.setdefault("worker", {})
     capacity = result.setdefault("capacity", {})
+    traffic = result.setdefault("traffic", {})
 
     storage_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_STORAGE_BACKEND", "backend", str),
@@ -416,12 +452,28 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     capacity_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_MAX_QUEUED_RUNS", "max_queued_runs", int),
         ("AXIOM_MAX_ACTIVE_RUNS", "max_active_runs", int),
+        ("AXIOM_MAX_QUEUED_RUNS_PER_PRINCIPAL", "max_queued_runs_per_principal", int),
+        ("AXIOM_MAX_ACTIVE_RUNS_PER_PRINCIPAL", "max_active_runs_per_principal", int),
     ]
     for env_key, config_key, caster in capacity_mappings:
         raw = env.get(env_key)
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 capacity[config_key] = caster(raw)
+
+    traffic_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_GLOBAL_SUBMISSION_RATE", "global_submission_rate", float),
+        ("AXIOM_GLOBAL_SUBMISSION_BURST", "global_submission_burst", int),
+        ("AXIOM_PRINCIPAL_SUBMISSION_RATE", "principal_submission_rate", float),
+        ("AXIOM_PRINCIPAL_SUBMISSION_BURST", "principal_submission_burst", int),
+        ("AXIOM_AGING_INTERVAL_SECONDS", "aging_interval_seconds", float),
+        ("AXIOM_AGING_BOOST_CAP", "aging_boost_cap", int),
+    ]
+    for env_key, config_key, caster in traffic_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                traffic[config_key] = caster(raw)
 
     mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_API_KEY", "api_key", str),

@@ -53,6 +53,7 @@ class DistributedRunWorker:
         heartbeat_interval_seconds: float = 10.0,
         poll_interval_seconds: float = 0.5,
         max_active_runs: int | None = None,
+        max_active_runs_per_principal: int | None = None,
         max_run_delivery_attempts: int | None = None,
         worker_id: str | None = None,
         event_sink: OwnershipEventSink | None = None,
@@ -78,12 +79,17 @@ class DistributedRunWorker:
             raise DistributedWorkerConfigurationError(
                 "max_run_delivery_attempts must be positive or null"
             )
+        if max_active_runs_per_principal is not None and max_active_runs_per_principal <= 0:
+            raise DistributedWorkerConfigurationError(
+                "max_active_runs_per_principal must be positive or null"
+            )
         self.store = store
         self.runtime_factory = runtime_factory
         self.lease_seconds = lease_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.max_active_runs = max_active_runs
+        self.max_active_runs_per_principal = max_active_runs_per_principal
         self.max_run_delivery_attempts = max_run_delivery_attempts
         self.worker_id = worker_id or new_worker_id()
         self.event_sink = event_sink
@@ -95,18 +101,33 @@ class DistributedRunWorker:
         if self._stopping:
             return None
         if self.max_run_delivery_attempts is None:
-            ownership = await self.store.claim_next(
-                self.worker_id,
-                self.lease_seconds,
-                self.max_active_runs,
-            )
+            if self.max_active_runs_per_principal is None:
+                ownership = await self.store.claim_next(
+                    self.worker_id, self.lease_seconds, self.max_active_runs
+                )
+            else:
+                ownership = await self.store.claim_next(
+                    self.worker_id,
+                    self.lease_seconds,
+                    self.max_active_runs,
+                    max_active_runs_per_principal=self.max_active_runs_per_principal,
+                )
         else:
-            ownership = await self.store.claim_next(
-                self.worker_id,
-                self.lease_seconds,
-                self.max_active_runs,
-                self.max_run_delivery_attempts,
-            )
+            if self.max_active_runs_per_principal is None:
+                ownership = await self.store.claim_next(
+                    self.worker_id,
+                    self.lease_seconds,
+                    self.max_active_runs,
+                    self.max_run_delivery_attempts,
+                )
+            else:
+                ownership = await self.store.claim_next(
+                    self.worker_id,
+                    self.lease_seconds,
+                    self.max_active_runs,
+                    self.max_run_delivery_attempts,
+                    max_active_runs_per_principal=self.max_active_runs_per_principal,
+                )
         if ownership is None:
             return None
         await self._emit(
