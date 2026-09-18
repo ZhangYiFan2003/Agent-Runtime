@@ -223,8 +223,8 @@ flowchart TD
     start/shutdown/context-manager lifecycle, `/health`, fake engine injection
     for no-network tests, and a thread/event repository boundary.
   - Thread events are persisted with monotonic IDs and explicit Run/parent/assignment
-    lineage, and can be replayed through stored SSE with `after_id` cursors and an
-    optional Run filter. This is replay, not an unlimited live event stream.
+    lineage. SSE preserves finite `after_id` replay and adds Run-filtered live following,
+    including `Last-Event-ID` reconnect and clean terminal close.
   - Restores prior user/assistant messages from persisted thread events before
     each turn and writes bounded typed memory records for conversation messages
     and tool-result digests.
@@ -1052,9 +1052,11 @@ separate from the normal Agent `CompletionPolicy -> NextAction -> _apply_next_ac
 same locked transaction advances RunState sequence/history and invalidates the previous fence.
 Stale Workers therefore cannot complete or continue an exhausted Run. Deterministic Agent failure,
 cancel, interrupt, normal wait/resume, Tool retry exhaustion, and capacity blocking are not Run
-redelivery failures. Root and Child Runs keep independent counters. Manual failure-queue requeue is
-not implemented in v1; an operator cannot accidentally reset attempts or override an unsafe
-`ToolExecution.UNKNOWN` decision through a new control endpoint.
+redelivery failures. Root and Child Runs keep independent counters. A narrow, idempotent
+`POST /v1/runs/{run_id}/requeue` control is available only for this exact failure-queue state. It
+keeps the same Run and latest RunState, resets `delivery_attempt` to zero for a new bounded cycle,
+advances sequence/fence, and emits one `run.requeued` event. It never clears ToolExecution facts:
+a persisted success remains reusable and an unsafe `UNKNOWN` remains retry-suppressed.
 
 Run-level redelivery does not make external effects exactly once. Recovery still reuses a stable
 Tool invocation ID and durable `ToolExecution` result, while an ambiguous unsafe effect remains
@@ -1062,6 +1064,24 @@ Tool invocation ID and durable `ToolExecution` result, while an ambiguous unsafe
 records Worker ownership cycles. Admission decides whether new external work may enter; redelivery
 decides whether already-durable work may receive another Worker attempt. Runtime Failure Queue
 records operational quarantine and is unrelated to Evaluation badcase datasets.
+
+### 12.1.3 Submission idempotency and live event following
+
+Distributed root submission accepts an optional `Idempotency-Key`, scoped to the current Thread.
+PostgreSQL stores `(thread_id, key) -> request fingerprint -> run_id`. The fingerprint covers the
+Thread, task input, and execution strategy. Under the same capacity coordination transaction, the
+first request admits one root Run and binds the key; equal replays return that Run, while different
+content returns `IDEMPOTENCY_KEY_CONFLICT`. Queue rejection or transaction rollback binds nothing,
+so a later retry may succeed. This is separate from explicit duplicate Run IDs, Tool idempotency,
+and control-operation idempotency. The mapping has no automatic TTL in v1.
+
+The Event repository remains the only event authority. Existing finite SSE replay is unchanged;
+run-filtered `follow=true` first reads durable events with `id > after_id` (or `Last-Event-ID`),
+then polls at a bounded interval for new durable events. IDs need only be monotonic, not gapless.
+Independent clients receive the same stream, transport keepalives are comments rather than stored
+Events, and a terminal Run closes after a final quiet poll. Built context, client cursors, SSE
+connections, polls, and keepalives are not persisted. PostgreSQL polling may later be optimized by
+LISTEN/NOTIFY, but Redis or a broker is not required for correctness.
 
 ## 12.2 Canonical Runtime domain model
 
@@ -1218,10 +1238,11 @@ preparation, source-code review, real-workload evaluation, bug fixes, and eviden
 hardening. New Runtime subsystems should be added only when a concrete requirement demonstrates a
 gap. PostgreSQL-backed runnable discovery, Worker claim, lease/heartbeat/fencing, expired-lease
 takeover, global runnable-backlog admission, global active-lease backpressure, and optional bounded
-Run redelivery with PostgreSQL-backed failure quarantine are implemented. Request-rate limiting,
-manual failure-queue requeue, broker-based DLQ, fairness/priority scheduling,
-shared circuit breakers, and global rate limiting remain explicit future decisions rather than
-implied features.
+Run redelivery with PostgreSQL-backed failure quarantine, narrow manual requeue, distributed root
+submission idempotency, and reconnectable SSE replay/live tail are implemented. Request-rate
+limiting, broker-based DLQ, fairness/priority scheduling, shared circuit breakers, and global rate
+limiting remain explicit future decisions rather than implied features. The SSE v1 tail uses
+bounded polling rather than LISTEN/NOTIFY and stores no per-client cursor.
 
 ## 16. Final interview mental model
 
