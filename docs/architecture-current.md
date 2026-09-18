@@ -1134,6 +1134,34 @@ hotspots suitable for current Runtime scale. A gateway, Redis, or dedicated rate
 be appropriate at substantially higher QPS, but is outside this milestone. SQLite remains compatible
 for local execution; distributed token and principal-quota guarantees are PostgreSQL-only.
 
+### 12.1.6 Security / isolation closure v1
+
+Tool access follows a small application-level policy chain: trusted Runtime configuration, Tool
+schema validation, capability evaluation, filesystem/network checks, optional HITL approval, then
+bounded execution and ToolExecution evidence. `principal_key` is still only a scheduling/accounting
+identity; Axiom does not provide authentication, tenant isolation, or RBAC. Untrusted user files,
+retrieved web pages, Tool results, and MCP responses may influence model reasoning but cannot change
+the configured policy or grant capabilities.
+
+Filesystem capabilities use canonical workspace containment and reject configured sensitive filename
+patterns such as `.env`, key, certificate, credential, and token files. Shell execution remains an
+explicit high-risk capability: CommandGuard rejects known destructive patterns, while the restricted
+backend narrows environment inheritance, bounds stdout/stderr, enforces wall-clock timeout, and
+cleans process trees where the platform supports it. Network-capable Tools accept only HTTP(S), can
+be disabled or host-allowlisted, and reject private/local/link-local/reserved targets; redirects are
+validated hop by hop. These are application-level guards, not an OS sandbox or kernel boundary.
+
+Permission denial is a structured Tool result and audit/policy evidence, not automatically a Worker
+failure or redelivery trigger. ToolExecution deduplication and UNKNOWN semantics remain the authority
+for ambiguous side effects. Audit, public Tool-call Event/SSE payloads, and configuration
+serialization redact credential-shaped fields and never expose restricted environment values.
+NetworkPolicy governs URL-bearing Web Tools; Streamable HTTP MCP endpoints are static trusted Runtime
+configuration, not model-selected URLs, and are outside that Web URL policy. Their Tools and returned
+content remain subject to ordinary permission handling and are not inherently trusted. Remaining
+boundaries include no OS sandbox, no hard
+portable CPU/memory/process-count quota, no perfect DNS-rebinding defense, and no full authentication
+or secret-management platform.
+
 ## 12.2 Canonical Runtime domain model
 
 Thread manages conversation scope. Run is the only durable execution/control/ownership unit and

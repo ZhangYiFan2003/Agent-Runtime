@@ -7,7 +7,7 @@ best-effort process-tree cleanup.
 
 > **This is not a complete OS sandbox.**
 
-> **Network isolation is not enforced.**
+> **Network policy is application-level; it is not a firewall or OS network namespace.**
 
 > **Shell commands may still access the host filesystem outside cwd unless an OS or container
 > boundary enforces otherwise.**
@@ -66,6 +66,21 @@ therefore cannot intentionally escape the configured workspace through their pat
 This is validation and application-level enforcement, not a filesystem jail. Once an approved
 Shell starts, cwd alone cannot prevent commands such as reading an absolute host path. Symlink races
 and other time-of-check/time-of-use changes also remain possible.
+
+## Network policy
+
+Network-capable Tools are checked by the same Permission Policy before execution. The policy accepts
+only `http` and `https`, rejects credentials embedded in URLs, and supports `public`, `allowlist`,
+and `disabled` access modes. Public mode rejects loopback, private, link-local, multicast, and
+reserved IP targets after DNS resolution. Allowlist mode permits an exact host or subdomain of a
+configured host rule, then applies the same address checks. `web_fetch` validates every redirect
+target rather than trusting only the initial URL.
+
+This is SSRF risk reduction, not a perfect DNS-rebinding-proof egress boundary. MCP HTTP servers
+remain static Runtime configuration outside this Web URL policy rather than model-selected endpoints;
+they are integrations, not automatically trusted content. Their returned Tools and responses still
+pass through the ordinary Tool permission path. MCP stdio uses the filtered environment, while its
+transport process lifecycle remains owned by the SDK.
 
 ## Environment filtering
 
@@ -146,11 +161,11 @@ application operations and are not routed through the Tool execution backend.
 
 ## Security limitations
 
-Sandbox-lite v1 does not provide:
+Application-level isolation v1 does not provide:
 
 - a full host filesystem jail;
 - syscall filtering, seccomp, AppArmor, or SELinux;
-- a network namespace, egress proxy, or network denial;
+- a network namespace or egress proxy (the URL policy is not a firewall);
 - container, VM, or WebAssembly isolation;
 - reliable CPU/memory quotas across platforms;
 - hardened multi-tenant code execution;
