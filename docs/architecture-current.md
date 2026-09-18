@@ -1025,8 +1025,43 @@ locally and reuses its bounded idle poll when global capacity blocks a claim.
 A non-executing `WAITING_CHILD` result releases its lease and is not immediately runnable. A
 terminal Child wakes its waiting Parent, which must compete for active capacity again. Child Runs
 created by the current inline Plan/Multi-Agent schedulers are internal work under the admitted root,
-not fresh external submissions. Capacity bounds do not provide request-rate limiting, fairness,
-priority, bounded latency, autoscaling, redelivery, or DLQ semantics.
+not fresh external submissions. Capacity bounds themselves do not provide request-rate limiting,
+fairness, priority, bounded latency, autoscaling, or redelivery semantics; bounded redelivery is a
+separate ownership policy described below.
+
+### 12.1.2 Bounded Run redelivery and failure quarantine
+
+Distributed redelivery is a PostgreSQL-only Run ownership concern. `delivery_attempt = 1` is the
+initial successful Worker claim; the count increases only when another Worker takes over an
+expired, still-owned lease. A clean release followed by `WAITING_CHILD` wakeup, HITL/user resume,
+or ordinary runnable continuation keeps the current count. A crash immediately after claim still
+consumes that delivery because ownership was durably granted; later claims resume the latest
+RunState rather than starting the Run again.
+
+`worker.max_run_delivery_attempts` is optional and defaults to `null`, preserving the previous
+unbounded behavior unless an operator opts into convergence. With a finite limit, the claim path
+locks the candidate Run row and atomically chooses one of two outcomes: grant the next ownership
+generation, or transition the expired poison Run to terminal `FAILED` with
+`RUN_DELIVERY_EXHAUSTED`, `runnable=false`, and durable failure-queue metadata. The latter is a
+logical Run Failure Queue represented by the Run head, not a broker DLQ or duplicate Run table.
+It consumes neither runnable backlog nor active-lease capacity; capacity diagnostics report its
+count and delivery-attempt mean/max separately.
+
+This operational failure transition occurs before another Step can execute, so it is intentionally
+separate from the normal Agent `CompletionPolicy -> NextAction -> _apply_next_action` path. The
+same locked transaction advances RunState sequence/history and invalidates the previous fence.
+Stale Workers therefore cannot complete or continue an exhausted Run. Deterministic Agent failure,
+cancel, interrupt, normal wait/resume, Tool retry exhaustion, and capacity blocking are not Run
+redelivery failures. Root and Child Runs keep independent counters. Manual failure-queue requeue is
+not implemented in v1; an operator cannot accidentally reset attempts or override an unsafe
+`ToolExecution.UNKNOWN` decision through a new control endpoint.
+
+Run-level redelivery does not make external effects exactly once. Recovery still reuses a stable
+Tool invocation ID and durable `ToolExecution` result, while an ambiguous unsafe effect remains
+`UNKNOWN` with retry suppression. `RunBudget` accounts actual work and resources; a delivery count
+records Worker ownership cycles. Admission decides whether new external work may enter; redelivery
+decides whether already-durable work may receive another Worker attempt. Runtime Failure Queue
+records operational quarantine and is unrelated to Evaluation badcase datasets.
 
 ## 12.2 Canonical Runtime domain model
 
@@ -1170,6 +1205,7 @@ to the same budgeted loop. Context hard-limit failure occurs before a provider r
 | Repeated no-progress | Emit one bounded recovery signal, then stop if stagnation continues | Checkpoint progress state and Trace | Not a dependency retry | `NO_PROGRESS` |
 | Completion check fails | ReAct may receive one configured corrective turn; orchestration terminal checks are one-shot | Contract/result/attempt in Checkpoint and verification Trace | Only normal budgeted continuation | Verified completion or `COMPLETION_NOT_VERIFIED` |
 | Explicit cancel | Persist durable control, then signal the process-local owner; descendant resume reconciles cancelled ancestors | Checkpoint, ToolExecution, and control/Trace events | No | `CANCELLED`; unsafe in-flight Tool evidence may remain `UNKNOWN` |
+| Repeated Worker lease loss | Atomically allow an expired-lease takeover while delivery allowance remains; otherwise stop automatic delivery | RunState/checkpoint history plus delivery metadata on the Run head | Bounded Run redelivery, not Tool/LLM retry | `RUN_DELIVERY_EXHAUSTED`, `FAILED`, `runnable=false` |
 
 The retry metrics distinguish one logical model/Tool operation from its actual provider/Tool
 attempts. Model-call and Tool-call budget counters count actual attempts; retry counters count only
@@ -1181,8 +1217,9 @@ The core Runtime capability set is now frozen. Future work should prioritize int
 preparation, source-code review, real-workload evaluation, bug fixes, and evidence-driven
 hardening. New Runtime subsystems should be added only when a concrete requirement demonstrates a
 gap. PostgreSQL-backed runnable discovery, Worker claim, lease/heartbeat/fencing, expired-lease
-takeover, global runnable-backlog admission, and global active-lease backpressure are implemented.
-Request-rate limiting, Run-level retry/DLQ, fairness/priority scheduling,
+takeover, global runnable-backlog admission, global active-lease backpressure, and optional bounded
+Run redelivery with PostgreSQL-backed failure quarantine are implemented. Request-rate limiting,
+manual failure-queue requeue, broker-based DLQ, fairness/priority scheduling,
 shared circuit breakers, and global rate limiting remain explicit future decisions rather than
 implied features.
 
