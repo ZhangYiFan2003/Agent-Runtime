@@ -1,0 +1,52 @@
+@import "./design/tokens.css";
+@import "tailwindcss";
+
+@theme inline {
+  --color-bg-0: var(--bg-0);
+  --color-bg-1: var(--bg-1);
+  --color-bg-2: var(--bg-2);
+  --color-bg-3: var(--bg-3);
+  --color-border: var(--border);
+  --color-fg-0: var(--fg-0);
+  --color-fg-1: var(--fg-1);
+  --color-fg-2: var(--fg-2);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, "Noto Sans", sans-serif;
+  --font-mono:
+    ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* compact type scale: 12 / 13 / 14 / 16 / 20 */
+  --text-13: 0.8125rem;
+
+  --shadow-pop: 0 4px 16px rgb(0 0 0 / 0.5);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-bg-0 font-sans text-fg-0 antialiased;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  ::selection {
+    background: var(--accent-dim);
+  }
+
+  :focus-visible {
+    outline: none;
+  }
+}
