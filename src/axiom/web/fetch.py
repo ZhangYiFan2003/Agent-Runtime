@@ -39,6 +39,11 @@ async def fetch_url(url: str, max_length: int = 10_000, timeout: float = 15.0) -
         return text or "(empty page)"
 
 
+def _validate_public_url(url: str) -> None:
+    """Compatibility entry point for retrieval/source-map consumers."""
+    NetworkPolicy().validate_url(url)
+
+
 def extract_text_from_html(raw_html: str) -> str:
     text = re.sub(r"<script[\s\S]*?</script>", " ", raw_html, flags=re.I)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
