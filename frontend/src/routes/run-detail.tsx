@@ -7,6 +7,7 @@ import {
   useRunMetrics,
   useRunTrace,
 } from "../queries/use-run-detail";
+import { useRunControls } from "../queries/use-run-controls";
 import { useRuntimeEvents } from "../queries/use-runtime-events";
 import { isChildRun } from "../lib/runs-view";
 import { useMediaQuery } from "../lib/use-media-query";
@@ -143,6 +144,7 @@ export function RunDetailPage() {
   const traceQuery = useRunTrace(runId, runStatus);
   const metricsQuery = useRunMetrics(runId, runStatus);
   const childrenQuery = useRunChildren(runId, runStatus);
+  const controls = useRunControls(runId, { parentRunId: run?.parentRunId ?? null });
   const runtimeEvents = useRuntimeEvents({
     threadId: run?.threadId ?? null,
     runId,
@@ -348,8 +350,8 @@ export function RunDetailPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <RunHeader run={run} onShowChildren={() => setTab("children")} />
-      <RunBanners run={run} />
+      <RunHeader run={run} onShowChildren={() => setTab("children")} controls={controls} />
+      <RunBanners run={run} controls={controls} />
 
       <div className="flex min-h-0 flex-1">
         {/* Timeline column (desktop) */}

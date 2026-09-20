@@ -134,3 +134,66 @@ export async function apiGet<T>(path: string, options: ApiClientOptions): Promis
   }
   return body as T;
 }
+
+export interface ApiPostOptions extends ApiClientOptions {
+  /** JSON-serializable body; omitted (no Content-Type) when undefined. */
+  body?: unknown;
+  /** Extra request headers, e.g. Idempotency-Key. Values never leave this call. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * POST with a JSON body and JSON response, sharing apiGet's timeout, abort
+ * and error normalization. A transport failure surfaces as `ApiError` with
+ * `status === 0`; any received HTTP status (including 5xx) is returned as a
+ * normal non-ok ApiError and must NOT be auto-retried by callers.
+ */
+export async function apiPost<T>(path: string, options: ApiPostOptions): Promise<T> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...(options.headers ?? {}),
+  };
+  if (options.apiKey) headers.Authorization = `Bearer ${options.apiKey}`;
+  const hasBody = options.body !== undefined;
+  if (hasBody) headers["Content-Type"] = "application/json";
+
+  let response: Response;
+  try {
+    response = await fetchImpl(joinUrl(options.baseUrl, path), {
+      method: "POST",
+      headers,
+      body: hasBody ? JSON.stringify(options.body) : undefined,
+      signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiError({ status: 0, message: "Request timed out or was cancelled" });
+    }
+    throw new ApiError({
+      status: 0,
+      message: error instanceof Error ? error.message : "Network request failed",
+    });
+  }
+
+  const text = await response.text();
+  let body: unknown = null;
+  if (text !== "") {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+  }
+
+  if (!response.ok) {
+    const shape = normalizeErrorBody(response.status, body);
+    throw new ApiError(shape);
+  }
+  return body as T;
+}

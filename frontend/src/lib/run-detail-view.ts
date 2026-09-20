@@ -1,4 +1,4 @@
-import type { RunView } from "../api/adapters/run";
+import type { RunView, InterruptSummary } from "../api/adapters/run";
 import type { RunMetrics } from "../api/adapters/metrics";
 import type { Span } from "../api/adapters/trace";
 import { formatDurationMs, formatFullTime } from "./format";
@@ -79,6 +79,8 @@ const KNOWN_ACTIONS: Record<string, { label: string; tone: RunActionTone }> = {
   approve: { label: "Approve", tone: "primary" },
   reject: { label: "Reject", tone: "danger" },
   cancel: { label: "Cancel", tone: "danger" },
+  interrupt: { label: "Interrupt", tone: "default" },
+  requeue: { label: "Requeue", tone: "default" },
 };
 
 function humanizeOperation(operation: string): string {
@@ -97,6 +99,32 @@ export function deriveRunActions(operations: readonly string[]): RunActionSpec[]
     if (known) return { operation, label: known.label, tone: known.tone, known: true };
     return { operation, label: humanizeOperation(operation), tone: "default", known: false };
   });
+}
+
+/** Pending labels replace button labels while a control mutation is in flight. */
+const ACTION_PENDING_LABELS: Record<string, string> = {
+  resume: "Resuming…",
+  cancel: "Cancelling…",
+  interrupt: "Interrupting…",
+  approve: "Approving…",
+  reject: "Rejecting…",
+  requeue: "Requeuing…",
+};
+
+/** Pending label for a known operation, or null for unknown operations. */
+export function actionPendingLabel(operation: string): string | null {
+  return ACTION_PENDING_LABELS[operation] ?? null;
+}
+
+/**
+ * The pending interrupt that targets the run itself — what the header
+ * Approve / Reject buttons resolve. Interrupts aggregated from children are
+ * excluded (those resolve from the approval banner, against the child run).
+ */
+export function selfPendingInterrupt(
+  run: Pick<RunView, "runId" | "interrupt" | "pendingInterrupts">,
+): InterruptSummary | null {
+  return run.pendingInterrupts.find((entry) => entry.runId === run.runId) ?? run.interrupt;
 }
 
 /* ------------------------------------------------------------------ */

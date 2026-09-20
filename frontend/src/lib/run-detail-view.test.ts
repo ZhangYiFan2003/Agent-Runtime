@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  actionPendingLabel,
   buildOverviewSections,
   deriveRunActions,
   deriveRunBanners,
@@ -13,6 +14,7 @@ import {
   promotedSpanAttributes,
   remainingSpanAttributes,
   runDetailRefetchInterval,
+  selfPendingInterrupt,
   DETAIL_REFETCH_INTERVAL_MS,
   RUN_REFETCH_INTERVAL_MS,
 } from "./run-detail-view";
@@ -88,6 +90,91 @@ describe("deriveRunActions", () => {
 
   it("handles an empty operation list", () => {
     expect(deriveRunActions([])).toEqual([]);
+  });
+
+  it("knows interrupt and requeue (Phase 5 controls)", () => {
+    const actions = deriveRunActions(["interrupt", "requeue"]);
+    expect(actions.map((a) => a.label)).toEqual(["Interrupt", "Requeue"]);
+    expect(actions.every((a) => a.known)).toBe(true);
+    expect(actions.map((a) => a.tone)).toEqual(["default", "default"]);
+  });
+
+  it("ignores unknown operations gracefully (kept, flagged unknown)", () => {
+    const actions = deriveRunActions(["resume", "hibernate"]);
+    expect(actions[0].known).toBe(true);
+    expect(actions[1]).toMatchObject({ operation: "hibernate", known: false });
+  });
+});
+
+describe("control UX helpers", () => {
+  it("provides a pending label for every known control operation", () => {
+    expect(actionPendingLabel("resume")).toBe("Resuming…");
+    expect(actionPendingLabel("cancel")).toBe("Cancelling…");
+    expect(actionPendingLabel("interrupt")).toBe("Interrupting…");
+    expect(actionPendingLabel("approve")).toBe("Approving…");
+    expect(actionPendingLabel("reject")).toBe("Rejecting…");
+    expect(actionPendingLabel("requeue")).toBe("Requeuing…");
+    expect(actionPendingLabel("hibernate")).toBeNull();
+  });
+
+  it("selfPendingInterrupt picks the run's own interrupt, not a child's", () => {
+    const run = makeRunView({
+      run_id: "run_parent",
+      pending_interrupts: [
+        {
+          run_id: "run_child",
+          invocation_id: "run_child:call_0",
+          interrupt_type: "tool_approval",
+          tool_name: "shell",
+          reason: "child approval",
+          created_at: "2026-09-17T10:00:03+00:00",
+        },
+        {
+          run_id: "run_parent",
+          invocation_id: "run_parent:call_1",
+          interrupt_type: "tool_approval",
+          tool_name: "write_file",
+          reason: "own approval",
+          created_at: "2026-09-17T10:00:04+00:00",
+        },
+      ],
+    });
+    const self = selfPendingInterrupt(run);
+    expect(self?.runId).toBe("run_parent");
+    expect(self?.invocationId).toBe("run_parent:call_1");
+  });
+
+  it("selfPendingInterrupt falls back to run.interrupt for a single waiting run", () => {
+    const run = makeRunView({
+      run_id: "run_a",
+      interrupt: {
+        run_id: "run_a",
+        invocation_id: "run_a:call_0",
+        interrupt_type: "manual",
+        tool_name: null,
+        reason: "operator pause",
+        created_at: "2026-09-17T10:00:03+00:00",
+      },
+      pending_interrupts: [],
+    });
+    expect(selfPendingInterrupt(run)?.invocationId).toBe("run_a:call_0");
+  });
+
+  it("selfPendingInterrupt is null when nothing targets the run itself", () => {
+    const run = makeRunView({
+      run_id: "run_parent",
+      pending_interrupts: [
+        {
+          run_id: "run_child",
+          invocation_id: "run_child:call_0",
+          interrupt_type: "tool_approval",
+          tool_name: "shell",
+          reason: "child approval",
+          created_at: "2026-09-17T10:00:03+00:00",
+        },
+      ],
+    });
+    expect(selfPendingInterrupt(run)).toBeNull();
   });
 });
 
