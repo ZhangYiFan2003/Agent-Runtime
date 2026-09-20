@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatDurationMs, formatRelativeTime, truncateId } from "./format";
+import { formatDurationMs, formatEventTime, formatRelativeTime, truncateId } from "./format";
 
 describe("formatDurationMs", () => {
   it("formats ms / seconds / minutes / hours", () => {
@@ -41,6 +41,14 @@ describe("formatRelativeTime", () => {
 
   it("handles garbage input", () => {
     expect(formatRelativeTime("not-a-date", now)).toBe("—");
+  });
+});
+
+describe("formatEventTime", () => {
+  it("formats HH:MM:SS.mmm and tolerates garbage", () => {
+    const d = new Date(2026, 8, 19, 14, 32, 7, 183);
+    expect(formatEventTime(d.toISOString())).toBe("14:32:07.183");
+    expect(formatEventTime("not-a-date")).toBe("—");
   });
 });
 

@@ -51,6 +51,21 @@ describe("parseRunDetailSearch", () => {
     expect(parseRunDetailSearch({ span: ["a"] })).toEqual({});
     expect(parseRunDetailSearch({ span: "span_1", other: "noise" })).toEqual({ span: "span_1" });
   });
+
+  it("keeps an integer event param", () => {
+    expect(parseRunDetailSearch({ event: 42 })).toEqual({ event: 42 });
+    expect(parseRunDetailSearch({ event: 0 })).toEqual({ event: 0 });
+    expect(parseRunDetailSearch({ event: "42" })).toEqual({ event: 42 });
+    expect(parseRunDetailSearch({ event: -1 })).toEqual({});
+    expect(parseRunDetailSearch({ event: 1.5 })).toEqual({});
+    expect(parseRunDetailSearch({ event: "abc" })).toEqual({});
+    expect(parseRunDetailSearch({ event: ["42"] })).toEqual({});
+  });
+
+  it("enforces span/event exclusivity (span wins when both are present)", () => {
+    expect(parseRunDetailSearch({ span: "span_1", event: 42 })).toEqual({ span: "span_1" });
+    expect(parseRunDetailSearch({ event: 42, span: "" })).toEqual({ event: 42 });
+  });
 });
 
 describe("deriveRunActions", () => {

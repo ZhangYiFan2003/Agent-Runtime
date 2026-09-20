@@ -7,6 +7,7 @@ import {
   useRunMetrics,
   useRunTrace,
 } from "../queries/use-run-detail";
+import { useRuntimeEvents } from "../queries/use-runtime-events";
 import { isChildRun } from "../lib/runs-view";
 import { useMediaQuery } from "../lib/use-media-query";
 import { cn } from "../lib/utils";
@@ -21,16 +22,19 @@ import { RunHeader } from "../components/run/run-header";
 import { RunMetricsPanel } from "../components/run/run-metrics";
 import { RunOutput } from "../components/run/run-output";
 import { RunOverview } from "../components/run/run-overview";
+import { EventFeed } from "../components/events/event-feed";
+import { EventInspector } from "../components/events/event-inspector";
 import { SpanInspector } from "../components/trace/span-inspector";
 import { SpanTable } from "../components/trace/span-table";
 import { TraceWaterfall } from "../components/trace/waterfall";
 
 const routeApi = getRouteApi("/runs/$runId");
 
-type DetailTab = "overview" | "timeline" | "trace" | "metrics" | "children" | "output";
+type DetailTab = "overview" | "timeline" | "events" | "trace" | "metrics" | "children" | "output";
 
 const DESKTOP_TABS: Array<{ key: DetailTab; label: string }> = [
   { key: "overview", label: "Overview" },
+  { key: "events", label: "Events" },
   { key: "trace", label: "Trace" },
   { key: "metrics", label: "Metrics" },
   { key: "children", label: "Children" },
@@ -40,6 +44,7 @@ const DESKTOP_TABS: Array<{ key: DetailTab; label: string }> = [
 const MOBILE_TABS: Array<{ key: DetailTab; label: string }> = [
   { key: "overview", label: "Overview" },
   { key: "timeline", label: "Timeline" },
+  { key: "events", label: "Events" },
   { key: "trace", label: "Trace" },
   { key: "metrics", label: "Metrics" },
   { key: "children", label: "Children" },
@@ -138,6 +143,11 @@ export function RunDetailPage() {
   const traceQuery = useRunTrace(runId, runStatus);
   const metricsQuery = useRunMetrics(runId, runStatus);
   const childrenQuery = useRunChildren(runId, runStatus);
+  const runtimeEvents = useRuntimeEvents({
+    threadId: run?.threadId ?? null,
+    runId,
+    runStatus,
+  });
 
   const [tab, setTab] = useState<DetailTab>("overview");
   // The mobile bottom-sheet inspector is portaled to document.body, so it
@@ -156,6 +166,24 @@ export function RunDetailPage() {
   const spanNotFound =
     selectedSpanId !== null && traceQuery.data !== undefined && selectedSpan === null;
 
+  // Event selection (Events tab) shares the inspector with span selection;
+  // the two are mutually exclusive in the URL.
+  const events = runtimeEvents.events;
+  const selectedEventId = search.event ?? null;
+  const selectedEvent = useMemo(
+    () =>
+      selectedEventId === null
+        ? null
+        : (events.find((event) => event.eventId === selectedEventId) ?? null),
+    [events, selectedEventId],
+  );
+  const eventNotFound =
+    selectedEventId !== null &&
+    selectedEvent === null &&
+    runtimeEvents.status !== "connecting";
+
+  // Each select replaces the whole search object, so selecting one kind
+  // automatically clears the other.
   const selectSpan = (spanId: string | null) =>
     void navigate({
       to: "/runs/$runId",
@@ -164,6 +192,14 @@ export function RunDetailPage() {
     });
   const toggleSpan = (spanId: string) =>
     selectSpan(spanId === selectedSpanId ? null : spanId);
+  const selectEvent = (eventId: number | null) =>
+    void navigate({
+      to: "/runs/$runId",
+      params: { runId },
+      search: eventId === null ? {} : { event: eventId },
+    });
+  const toggleEvent = (eventId: number) =>
+    selectEvent(eventId === selectedEventId ? null : eventId);
   const openRun = (id: string) =>
     void navigate({ to: "/runs/$runId", params: { runId: id }, search: {} });
 
@@ -225,6 +261,18 @@ export function RunDetailPage() {
     switch (tab) {
       case "overview":
         return <RunOverview run={run} metrics={metricsQuery.data ?? null} />;
+      case "events":
+        return (
+          <div className="flex h-full min-h-0 flex-col">
+            <EventFeed
+              events={events}
+              status={runtimeEvents.status}
+              runStatus={runStatus}
+              selectedEventId={selectedEventId}
+              onSelectEvent={toggleEvent}
+            />
+          </div>
+        );
       case "timeline":
         return traceArea;
       case "trace": {
@@ -330,7 +378,11 @@ export function RunDetailPage() {
             Inspector
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <SpanInspector span={selectedSpan} notFound={spanNotFound} />
+            {selectedEvent !== null || eventNotFound ? (
+              <EventInspector event={selectedEvent} notFound={eventNotFound} />
+            ) : (
+              <SpanInspector span={selectedSpan} notFound={spanNotFound} />
+            )}
           </div>
         </aside>
       </div>
@@ -338,14 +390,21 @@ export function RunDetailPage() {
       {/* Inspector as bottom sheet (mobile) */}
       {!isDesktop && (
         <Sheet
-          open={selectedSpan !== null || spanNotFound}
+          open={selectedEvent !== null || eventNotFound || selectedSpan !== null || spanNotFound}
           onOpenChange={(open) => {
-            if (!open) selectSpan(null);
+            if (!open) {
+              selectSpan(null);
+              selectEvent(null);
+            }
           }}
         >
           <SheetContent side="bottom" className="overflow-y-auto p-0">
-            <SheetTitle className="sr-only">Span inspector</SheetTitle>
-            <SpanInspector span={selectedSpan} notFound={spanNotFound} />
+            <SheetTitle className="sr-only">Inspector</SheetTitle>
+            {selectedEvent !== null || eventNotFound ? (
+              <EventInspector event={selectedEvent} notFound={eventNotFound} />
+            ) : (
+              <SpanInspector span={selectedSpan} notFound={spanNotFound} />
+            )}
           </SheetContent>
         </Sheet>
       )}

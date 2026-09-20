@@ -56,6 +56,15 @@ function formatClock(then: number): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+/** "14:32:07.183" — event-feed timestamps. */
+export function formatEventTime(iso: string): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "—";
+  const d = new Date(then);
+  const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+
 /** "run_a8312c9d4e5…" — IDs stay mono and truncated; full value lives in tooltip/copy. */
 export function truncateId(id: string, head = 14): string {
   return id.length > head + 1 ? `${id.slice(0, head)}…` : id;

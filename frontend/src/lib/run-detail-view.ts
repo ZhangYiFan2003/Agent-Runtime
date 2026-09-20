@@ -44,11 +44,20 @@ export function runDetailRefetchInterval(
 export interface RunDetailSearch {
   /** Selected span id, mirrored into the waterfall/table/inspector. */
   span?: string;
+  /** Selected event id (persisted event feed). Mutually exclusive with span. */
+  event?: number;
 }
 
 export function parseRunDetailSearch(search: Record<string, unknown>): RunDetailSearch {
   const span = search.span;
-  return typeof span === "string" && span !== "" ? { span } : {};
+  if (typeof span === "string" && span !== "") return { span };
+  const event = search.event;
+  if (typeof event === "number" && Number.isInteger(event) && event >= 0) return { event };
+  // Tolerate stringified event ids from hand-edited URLs.
+  if (typeof event === "string" && event !== "" && /^\d+$/.test(event)) {
+    return { event: Number(event) };
+  }
+  return {};
 }
 
 /* ------------------------------------------------------------------ */
