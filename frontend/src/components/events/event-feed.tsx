@@ -1,15 +1,12 @@
-import { useEffect, useRef, useState } from "react";
 import { ArrowDown } from "lucide-react";
 import type { RuntimeEvent } from "../../api/adapters/event";
 import {
   replayStatusLabel,
   type ReplayStatus,
 } from "../../lib/events-view";
+import { useFollowPin } from "../../lib/use-follow-pin";
 import { Button } from "../ui/button";
 import { EventRow } from "./event-row";
-
-/** Distance from the bottom (px) that still counts as "watching the tail". */
-const TAIL_THRESHOLD_PX = 48;
 
 /**
  * Persisted-event feed for the Run Detail Events tab (desktop + mobile).
@@ -32,34 +29,8 @@ export function EventFeed({
   selectedEventId: number | null;
   onSelectEvent: (eventId: number) => void;
 }) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const pinnedRef = useRef(true);
-  const [showJump, setShowJump] = useState(false);
-
-  const handleScroll = () => {
-    const el = scrollRef.current;
-    if (el === null) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < TAIL_THRESHOLD_PX;
-    pinnedRef.current = nearBottom;
-    setShowJump(!nearBottom);
-  };
-
   const lastEventId = events.length > 0 ? events[events.length - 1].eventId : null;
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el !== null && pinnedRef.current) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [lastEventId]);
-
-  const jumpToLatest = () => {
-    const el = scrollRef.current;
-    if (el === null) return;
-    el.scrollTop = el.scrollHeight;
-    pinnedRef.current = true;
-    setShowJump(false);
-  };
+  const { scrollRef, showJump, handleScroll, jumpToLatest } = useFollowPin(lastEventId);
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">

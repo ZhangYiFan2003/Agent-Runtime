@@ -23,7 +23,7 @@ import { StatusPill } from "./status-pill";
 const UNKNOWN_OP_HINT = "This operation is not supported by the console yet.";
 
 /** Dismissible inline feedback for control mutations (success / conflict / error). */
-function ControlFeedback({ controls }: { controls: RunControls }) {
+export function ControlFeedback({ controls }: { controls: RunControls }) {
   const feedback = controls.feedback;
   if (feedback === null) return null;
   return (
