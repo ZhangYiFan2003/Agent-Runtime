@@ -21,6 +21,22 @@ Axiom is organized around a few core paths:
 
 The core Agent Runtime paths are covered by offline tests with fake LLM clients. Runtime API localhost lifecycle is covered with live HTTP tests. Some integration surfaces, such as MCP server transport lifecycle and public Runtime API deployment behavior, are intentionally marked as partially verified until they have stable end-to-end transport or deployment tests.
 
+## Web Console
+
+Axiom includes a dark, responsive web console for interacting with Threads and operating durable Agent Runs.
+
+![Axiom Agent Workbench](docs/assets/frontend/workbench-desktop.png)
+
+The console keeps the runtime control plane visible: Runs, child execution, trace spans, runtime events, metrics, approvals, and resume, interrupt, and cancel controls remain inspectable.
+
+![Axiom Run Inspector](docs/assets/frontend/run-inspector-desktop.png)
+
+Workbench, Runs explorer, and Run Inspector layouts support both desktop and mobile use.
+
+<p align="center">
+  <img src="docs/assets/frontend/workbench-mobile.png" width="360" alt="Axiom mobile workbench">
+</p>
+
 ## Features
 
 | Feature | Description | Verification |
