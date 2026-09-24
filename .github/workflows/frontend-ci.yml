@@ -51,4 +51,6 @@ jobs:
         run: npm run test
 
       - name: Build
-        run: npm run build
+        # TypeScript already passed in the dedicated Typecheck step above;
+        # keep this step focused on the Vite production bundle.
+        run: npm exec vite build
