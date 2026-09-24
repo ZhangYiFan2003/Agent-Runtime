@@ -87,8 +87,6 @@ jobs:
             "native transform panic"
           } elseif ($content -match "tailwind.*(scan|source|candidate)") {
             "Tailwind source scanning"
-          } elseif ($content -match "tailwind|oxide") {
-            "other Tailwind transform"
           } elseif ($content -match "lightningcss") {
             "Lightning CSS transform"
           } elseif ($content -match "rolldown") {
@@ -107,6 +105,10 @@ jobs:
             "resource exhaustion"
           } elseif ($content -match "permission denied|EACCES|EPERM") {
             "filesystem permission"
+          } elseif ($content -match "tailwind|oxide") {
+            "other Tailwind transform"
+          } elseif ($content -match "Error:") {
+            "other reported error"
           } else {
             "unclassified"
           }
