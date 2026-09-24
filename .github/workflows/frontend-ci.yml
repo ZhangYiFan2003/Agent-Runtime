@@ -75,8 +75,20 @@ jobs:
             "module resolution"
           } elseif ($content -match "failed to load config|config file") {
             "Vite configuration loading"
-          } elseif ($content -match "tailwind|oxide|unknown utility|invalid utility") {
-            "Tailwind transform"
+          } elseif ($content -match "unknown utility|invalid utility|cannot apply.*utility") {
+            "Tailwind unknown utility"
+          } elseif ($content -match "CssSyntaxError|CSS syntax") {
+            "CSS syntax"
+          } elseif ($content -match "cannot resolve.*css|failed to resolve.*css|CSS import") {
+            "CSS import resolution"
+          } elseif ($content -match "tailwind.*(is not a function|does not provide|export)") {
+            "Tailwind API mismatch"
+          } elseif ($content -match "panicked at|unreachable|segmentation fault") {
+            "native transform panic"
+          } elseif ($content -match "tailwind.*(scan|source|candidate)") {
+            "Tailwind source scanning"
+          } elseif ($content -match "tailwind|oxide") {
+            "other Tailwind transform"
           } elseif ($content -match "lightningcss") {
             "Lightning CSS transform"
           } elseif ($content -match "rolldown") {
