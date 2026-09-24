@@ -21,10 +21,7 @@ concurrency:
 
 jobs:
   build-test:
-    # Vite 8 currently exits inside its Linux native bundler on the hosted
-    # runner after typecheck/tests pass. Use the validated Windows toolchain;
-    # the repository's primary CI continues to cover Ubuntu separately.
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 15
 
     defaults:
@@ -38,17 +35,12 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
-          # Match the Node major used for the validated frontend build. This
-          # also avoids Node 22/Linux native-toolchain drift in Vite 8 builds.
-          node-version: "24"
+          node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        # Vite 8, Rolldown, Tailwind, and Lightning CSS select native Linux
-        # bindings through optional dependencies. Materialize them explicitly
-        # while still enforcing the committed lockfile.
-        run: npm ci --include=optional
+        run: npm ci
 
       - name: Typecheck
         run: npm run typecheck
@@ -57,73 +49,4 @@ jobs:
         run: npm run test
 
       - name: Build
-        shell: pwsh
-        run: |
-          $log = Join-Path $env:RUNNER_TEMP "frontend-build.log"
-          & npm.cmd exec vite build *> $log
-          $status = $LASTEXITCODE
-
-          if ($status -eq 0) {
-            Get-Content -LiteralPath $log
-            exit 0
-          }
-
-          $content = Get-Content -LiteralPath $log -Raw
-          $category = if ($content -match "native binding|optional dependenc|cannot find (module|package).*(binding|oxide|lightningcss)") {
-            "native dependency loading"
-          } elseif ($content -match "could not resolve|failed to resolve import|module not found|cannot find package") {
-            "module resolution"
-          } elseif ($content -match "failed to load config|config file") {
-            "Vite configuration loading"
-          } elseif ($content -match "unknown utility|invalid utility|cannot apply.*utility") {
-            "Tailwind unknown utility"
-          } elseif ($content -match "CssSyntaxError|CSS syntax") {
-            "CSS syntax"
-          } elseif ($content -match "cannot resolve.*css|failed to resolve.*css|CSS import") {
-            "CSS import resolution"
-          } elseif ($content -match "tailwind.*(is not a function|does not provide|export)") {
-            "Tailwind API mismatch"
-          } elseif ($content -match "panicked at|unreachable|segmentation fault") {
-            "native transform panic"
-          } elseif ($content -match "tailwind.*(scan|source|candidate)") {
-            "Tailwind source scanning"
-          } elseif ($content -match "lightningcss") {
-            "Lightning CSS transform"
-          } elseif ($content -match "rolldown") {
-            "Rolldown transform"
-          } elseif ($content -match "plugin-react|oxc|react refresh") {
-            "React transform"
-          } elseif ($content -match "ENOENT|no such file or directory") {
-            "missing filesystem input"
-          } elseif ($content -match "spawn|executable") {
-            "subprocess launch"
-          } elseif ($content -match "ReferenceError|TypeError|RangeError|ERR_") {
-            "JavaScript runtime exception"
-          } elseif ($content -match "parse error|syntax error|unexpected token") {
-            "source parsing"
-          } elseif ($content -match "heap out of memory|allocation failed|Killed") {
-            "resource exhaustion"
-          } elseif ($content -match "permission denied|EACCES|EPERM") {
-            "filesystem permission"
-          } elseif ($content -match "tailwind|oxide") {
-            "other Tailwind transform"
-          } elseif ($content -match "Error:") {
-            "other reported error"
-          } else {
-            "unclassified"
-          }
-
-          $phase = if ($content -match "computing gzip size") {
-            "report"
-          } elseif ($content -match "rendering chunks") {
-            "render"
-          } elseif ($content -match "transforming") {
-            "transform"
-          } elseif ($content -match "building client environment") {
-            "startup"
-          } else {
-            "before startup"
-          }
-
-          Write-Output "::error title=Frontend build classification::category=$category; phase=$phase"
-          exit $status
+        run: npm run build
