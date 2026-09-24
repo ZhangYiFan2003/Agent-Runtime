@@ -57,6 +57,47 @@ jobs:
         run: npm run test
 
       - name: Build
-        # TypeScript already passed in the dedicated Typecheck step above;
-        # keep this step focused on the Vite production bundle.
-        run: npm exec vite build
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "frontend-build.log"
+          & npm.cmd exec vite build *> $log
+          $status = $LASTEXITCODE
+
+          if ($status -eq 0) {
+            Get-Content -LiteralPath $log
+            exit 0
+          }
+
+          $content = Get-Content -LiteralPath $log -Raw
+          $category = if ($content -match "native binding|optional dependenc|cannot find (module|package).*(binding|oxide|lightningcss)") {
+            "native dependency loading"
+          } elseif ($content -match "could not resolve|failed to resolve import|module not found|cannot find package") {
+            "module resolution"
+          } elseif ($content -match "failed to load config|config file") {
+            "Vite configuration loading"
+          } elseif ($content -match "ReferenceError|TypeError|RangeError|ERR_") {
+            "JavaScript runtime exception"
+          } elseif ($content -match "parse error|syntax error|unexpected token") {
+            "source parsing"
+          } elseif ($content -match "heap out of memory|allocation failed|Killed") {
+            "resource exhaustion"
+          } elseif ($content -match "permission denied|EACCES|EPERM") {
+            "filesystem permission"
+          } else {
+            "unclassified"
+          }
+
+          $phase = if ($content -match "computing gzip size") {
+            "report"
+          } elseif ($content -match "rendering chunks") {
+            "render"
+          } elseif ($content -match "transforming") {
+            "transform"
+          } elseif ($content -match "building client environment") {
+            "startup"
+          } else {
+            "before startup"
+          }
+
+          Write-Output "::error title=Frontend build classification::category=$category; phase=$phase"
+          exit $status
