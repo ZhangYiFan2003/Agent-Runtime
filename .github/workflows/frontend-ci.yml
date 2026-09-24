@@ -62,7 +62,17 @@ jobs:
           fi
 
           category="unclassified"
-          if grep -Eqi "out of memory|allocation failed|killed" "$log"; then
+          if grep -Eqi "object not disposable|Symbol\.dispose" "$log"; then
+            category="object-disposal"
+          elif grep -Eqi "cannot read properties|is not a function|object expected" "$log"; then
+            category="javascript-type-error"
+          elif grep -Eqi "invalid value|missing field" "$log"; then
+            category="invalid-plugin-output"
+          elif grep -Eqi "unknown utility|invalid utility|cannot apply.*utility" "$log"; then
+            category="tailwind-utility"
+          elif grep -Eqi "unknown word|CssSyntaxError|CSS syntax" "$log"; then
+            category="css-syntax"
+          elif grep -Eqi "out of memory|allocation failed|killed" "$log"; then
             category="resource-exhaustion"
           elif grep -Eqi "cannot find (module|package)|could not resolve|failed to resolve" "$log"; then
             category="module-resolution"
