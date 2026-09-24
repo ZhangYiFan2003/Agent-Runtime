@@ -75,6 +75,18 @@ jobs:
             "module resolution"
           } elseif ($content -match "failed to load config|config file") {
             "Vite configuration loading"
+          } elseif ($content -match "tailwind|oxide|unknown utility|invalid utility") {
+            "Tailwind transform"
+          } elseif ($content -match "lightningcss") {
+            "Lightning CSS transform"
+          } elseif ($content -match "rolldown") {
+            "Rolldown transform"
+          } elseif ($content -match "plugin-react|oxc|react refresh") {
+            "React transform"
+          } elseif ($content -match "ENOENT|no such file or directory") {
+            "missing filesystem input"
+          } elseif ($content -match "spawn|executable") {
+            "subprocess launch"
           } elseif ($content -match "ReferenceError|TypeError|RangeError|ERR_") {
             "JavaScript runtime exception"
           } elseif ($content -match "parse error|syntax error|unexpected token") {
