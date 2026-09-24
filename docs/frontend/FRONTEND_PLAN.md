@@ -1,7 +1,18 @@
 # Axiom Frontend Plan
 
-Status: analysis and design only. No frontend code exists yet.
-This document is the long-term context for all future frontend sessions.
+> **Implementation status: Phase 1–7 complete** (scaffold, Runs explorer, Run
+> Inspector, event replay, run controls, Agent Workbench, final polish &
+> hardening). Route-level code splitting, route error boundary + Not Found,
+> per-route document titles, and a frontend CI workflow landed in Phase 7.
+> Event transport is **persisted replay + `after_id` polling** (see B.3.4);
+> migrating to the backend's `follow=1` held-open mode is optional future
+> work — it requires a `run_id` filter, so the Workbench's thread-wide replay
+> would keep polling regardless, and the replay client's cursor/dedupe/
+> backoff/terminal-drain semantics are already unit-tested.
+
+This document is the long-term context for all frontend sessions. Sections
+A–K below are the original analysis/design record; the status note above
+reflects what actually shipped.
 
 Product position: AI Agent Runtime / developer tool / runtime control plane.
 Not an admin dashboard, not an AI SaaS chat product. The `/v1` HTTP API is the

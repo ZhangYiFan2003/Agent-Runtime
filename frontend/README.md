@@ -1,8 +1,9 @@
 # Axiom Frontend
 
-Developer console for the local Axiom Runtime. Phase 1: scaffold, design
-system, app shell, API contract layer (client + zod DTOs + adapters),
-Settings with `/health` connection check. Architecture source of truth:
+Developer console for the local Axiom Runtime: Agent Workbench (threads,
+blocking turns, live execution feed, approvals), Runs explorer, Run
+Inspector (trace waterfall, events, metrics, children, controls), and
+Settings. Architecture source of truth:
 `../docs/frontend/FRONTEND_PLAN.md`.
 
 ## Requirements

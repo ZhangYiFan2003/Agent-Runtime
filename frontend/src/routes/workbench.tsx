@@ -3,6 +3,7 @@ import { Menu, X } from "lucide-react";
 import { useWorkbench } from "../queries/use-workbench";
 import { SUBMISSION_LOST_MESSAGE } from "../queries/workbench-session";
 import { useMediaQuery } from "../lib/use-media-query";
+import { useDocumentTitle } from "../lib/use-document-title";
 import { Composer } from "../components/workbench/composer";
 import { RunContextPanel } from "../components/workbench/context-panel";
 import { ThreadRail } from "../components/workbench/thread-rail";
@@ -22,6 +23,7 @@ import { Sheet, SheetContent, SheetTitle } from "../components/ui/sheet";
  * panel reads the RunView queries, controls go through the Phase-5 engine.
  */
 export function WorkbenchPage() {
+  useDocumentTitle("Workbench · Axiom");
   const wb = useWorkbench();
   const isDesktop = useMediaQuery("(min-width: 768px)");
   const [railOpen, setRailOpen] = useState(false);

@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { RunView } from "../../api/adapters/run";
-import { formatDurationMs, formatFullTime, formatRelativeTime } from "../../lib/format";
+import { formatDurationMs, formatFullTime, formatRelativeTime, truncateId } from "../../lib/format";
 import { childrenLabel, isChildRun, runDurationMs } from "../../lib/runs-view";
 import { CopyId } from "./copy-id";
 import { StatusPill } from "./status-pill";
@@ -147,7 +147,12 @@ export function RunsMobileList({ runs, onOpenRun }: RunsTableProps) {
               </span>
             </div>
             <div className="flex items-center justify-between gap-2">
-              <CopyId id={run.runId} head={18} />
+              {/* Plain text, not CopyId: a nested <button> inside the row
+                  button is invalid HTML (hydration warning). Copy lives on
+                  the Run Detail page. */}
+              <span className="min-w-0 truncate font-mono text-xs text-fg-0">
+                {truncateId(run.runId, 18)}
+              </span>
               <span className="font-mono text-[11px] text-fg-2">
                 {formatRelativeTime(run.updatedAt)}
               </span>

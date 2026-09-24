@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Eye, EyeOff, PlugZap, Trash2 } from "lucide-react";
 import { testConnection, type ConnectionTestResult } from "../api/health";
 import { clearConnection, getConnection, saveConnection } from "../lib/connection";
+import { useDocumentTitle } from "../lib/use-document-title";
 import { queryKeys } from "../queries/keys";
 import { Button } from "../components/ui/button";
 import { ErrorState } from "../components/ui/error-state";
@@ -46,6 +47,7 @@ function HealthDetails({ health }: { health: ConnectionTestResult & { ok: true }
 }
 
 export function SettingsPage() {
+  useDocumentTitle("Settings · Axiom");
   const queryClient = useQueryClient();
   const initial = getConnection();
   const [baseUrl, setBaseUrl] = useState(initial.baseUrl);

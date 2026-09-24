@@ -11,6 +11,8 @@ import { useRunControls } from "../queries/use-run-controls";
 import { useRuntimeEvents } from "../queries/use-runtime-events";
 import { isChildRun } from "../lib/runs-view";
 import { useMediaQuery } from "../lib/use-media-query";
+import { useDocumentTitle } from "../lib/use-document-title";
+import { truncateId } from "../lib/format";
 import { cn } from "../lib/utils";
 import { Button } from "../components/ui/button";
 import { ErrorState } from "../components/ui/error-state";
@@ -137,6 +139,7 @@ export function RunDetailPage() {
   const { runId } = routeApi.useParams();
   const search = routeApi.useSearch();
   const navigate = useNavigate();
+  useDocumentTitle(`${truncateId(runId, 14)} · Axiom`);
 
   const runQuery = useRun(runId);
   const run = runQuery.data;

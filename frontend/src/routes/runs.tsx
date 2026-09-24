@@ -3,6 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { ListTree, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { useRuns } from "../queries/use-runs";
 import { ApiError } from "../api/client";
+import { useDocumentTitle } from "../lib/use-document-title";
 import {
   ALL_FILTER,
   deriveFilterOptions,
@@ -49,6 +50,7 @@ function EmptyState({ title, hint }: { title: string; hint: string }) {
 }
 
 export function RunsPage() {
+  useDocumentTitle("Runs · Axiom");
   const navigate = useNavigate();
   const runsQuery = useRuns();
   const [filter, setFilter] = useState<RunsFilter>({
