@@ -42,7 +42,10 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        # Vite 8, Rolldown, Tailwind, and Lightning CSS select native Linux
+        # bindings through optional dependencies. Materialize them explicitly
+        # while still enforcing the committed lockfile.
+        run: npm ci --include=optional
 
       - name: Typecheck
         run: npm run typecheck
