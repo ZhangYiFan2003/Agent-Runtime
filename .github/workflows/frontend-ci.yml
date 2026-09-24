@@ -54,6 +54,29 @@ jobs:
         run: npm run test
 
       - name: Build
-        # TypeScript already passed in the dedicated Typecheck step above;
-        # keep this step focused on the Vite production bundle.
-        run: npm exec vite build
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/frontend-build.log"
+          if npm exec vite build >"$log" 2>&1; then
+            cat "$log"
+            exit 0
+          fi
+
+          if grep -Eqi 'native binding|optional dependenc|cannot find module.*(binding|oxide|lightningcss)' "$log"; then
+            category='native dependency loading'
+          elif grep -Eqi 'could not resolve|failed to resolve import|module not found' "$log"; then
+            category='module resolution'
+          elif grep -Eqi 'failed to load config|config file' "$log"; then
+            category='Vite configuration loading'
+          elif grep -Eqi 'parse error|syntax error|unexpected token' "$log"; then
+            category='source parsing'
+          elif grep -Eqi 'heap out of memory|allocation failed' "$log"; then
+            category='memory exhaustion'
+          elif grep -Eqi 'permission denied|EACCES' "$log"; then
+            category='filesystem permission'
+          else
+            category='unclassified Vite build failure'
+          fi
+
+          echo "::error title=Frontend build category::$category"
+          exit 1
