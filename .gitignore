@@ -15,7 +15,9 @@ credentials.json
 *.key
 *.pem
 *.secret
-*token*
+token.json
+tokens.json
+*.token
 .uv-cache/
 node_modules/
 docs/interview/

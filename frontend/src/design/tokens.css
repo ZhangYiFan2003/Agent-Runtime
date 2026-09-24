@@ -1,0 +1,27 @@
+/* Axiom design tokens — dark only.
+ * 80% minimal developer tool, 20% subtle cyberpunk console.
+ * Components must use the Tailwind theme tokens mapped in styles.css,
+ * never these hex values directly.
+ */
+
+:root {
+  /* surfaces */
+  --bg-0: #0b0e0c; /* app background (near-black, green undertone) */
+  --bg-1: #101411; /* panels, sidebar */
+  --bg-2: #161b17; /* raised surfaces, hover */
+  --bg-3: #1d241f; /* active / selected surface */
+  --border: #232a25; /* 1px hairlines */
+
+  /* text */
+  --fg-0: #e8ede9; /* primary */
+  --fg-1: #9aa69d; /* secondary */
+  --fg-2: #5c665e; /* muted / metadata */
+
+  /* accent — rationed: selected, active, focus, key action, success */
+  --accent: #34d399;
+  --accent-dim: color-mix(in srgb, var(--accent) 12%, transparent);
+
+  --warn: #e8b44a; /* waiting_approval, retry, degraded */
+  --danger: #e4574f; /* failed, errors, reject */
+  --info: #7ba7bc; /* interrupted, links (sparingly) */
+}
