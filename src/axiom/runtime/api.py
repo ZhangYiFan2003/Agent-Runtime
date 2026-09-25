@@ -48,6 +48,7 @@ from axiom.runtime.observability_store import (
     RunTracer,
     SQLiteObservabilityStore,
 )
+from axiom.runtime.ownership import DistributedRunWorker, RunOwnership
 from axiom.runtime.supervisor import ActiveRunSupervisor
 from axiom.runtime.tasks import DurableTaskManager
 from axiom.types import Message
@@ -83,6 +84,7 @@ class RuntimeApiServer:
         cwd: str,
         config: AxiomConfig,
         api_key: str,
+        host: str = "127.0.0.1",
         port: int = 8080,
         workers: int = 2,
         data_dir: str | Path | None = None,
@@ -104,6 +106,7 @@ class RuntimeApiServer:
         self.cwd = str(Path(cwd).resolve())
         self.config = config
         self.api_key = api_key
+        self.host = host
         self.port = port
         self.workers = workers
         self.data_dir = (
@@ -179,7 +182,7 @@ class RuntimeApiServer:
     @property
     def address(self) -> tuple[str, int]:
         if self._httpd is None:
-            return ("127.0.0.1", self.port)
+            return (self.host, self.port)
         host, port = self._httpd.server_address[:2]
         return (str(host), int(port))
 
@@ -189,7 +192,7 @@ class RuntimeApiServer:
         self._stop.clear()
         asyncio.run(self._recover_waiting_parents())
         self._start_workers()
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self._handler_class())
+        self._httpd = ThreadingHTTPServer((self.host, self.port), self._handler_class())
         self._server_thread = threading.Thread(
             target=self._httpd.serve_forever,
             name="axiom-runtime-api",
@@ -202,9 +205,9 @@ class RuntimeApiServer:
         self._stop.clear()
         asyncio.run(self._recover_waiting_parents())
         self._start_workers()
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self._handler_class())
+        self._httpd = ThreadingHTTPServer((self.host, self.port), self._handler_class())
         self.port = self.address[1]
-        print(f"Axiom Runtime API listening on http://127.0.0.1:{self.port}", flush=True)
+        print(f"Axiom Runtime API listening on http://{self.host}:{self.port}", flush=True)
         try:
             self._httpd.serve_forever()
         finally:
@@ -317,6 +320,52 @@ class RuntimeApiServer:
             )
             thread.start()
             self._worker_threads.append(thread)
+
+    def build_distributed_worker(self, *, worker_id: str | None = None) -> DistributedRunWorker:
+        """Compose the production PostgreSQL Worker without duplicating ownership logic."""
+        if not self.config.worker.distributed_enabled:
+            raise ValueError("axiom worker requires worker.distributed_enabled=true")
+        if self.storage_backend != "postgres":
+            raise ValueError("axiom worker requires storage.backend=postgres")
+        return DistributedRunWorker(
+            store=self.checkpoint_store,
+            runtime_factory=lambda ownership: _ClaimedRunRuntime(self, ownership),
+            lease_seconds=self.config.worker.lease_seconds,
+            heartbeat_interval_seconds=self.config.worker.heartbeat_interval_seconds,
+            poll_interval_seconds=self.config.worker.poll_interval_seconds,
+            max_active_runs=self.config.capacity.max_active_runs,
+            max_active_runs_per_principal=(
+                self.config.capacity.max_active_runs_per_principal
+            ),
+            max_run_delivery_attempts=self.config.worker.max_run_delivery_attempts,
+            worker_id=worker_id,
+            event_sink=self._ownership_event_sink(),
+        )
+
+    def _ownership_event_sink(self):
+        async def emit(event_type: str, payload: dict[str, object]) -> None:
+            run_id = _optional_text(payload.get("run_id"))
+            if run_id is None:
+                return
+            state = await self.checkpoint_store.load(run_id)
+            if state is None:
+                return
+            await self._append_event_async(
+                state.thread_id,
+                event_type,
+                redact_secrets(
+                    {
+                        "thread_id": state.thread_id,
+                        "turn_id": state.turn_id,
+                        "run_id": state.run_id,
+                        "parent_run_id": state.parent_run_id,
+                        "parent_step_id": state.parent_step_id,
+                        **payload,
+                    }
+                ),
+            )
+
+        return emit
 
     def _handler_class(self):
         outer = self
@@ -1354,6 +1403,7 @@ class RuntimeApiServer:
         thread_id: str,
         *,
         execution_strategy: str = "react",
+        ownership: RunOwnership | None = None,
     ) -> DurableAgentRuntime:
         return DurableAgentRuntime(
             llm_client=engine.llm_client,
@@ -1367,6 +1417,7 @@ class RuntimeApiServer:
             tracer=RunTracer(self.observability_store),
             execution_strategy=execution_strategy,
             active_run_supervisor=self.active_run_supervisor,
+            ownership=ownership,
         )
 
     def _runtime_event_sink(self, thread_id: str):
@@ -1516,6 +1567,8 @@ class RuntimeApiServer:
         return state
 
     async def _recover_waiting_parents(self) -> None:
+        if self.config.worker.distributed_enabled:
+            return
         for state in await self._all_runs():
             if state.status != RunStatus.WAITING_CHILD:
                 continue
@@ -1832,6 +1885,42 @@ class RuntimeApiServer:
         finally:
             with self._sse_metrics_lock:
                 self._active_sse_followers -= 1
+
+
+class _ClaimedRunRuntime:
+    """Build one ownership-fenced Runtime lazily after a Worker claim."""
+
+    def __init__(self, server: RuntimeApiServer, ownership: RunOwnership):
+        self.server = server
+        self.ownership = ownership
+
+    async def resume(self, run_id: str) -> Checkpoint:
+        state = await self.server.checkpoint_store.load(run_id)
+        if state is None:
+            raise ValueError(f"run not found after claim: {run_id}")
+        context = RuntimeRequestContext(
+            thread_id=state.thread_id,
+            message=state.input,
+            history=list(state.messages),
+            cwd=self.server.cwd,
+            config=self.server.config,
+            turn_id=state.turn_id,
+            run_id=state.run_id,
+        )
+        engine = await self.server._engine(context)
+        if not isinstance(engine, QueryEngine):
+            raise ValueError("custom engine does not support distributed execution")
+        runtime = self.server._durable_runtime(
+            engine,
+            state.thread_id,
+            execution_strategy=state.execution_strategy,
+            ownership=self.ownership,
+        )
+        result = await runtime.resume(run_id)
+        if result.parent_run_id is None and result.status == RunStatus.COMPLETED:
+            await self.server._finish_durable_turn(result)
+        return result
+
 
 class _RunningRuntimeServer:
     def __init__(self, server: RuntimeApiServer):

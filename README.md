@@ -52,6 +52,12 @@ Quick demo:
 4. Open Workbench, create a Thread, and submit a Turn.
 5. Follow the active Run, then open its full Inspector.
 
+## Deployment
+
+A single-host Docker Compose baseline is available for private, trusted-user deployments. It runs
+the Web Console, Runtime API, PostgreSQL durable authority, and horizontally scalable Worker
+processes behind one same-origin HTTP entrypoint. See [`deploy/README.md`](deploy/README.md).
+
 ## Features
 
 | Feature | Description | Verification |

@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -132,7 +133,25 @@ def doctor(
 @app.command("serve")
 def runtime_serve(
     http: Annotated[bool, typer.Option("--http", help="Serve Runtime API over HTTP")] = True,
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            help="HTTP bind host. Use 0.0.0.0 inside a trusted container network.",
+        ),
+    ] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", help="HTTP port")] = 8080,
+    workers: Annotated[
+        int,
+        typer.Option(
+            "--task-workers",
+            min=0,
+            help=(
+                "Process-local legacy task workers; distributed Run Workers are separate "
+                "processes."
+            ),
+        ),
+    ] = 2,
     api_key: Annotated[
         str | None,
         typer.Option("--api-key", help="Runtime API key. Defaults to AXIOM_RUNTIME_API_KEY."),
@@ -155,9 +174,97 @@ def runtime_serve(
         cwd=str(root),
         config=config,
         api_key=key,
+        host=host,
         port=port,
+        workers=workers,
         data_dir=data_dir,
     ).serve_forever()
+
+
+@app.command("worker")
+def runtime_worker(
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+    worker_id: Annotated[
+        str | None,
+        typer.Option(
+            "--worker-id",
+            help="Optional stable Worker identity; defaults to a unique host identity.",
+        ),
+    ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Runtime auxiliary data directory"),
+    ] = None,
+) -> None:
+    """Run the PostgreSQL-backed distributed ownership Worker process."""
+    root = (cwd or Path.cwd()).resolve()
+    composition = None
+    try:
+        config = load_config(project_root=root)
+        composition = RuntimeApiServer(
+            cwd=str(root),
+            config=config,
+            api_key="",
+            workers=0,
+            data_dir=data_dir,
+        )
+        worker = composition.build_distributed_worker(worker_id=worker_id)
+    except ValueError as exc:
+        if composition is not None:
+            composition.shutdown()
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"Axiom distributed Worker started: {worker.worker_id}")
+    try:
+        asyncio.run(_run_distributed_worker(worker))
+    finally:
+        composition.shutdown()
+
+
+async def _run_distributed_worker(
+    worker: Any,
+    *,
+    stop_event: asyncio.Event | None = None,
+    install_signal_handlers: bool = True,
+) -> None:
+    """Run until SIGINT/SIGTERM, then stop claims and release active ownership safely."""
+    stopping = stop_event or asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_handlers: list[signal.Signals] = []
+    fallback_handlers: dict[signal.Signals, Any] = {}
+
+    if install_signal_handlers:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stopping.set)
+                loop_handlers.append(sig)
+            except (NotImplementedError, RuntimeError):
+                previous = signal.getsignal(sig)
+
+                def request_stop(_signum, _frame, *, event=stopping, event_loop=loop):
+                    event_loop.call_soon_threadsafe(event.set)
+
+                signal.signal(sig, request_stop)
+                fallback_handlers[sig] = previous
+
+    run_task = asyncio.create_task(worker.run_forever())
+    stop_task = asyncio.create_task(stopping.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {run_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if run_task in done:
+            await run_task
+    finally:
+        await worker.shutdown()
+        stop_task.cancel()
+        await asyncio.gather(run_task, stop_task, return_exceptions=True)
+        for sig in loop_handlers:
+            loop.remove_signal_handler(sig)
+        for sig, previous in fallback_handlers.items():
+            signal.signal(sig, previous)
 
 
 @runs_app.command("show")

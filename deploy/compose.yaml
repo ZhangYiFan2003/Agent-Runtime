@@ -1,0 +1,129 @@
+name: axiom
+
+x-runtime-environment: &runtime-environment
+  AXIOM_STORAGE_BACKEND: postgres
+  AXIOM_POSTGRES_DSN: ${AXIOM_POSTGRES_DSN:?AXIOM_POSTGRES_DSN is required}
+  AXIOM_DISTRIBUTED_WORKER: "true"
+  AXIOM_WORKER_LEASE_SECONDS: ${AXIOM_WORKER_LEASE_SECONDS:-30}
+  AXIOM_WORKER_HEARTBEAT_INTERVAL_SECONDS: ${AXIOM_WORKER_HEARTBEAT_INTERVAL_SECONDS:-10}
+  AXIOM_WORKER_POLL_INTERVAL_SECONDS: ${AXIOM_WORKER_POLL_INTERVAL_SECONDS:-0.5}
+  AXIOM_MAX_RUN_DELIVERY_ATTEMPTS: ${AXIOM_MAX_RUN_DELIVERY_ATTEMPTS:-5}
+  AXIOM_MAX_QUEUED_RUNS: ${AXIOM_MAX_QUEUED_RUNS:-100}
+  AXIOM_MAX_ACTIVE_RUNS: ${AXIOM_MAX_ACTIVE_RUNS:-4}
+  AXIOM_MAX_QUEUED_RUNS_PER_PRINCIPAL: ${AXIOM_MAX_QUEUED_RUNS_PER_PRINCIPAL:-100}
+  AXIOM_MAX_ACTIVE_RUNS_PER_PRINCIPAL: ${AXIOM_MAX_ACTIVE_RUNS_PER_PRINCIPAL:-4}
+  AXIOM_PROVIDER: ${AXIOM_PROVIDER:-deepseek}
+  AXIOM_MODEL: ${AXIOM_MODEL:-deepseek-v4-flash}
+  AXIOM_API_KEY: ${AXIOM_API_KEY:-}
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-axiom}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-axiom}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - internal
+
+  runtime-api:
+    image: axiom-runtime:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --task-workers
+      - "0"
+      - --cwd
+      - /workspace
+      - --data-dir
+      - /var/lib/axiom
+    restart: unless-stopped
+    environment:
+      <<: *runtime-environment
+      AXIOM_RUNTIME_API_KEY: ${AXIOM_RUNTIME_API_KEY:?AXIOM_RUNTIME_API_KEY is required}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${AXIOM_WORKSPACE_MOUNT:-workspace_data}:/workspace
+      - runtime_data:/var/lib/axiom
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    stop_grace_period: 15s
+    networks:
+      - internal
+
+  worker:
+    image: axiom-runtime:local
+    command:
+      - worker
+      - --cwd
+      - /workspace
+      - --data-dir
+      - /var/lib/axiom
+    restart: unless-stopped
+    environment:
+      <<: *runtime-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${AXIOM_WORKSPACE_MOUNT:-workspace_data}:/workspace
+      - runtime_data:/var/lib/axiom
+    stop_grace_period: 35s
+    networks:
+      - internal
+
+  web:
+    image: axiom-web:local
+    build:
+      context: ..
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      runtime-api:
+        condition: service_healthy
+    ports:
+      - "${AXIOM_WEB_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+  runtime_data:
+  workspace_data:
+
+networks:
+  internal:
+    driver: bridge
