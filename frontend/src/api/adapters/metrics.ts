@@ -18,7 +18,7 @@ export interface RunMetrics {
   totalTokens: number;
   toolSuccesses: number;
   toolFailures: number;
-  toolSuccessRate: number;
+  toolSuccessRate: number | null;
   checkpointCount: number;
   interruptCount: number;
   resumeCount: number;
@@ -59,6 +59,8 @@ export interface RunMetrics {
 }
 
 export function adaptRunMetrics(dto: RunMetricsDto): RunMetrics {
+  const parsedCostUsd = dto.cost_usd === null ? null : Number(dto.cost_usd);
+
   return {
     traceId: dto.trace_id,
     runId: dto.run_id,
@@ -85,7 +87,7 @@ export function adaptRunMetrics(dto: RunMetricsDto): RunMetrics {
     retryBackoffMs: dto.retry_backoff_ms,
     cachedInputTokens: dto.cached_input_tokens,
     reasoningTokens: dto.reasoning_tokens,
-    costUsd: dto.cost_usd,
+    costUsd: parsedCostUsd !== null && Number.isFinite(parsedCostUsd) ? parsedCostUsd : null,
     costKnown: dto.cost_known,
     elapsedSeconds: dto.elapsed_seconds,
     budgetPolicy: dto.budget_policy,

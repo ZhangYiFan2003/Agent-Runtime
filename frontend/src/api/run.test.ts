@@ -134,6 +134,14 @@ describe("fetchRunMetrics", () => {
     expect(metrics?.budgetUtilization).toEqual({});
   });
 
+  it("accepts nullable tool success and decimal-string cost from the runtime", async () => {
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse(200, makeRunMetricsDto({ tool_success_rate: null, cost_usd: "0.0125" }));
+    const metrics = await fetchRunMetrics(BASE, "run_a", fetchImpl);
+    expect(metrics?.toolSuccessRate).toBeNull();
+    expect(metrics?.costUsd).toBe(0.0125);
+  });
+
   it("tolerates unknown extra fields from a newer backend", async () => {
     const fetchImpl: typeof fetch = async () =>
       jsonResponse(200, makeRunMetricsDto({ future_field: { nested: true } }));

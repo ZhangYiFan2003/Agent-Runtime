@@ -330,7 +330,10 @@ export function groupMetrics(metrics: RunMetrics): MetricGroup[] {
         { label: "Tool calls", value: String(metrics.toolCalls) },
         { label: "Successes", value: String(metrics.toolSuccesses) },
         { label: "Failures", value: String(metrics.toolFailures) },
-        { label: "Success rate", value: formatPercent(metrics.toolSuccessRate) },
+        {
+          label: "Success rate",
+          value: metrics.toolSuccessRate === null ? "—" : formatPercent(metrics.toolSuccessRate),
+        },
       ],
     },
     {

@@ -129,7 +129,7 @@ export function useWorkbench(): Workbench {
       setPromptBoundary(null);
       setThreadIdState(next);
       saveLastThreadId(next);
-      if (next !== null) setThreads(threadRegistry.touch(next));
+      if (next !== null) setThreads(threadRegistry.add(next));
     },
     [session],
   );

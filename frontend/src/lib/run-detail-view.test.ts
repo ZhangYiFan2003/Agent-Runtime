@@ -308,6 +308,13 @@ describe("groupMetrics", () => {
     expect(budget?.entries).toContainEqual({ label: "utilization · tokens", value: "50.0%" });
     expect(budget?.entries).toContainEqual({ label: "Soft limit reached", value: "yes" });
   });
+
+  it("renders an unavailable tool success rate without failing", () => {
+    const tools = groupMetrics(makeRunMetrics({ tool_success_rate: null })).find(
+      (group) => group.title === "Tools",
+    );
+    expect(tools?.entries.find((entry) => entry.label === "Success rate")?.value).toBe("—");
+  });
 });
 
 describe("buildOverviewSections", () => {
