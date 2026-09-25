@@ -37,6 +37,21 @@ Workbench, Runs explorer, and Run Inspector layouts support both desktop and mob
   <img src="docs/assets/frontend/workbench-mobile.png" width="360" alt="Axiom mobile workbench">
 </p>
 
+```text
+Web Console ── /v1 ──▶ Runtime Control Plane
+                         ├─ Runs / Children
+                         ├─ Events / Trace / Metrics
+                         └─ Controls / Approvals
+```
+
+Quick demo:
+
+1. Start the Runtime with `uv run axiom serve`.
+2. In `frontend/`, run `npm install` and `npm run dev`.
+3. Open Settings, configure the Runtime connection, and test it.
+4. Open Workbench, create a Thread, and submit a Turn.
+5. Follow the active Run, then open its full Inspector.
+
 ## Features
 
 | Feature | Description | Verification |
