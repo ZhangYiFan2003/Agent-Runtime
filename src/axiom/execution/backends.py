@@ -10,6 +10,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import quote
+
+import httpx
 
 from axiom.config import AxiomConfig, ExecutionConfig
 from axiom.policy.path_guard import PathGuard
@@ -44,9 +47,12 @@ class ExecutionResult:
     workspace: str
     env_filtered_count: int
     cleanup_method: str | None = None
+    sandbox_id: str | None = None
+    resource_limits: Mapping[str, object] | None = None
+    network_mode: str | None = None
 
     def metadata(self) -> dict[str, object]:
-        return {
+        metadata = {
             "execution_backend": self.execution_backend,
             "workspace": self.workspace,
             "timeout_seconds": self.timeout_seconds,
@@ -61,12 +67,23 @@ class ExecutionResult:
             "env_filtered_count": self.env_filtered_count,
             "process_cleanup": self.cleanup_method,
         }
+        if self.sandbox_id is not None:
+            metadata["sandbox_id"] = self.sandbox_id
+        if self.resource_limits is not None:
+            metadata["resource_limits"] = dict(self.resource_limits)
+        if self.network_mode is not None:
+            metadata["network_mode"] = self.network_mode
+        return metadata
 
 
 class ExecutionBackend(Protocol):
     name: str
 
     async def execute(self, request: ExecutionRequest) -> ExecutionResult: ...
+
+    async def cleanup_run(self, run_id: str) -> None: ...
+
+    async def shutdown(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +164,12 @@ class _SubprocessExecutionBackend:
             env_filtered_count=filtered_count,
             cleanup_method=cleanup_method,
         )
+
+    async def cleanup_run(self, run_id: str) -> None:
+        del run_id
+
+    async def shutdown(self) -> None:
+        return None
 
     def _resolve_cwd(self, request: ExecutionRequest) -> Path:
         return Path(request.cwd).resolve()
@@ -274,6 +297,229 @@ class RestrictedExecutionBackend(_SubprocessExecutionBackend):
         return environment, filtered_count
 
 
+class SandboxControllerError(RuntimeError):
+    """Safe controller failure surfaced to the Tool result."""
+
+    def __init__(self, message: str, *, code: str = "SANDBOX_CONTROLLER_ERROR") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class SandboxExecutionBackend:
+    """Fail-closed client for the narrow sandboxd execution API."""
+
+    name = "sandbox"
+
+    def __init__(
+        self,
+        workspace: str | Path,
+        *,
+        controller_url: str,
+        allowed_env_names: list[str] | tuple[str, ...],
+        request_max_bytes: int,
+        command_max_bytes: int,
+    ) -> None:
+        self.workspace = Path(workspace).resolve()
+        self.controller_url = controller_url.rstrip("/")
+        self.allowed_env_names = {name.casefold() for name in allowed_env_names}
+        self.request_max_bytes = request_max_bytes
+        self.command_max_bytes = command_max_bytes
+
+    async def healthcheck(self) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{self.controller_url}/health")
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise SandboxControllerError(
+                "sandbox controller is unavailable",
+                code="SANDBOX_UNAVAILABLE",
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            raise SandboxControllerError(
+                "sandbox controller health check failed",
+                code="SANDBOX_UNAVAILABLE",
+            )
+
+    async def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        if not request.run_id:
+            raise SandboxControllerError(
+                "sandbox execution requires a Run identity",
+                code="SANDBOX_INVALID_REQUEST",
+            )
+        sandbox_cwd = self._sandbox_cwd(request)
+        environment, filtered_count = self._environment(request)
+        command_bytes = len(request.command.encode("utf-8"))
+        if command_bytes == 0 or command_bytes > self.command_max_bytes:
+            raise SandboxControllerError(
+                "sandbox command size is invalid",
+                code="SANDBOX_INVALID_REQUEST",
+            )
+        body = {
+            "run_id": request.run_id,
+            "invocation_id": request.invocation_id or "",
+            "command": request.command,
+            "cwd": sandbox_cwd,
+            "timeout_seconds": request.timeout_seconds,
+            "stdout_limit_bytes": request.stdout_limit_bytes,
+            "stderr_limit_bytes": request.stderr_limit_bytes,
+            "environment": environment,
+        }
+        encoded = httpx.Request("POST", "http://sandbox/v1/execute", json=body).content
+        if len(encoded) > self.request_max_bytes:
+            raise SandboxControllerError(
+                "sandbox request body is too large",
+                code="SANDBOX_INVALID_REQUEST",
+            )
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(max(5.0, request.timeout_seconds + 10.0))
+            ) as client:
+                response = await client.post(f"{self.controller_url}/v1/execute", json=body)
+            payload = self._response_payload(response)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._cancel_run(request.run_id))
+            raise
+        except SandboxControllerError:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
+            raise SandboxControllerError(
+                "sandbox controller is unavailable",
+                code="SANDBOX_UNAVAILABLE",
+            ) from exc
+        return ExecutionResult(
+            stdout=str(payload["stdout"]),
+            stderr=str(payload["stderr"]),
+            exit_code=_optional_int(payload.get("exit_code")),
+            duration_ms=float(payload["duration_ms"]),
+            stdout_bytes=int(payload["stdout_bytes"]),
+            stderr_bytes=int(payload["stderr_bytes"]),
+            stdout_truncated=bool(payload["stdout_truncated"]),
+            stderr_truncated=bool(payload["stderr_truncated"]),
+            timed_out=bool(payload["timed_out"]),
+            timeout_seconds=request.timeout_seconds,
+            execution_backend=self.name,
+            workspace=str(self.workspace),
+            env_filtered_count=filtered_count,
+            cleanup_method=_optional_text(payload.get("cleanup_method")),
+            sandbox_id=_optional_text(payload.get("sandbox_id")),
+            resource_limits=(
+                dict(payload["resource_limits"])
+                if isinstance(payload.get("resource_limits"), dict)
+                else None
+            ),
+            network_mode=_optional_text(payload.get("network_mode")),
+        )
+
+    async def cleanup_run(self, run_id: str) -> None:
+        if not run_id:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.delete(
+                    f"{self.controller_url}/v1/runs/{quote(run_id, safe='')}"
+                )
+            if response.status_code not in {200, 204, 404}:
+                self._response_payload(response)
+        except SandboxControllerError:
+            raise
+        except httpx.HTTPError as exc:
+            raise SandboxControllerError(
+                "sandbox cleanup could not reach the controller",
+                code="SANDBOX_UNAVAILABLE",
+            ) from exc
+
+    async def shutdown(self) -> None:
+        return None
+
+    async def _cancel_run(self, run_id: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{self.controller_url}/v1/runs/{quote(run_id, safe='')}/cancel"
+                )
+        except httpx.HTTPError:
+            return
+
+    def _sandbox_cwd(self, request: ExecutionRequest) -> str:
+        request_workspace = Path(request.workspace).resolve()
+        if request_workspace != self.workspace:
+            raise SandboxControllerError(
+                "execution workspace does not match sandbox backend workspace",
+                code="SANDBOX_INVALID_CWD",
+            )
+        try:
+            cwd = PathGuard(self.workspace).validate(request.cwd)
+        except ValueError as exc:
+            raise SandboxControllerError(
+                "sandbox cwd is outside the workspace",
+                code="SANDBOX_INVALID_CWD",
+            ) from exc
+        if not cwd.is_dir():
+            raise SandboxControllerError(
+                "sandbox cwd is not a directory",
+                code="SANDBOX_INVALID_CWD",
+            )
+        relative = cwd.relative_to(self.workspace)
+        suffix = "/".join(relative.parts)
+        return "/workspace" if not suffix else f"/workspace/{suffix}"
+
+    def _environment(self, request: ExecutionRequest) -> tuple[dict[str, str], int]:
+        environment, filtered_count = filtered_host_environment(self.allowed_env_names)
+        for name, value in request.environment.items():
+            if name.casefold() in self.allowed_env_names:
+                environment[name] = value
+            else:
+                filtered_count += 1
+        return environment, filtered_count
+
+    @staticmethod
+    def _response_payload(response: httpx.Response) -> dict[str, object]:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SandboxControllerError("sandbox controller returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise SandboxControllerError("sandbox controller returned an invalid response")
+        if response.is_error:
+            message = str(payload.get("message") or "sandbox controller request failed")
+            code = str(payload.get("code") or "SANDBOX_CONTROLLER_ERROR")
+            raise SandboxControllerError(message, code=code)
+        required = {
+            "stdout",
+            "stderr",
+            "duration_ms",
+            "stdout_bytes",
+            "stderr_bytes",
+            "stdout_truncated",
+            "stderr_truncated",
+            "timed_out",
+        }
+        if not required.issubset(payload):
+            raise SandboxControllerError("sandbox controller response is incomplete")
+        if not isinstance(payload.get("stdout"), str) or not isinstance(
+            payload.get("stderr"), str
+        ):
+            raise SandboxControllerError("sandbox controller output is invalid")
+        for name in ("stdout_bytes", "stderr_bytes"):
+            if isinstance(payload.get(name), bool) or not isinstance(payload.get(name), int):
+                raise SandboxControllerError("sandbox controller byte counts are invalid")
+        for name in ("stdout_truncated", "stderr_truncated", "timed_out"):
+            if not isinstance(payload.get(name), bool):
+                raise SandboxControllerError("sandbox controller flags are invalid")
+        if not isinstance(payload.get("duration_ms"), (int, float)) or isinstance(
+            payload.get("duration_ms"), bool
+        ):
+            raise SandboxControllerError("sandbox controller duration is invalid")
+        exit_code = payload.get("exit_code")
+        if exit_code is not None and (
+            not isinstance(exit_code, int) or isinstance(exit_code, bool)
+        ):
+            raise SandboxControllerError("sandbox controller exit code is invalid")
+        return payload
+
+
 def create_execution_backend(
     config: AxiomConfig | ExecutionConfig,
     workspace: str | Path,
@@ -283,13 +529,21 @@ def create_execution_backend(
         return LocalExecutionBackend(
             termination_grace_seconds=execution.termination_grace_seconds,
         )
-    if execution.backend != "restricted":
-        raise ValueError(f"unknown execution backend: {execution.backend}")
-    return RestrictedExecutionBackend(
-        workspace,
-        allowed_env_names=execution.allowed_env_names,
-        termination_grace_seconds=execution.termination_grace_seconds,
-    )
+    if execution.backend == "restricted":
+        return RestrictedExecutionBackend(
+            workspace,
+            allowed_env_names=execution.allowed_env_names,
+            termination_grace_seconds=execution.termination_grace_seconds,
+        )
+    if execution.backend == "sandbox":
+        return SandboxExecutionBackend(
+            workspace,
+            controller_url=execution.sandbox.controller_url,
+            allowed_env_names=execution.allowed_env_names,
+            request_max_bytes=execution.sandbox.request_max_bytes,
+            command_max_bytes=execution.sandbox.command_max_bytes,
+        )
+    raise ValueError(f"unknown execution backend: {execution.backend}")
 
 
 def filtered_host_environment(
@@ -298,6 +552,14 @@ def filtered_host_environment(
     allowed = {name.casefold() for name in allowed_env_names}
     environment = {name: value for name, value in os.environ.items() if name.casefold() in allowed}
     return environment, max(0, len(os.environ) - len(environment))
+
+
+def _optional_text(value: object) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _optional_int(value: object) -> int | None:
+    return int(value) if value is not None else None
 
 
 async def _capture_stream(

@@ -4,6 +4,8 @@ from axiom.execution.backends import (
     ExecutionResult,
     LocalExecutionBackend,
     RestrictedExecutionBackend,
+    SandboxControllerError,
+    SandboxExecutionBackend,
     create_execution_backend,
     filtered_host_environment,
 )
@@ -14,6 +16,8 @@ __all__ = [
     "ExecutionResult",
     "LocalExecutionBackend",
     "RestrictedExecutionBackend",
+    "SandboxControllerError",
+    "SandboxExecutionBackend",
     "create_execution_backend",
     "filtered_host_environment",
 ]

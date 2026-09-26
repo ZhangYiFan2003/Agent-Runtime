@@ -15,6 +15,13 @@ x-runtime-environment: &runtime-environment
   AXIOM_PROVIDER: ${AXIOM_PROVIDER:-deepseek}
   AXIOM_MODEL: ${AXIOM_MODEL:-deepseek-v4-flash}
   AXIOM_API_KEY: ${AXIOM_API_KEY:-}
+x-sandbox-environment: &sandbox-environment
+  AXIOM_SANDBOX_IMAGE: ${AXIOM_SANDBOX_IMAGE:-axiom-sandbox:local}
+  AXIOM_SANDBOX_WORKSPACE_SOURCE: ${AXIOM_SANDBOX_WORKSPACE_SOURCE:-axiom_workspace_data}
+  AXIOM_SANDBOX_CPU_LIMIT: ${AXIOM_SANDBOX_CPU_LIMIT:-1.0}
+  AXIOM_SANDBOX_MEMORY_LIMIT_BYTES: ${AXIOM_SANDBOX_MEMORY_LIMIT_BYTES:-536870912}
+  AXIOM_SANDBOX_PIDS_LIMIT: ${AXIOM_SANDBOX_PIDS_LIMIT:-128}
+  AXIOM_SANDBOX_TMPFS_SIZE_BYTES: ${AXIOM_SANDBOX_TMPFS_SIZE_BYTES:-67108864}
 
 services:
   postgres:
@@ -88,9 +95,13 @@ services:
       - /var/lib/axiom
     restart: unless-stopped
     environment:
-      <<: *runtime-environment
+      <<: [*runtime-environment, *sandbox-environment]
+      AXIOM_EXECUTION_BACKEND: sandbox
+      AXIOM_SANDBOX_CONTROLLER_URL: http://sandboxd:8090
     depends_on:
       postgres:
+        condition: service_healthy
+      sandboxd:
         condition: service_healthy
     volumes:
       - ${AXIOM_WORKSPACE_MOUNT:-workspace_data}:/workspace
@@ -98,6 +109,47 @@ services:
     stop_grace_period: 35s
     networks:
       - internal
+      - sandbox-control
+
+  sandboxd:
+    image: axiom-runtime:local
+    command:
+      - sandboxd
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8090"
+      - --cwd
+      - /workspace
+    user: "0:0"
+    restart: unless-stopped
+    environment:
+      <<: *sandbox-environment
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    networks:
+      - sandbox-control
+
+  sandbox-image:
+    image: ${AXIOM_SANDBOX_IMAGE:-axiom-sandbox:local}
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+    profiles:
+      - sandbox-build
+    command: ["true"]
 
   web:
     image: axiom-web:local
@@ -127,3 +179,6 @@ volumes:
 networks:
   internal:
     driver: bridge
+  sandbox-control:
+    driver: bridge
+    internal: true

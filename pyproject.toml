@@ -53,6 +53,7 @@ addopts = "-q"
 pythonpath = ["."]
 markers = [
   "postgres: requires a real PostgreSQL integration database",
+  "docker: requires the optional live sandboxd Docker integration environment",
 ]
 
 [tool.ruff]

@@ -253,12 +253,15 @@ def _tool_call_arguments(call: dict[str, Any]) -> dict[str, Any]:
     return arguments if isinstance(arguments, dict) else {}
 
 
-def _safe_exception_metadata(exc: Exception) -> dict[str, int | float]:
+def _safe_exception_metadata(exc: Exception) -> dict[str, int | float | str]:
     response = getattr(exc, "response", None)
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(response, "status_code", None)
-    metadata: dict[str, int | float] = {}
+    metadata: dict[str, int | float | str] = {}
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code.startswith("SANDBOX_"):
+        metadata["failure_code"] = code
     try:
         parsed_status = int(status)
     except (TypeError, ValueError):

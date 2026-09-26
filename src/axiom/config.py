@@ -54,6 +54,20 @@ class ToolsConfig:
 
 
 @dataclass(slots=True)
+class SandboxConfig:
+    controller_url: str = "http://sandboxd:8090"
+    image: str = "axiom-sandbox:local"
+    workspace_source: str = "axiom_workspace_data"
+    docker_socket_path: str = "/var/run/docker.sock"
+    cpu_limit: float = 1.0
+    memory_limit_bytes: int = 512 * 1024 * 1024
+    pids_limit: int = 128
+    tmpfs_size_bytes: int = 64 * 1024 * 1024
+    request_max_bytes: int = 64 * 1024
+    command_max_bytes: int = 32 * 1024
+
+
+@dataclass(slots=True)
 class ExecutionConfig:
     backend: str = "restricted"
     stdout_limit_bytes: int = 20_000
@@ -74,6 +88,7 @@ class ExecutionConfig:
             "LC_CTYPE",
         ]
     )
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
 @dataclass(slots=True)
@@ -363,6 +378,23 @@ def load_config(
         host.strip() for host in config.policy.allowed_network_hosts
     ):
         raise ValueError("policy.allowed_network_hosts is required for allowlist network access")
+    if config.execution.backend not in {"local", "restricted", "sandbox"}:
+        raise ValueError("execution.backend must be local, restricted, or sandbox")
+    sandbox = config.execution.sandbox
+    if not sandbox.controller_url.startswith(("http://", "https://")):
+        raise ValueError("execution.sandbox.controller_url must be HTTP(S)")
+    if not sandbox.image.strip() or not sandbox.workspace_source.strip():
+        raise ValueError("execution.sandbox image and workspace source are required")
+    if (
+        sandbox.cpu_limit <= 0
+        or sandbox.memory_limit_bytes <= 0
+        or sandbox.pids_limit <= 0
+        or sandbox.tmpfs_size_bytes <= 0
+        or sandbox.request_max_bytes <= 0
+        or sandbox.command_max_bytes <= 0
+        or sandbox.command_max_bytes >= sandbox.request_max_bytes
+    ):
+        raise ValueError("execution.sandbox limits must be positive and request-bounded")
     return config
 
 
@@ -628,13 +660,31 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         policy["hitl_mode"] = hitl
 
     execution_backend = env.get("AXIOM_EXECUTION_BACKEND")
-    if execution_backend in {"local", "restricted"}:
+    if execution_backend in {"local", "restricted", "sandbox"}:
         execution["backend"] = execution_backend
     allowed_env = env.get("AXIOM_EXECUTION_ALLOWED_ENV")
     if allowed_env is not None:
         execution["allowed_env_names"] = [
             name.strip() for name in allowed_env.split(",") if name.strip()
         ]
+    sandbox = execution.setdefault("sandbox", {})
+    sandbox_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_SANDBOX_CONTROLLER_URL", "controller_url", str),
+        ("AXIOM_SANDBOX_IMAGE", "image", str),
+        ("AXIOM_SANDBOX_WORKSPACE_SOURCE", "workspace_source", str),
+        ("AXIOM_SANDBOX_DOCKER_SOCKET", "docker_socket_path", str),
+        ("AXIOM_SANDBOX_CPU_LIMIT", "cpu_limit", float),
+        ("AXIOM_SANDBOX_MEMORY_LIMIT_BYTES", "memory_limit_bytes", int),
+        ("AXIOM_SANDBOX_PIDS_LIMIT", "pids_limit", int),
+        ("AXIOM_SANDBOX_TMPFS_SIZE_BYTES", "tmpfs_size_bytes", int),
+        ("AXIOM_SANDBOX_REQUEST_MAX_BYTES", "request_max_bytes", int),
+        ("AXIOM_SANDBOX_COMMAND_MAX_BYTES", "command_max_bytes", int),
+    ]
+    for env_key, config_key, caster in sandbox_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                sandbox[config_key] = caster(raw)
     max_parallel_workers = env.get("AXIOM_MULTI_AGENT_MAX_PARALLEL_WORKERS")
     if max_parallel_workers not in (None, ""):
         with suppress(TypeError, ValueError):
@@ -665,12 +715,14 @@ def _config_to_dict(config: AxiomConfig) -> dict[str, Any]:
 
 
 def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
+    execution_data = dict(data.get("execution", {}))
+    execution_data["sandbox"] = SandboxConfig(**execution_data.get("sandbox", {}))
     return AxiomConfig(
         llm=LlmConfig(**data.get("llm", {})),
         embedding=EmbeddingConfig(**data.get("embedding", {})),
         render_mode=data.get("render_mode", "inline"),
         tools=ToolsConfig(**data.get("tools", {})),
-        execution=ExecutionConfig(**data.get("execution", {})),
+        execution=ExecutionConfig(**execution_data),
         multi_agent=MultiAgentConfig(**data.get("multi_agent", {})),
         plan=PlanConfig(**data.get("plan", {})),
         mcp=McpConfig(**data.get("mcp", {})),

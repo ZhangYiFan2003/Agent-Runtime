@@ -57,6 +57,8 @@ Quick demo:
 A single-host Docker Compose baseline is available for private, trusted-user deployments. It runs
 the Web Console, Runtime API, PostgreSQL durable authority, and horizontally scalable Worker
 processes behind one same-origin HTTP entrypoint. See [`deploy/README.md`](deploy/README.md).
+The deployment optionally routes approved Shell calls through a Docker-backed per-Run container;
+the privileged sandbox controller remains isolated from Workers behind a narrow internal API.
 
 ## Features
 
@@ -82,7 +84,7 @@ processes behind one same-origin HTTP entrypoint. See [`deploy/README.md`](deplo
 | Agent Evaluation | Runs JSON task datasets through the durable Runtime, applies deterministic scorers, writes JSON reports, and compares functional/performance regressions. | Runner, scorer, report, comparison, and CLI tested |
 | Agentic RL Bridge | Converts durable Agent Runs into validated trajectories, decomposed deterministic reward, and trainer-facing rollouts. A real TRL GRPO/LoRA experiment completed verified model updates but did not improve held-out success (0/30 to 0/30). | Bridge smoke-tested; capability gain not achieved |
 | Permission Policy | Evaluates capability, arguments, workspace scope, and Run context before Tool execution; supports durable per-invocation approval and policy audit spans. | Policy, restart approval, denial, audit, and Evaluation compatibility tested |
-| Execution Isolation | Routes approved Shell calls through Local/Restricted backends with filtered environment, bounded output, timeout, and process-tree cleanup. This is not a complete OS sandbox. | Cross-platform backend, approval, restart, trace, and safety regression tests |
+| Execution Isolation | Routes approved Shell calls through Local/Restricted backends or an optional Docker-backed per-Run Sandbox with no network, a read-only rootfs, and resource limits. | Cross-platform local tests plus optional real-Docker security validation |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
 | REPL | Interactive prompt-toolkit entrypoint and slash commands. | Not fully verified |
 
@@ -176,7 +178,8 @@ Runtime restart. This authorization layer is not an OS sandbox. See
 
 Approved Shell calls use an `ExecutionBackend`; the default restricted local backend filters inherited
 environment variables, validates workspace cwd, bounds stdout/stderr, and cleans process trees on
-timeout or task cancellation. It does not enforce a host filesystem jail or network isolation. See
+timeout or task cancellation. Deployment can opt into the fail-closed Docker backend for a real
+container boundary while retaining the same Permission and ToolExecution semantics. See
 [`docs/execution-isolation.md`](docs/execution-isolation.md) for platform behavior and non-guarantees.
 
 ### Durable Plan-Execute

@@ -436,6 +436,7 @@ class DurableAgentRuntime:
                     state.status = RunStatus.CANCELLED
                     state.interrupt = None
                     await self._save_checkpoint(state, operation="resume.reject")
+                    await self._cleanup_execution_run(run_id)
                     await self._emit("run.cancelled", {"run_id": run_id})
                     return state
             state.status = RunStatus.RUNNING
@@ -485,6 +486,7 @@ class DurableAgentRuntime:
                     state.status = RunStatus.CANCELLED
                     state.interrupt = None
                     await self._save_checkpoint(state, operation="resume.reject")
+                    await self._cleanup_execution_run(run_id)
                     await self._emit("run.cancelled", {"run_id": run_id})
                     await self._finish_span(resume_span, SpanStatus.CANCELLED)
                     await self._finish_run_trace(state.status)
@@ -607,6 +609,7 @@ class DurableAgentRuntime:
             await self.execution_strategy.on_cancel(self, state)
             await self._save_checkpoint(state, operation="cancel")
             await self.execution_strategy.after_cancel(self, state)
+            await self._cleanup_execution_run(run_id)
             await self._finish_run_trace(state.status)
             await self._emit("run.cancelled", {"run_id": run_id})
             if signal_owner:
@@ -752,6 +755,7 @@ class DurableAgentRuntime:
         if current.to_dict() != state.to_dict():
             await self._save_checkpoint(state, operation=operation)
         if state.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            await self._cleanup_execution_run(state.run_id)
             await self._finish_run_trace(state.status)
             await self._emit(
                 "run.completed" if state.status == RunStatus.COMPLETED else "run.failed",
@@ -2616,6 +2620,20 @@ class DurableAgentRuntime:
     async def _finish_run_trace(self, status: RunStatus) -> None:
         if self.tracer is not None:
             await self.tracer.update_run(status, terminal=True)
+
+    async def _cleanup_execution_run(self, run_id: str) -> None:
+        cleanup = getattr(self.execution_backend, "cleanup_run", None)
+        if cleanup is None:
+            return
+        try:
+            result = cleanup(run_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - side cleanup is not Run authority
+            await self._emit(
+                "sandbox.cleanup_failed",
+                {"run_id": run_id, "error": _safe_error(exc)},
+            )
 
     async def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.event_sink is None:

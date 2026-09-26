@@ -1147,9 +1147,12 @@ Filesystem capabilities use canonical workspace containment and reject configure
 patterns such as `.env`, key, certificate, credential, and token files. Shell execution remains an
 explicit high-risk capability: CommandGuard rejects known destructive patterns, while the restricted
 backend narrows environment inheritance, bounds stdout/stderr, enforces wall-clock timeout, and
-cleans process trees where the platform supports it. Network-capable Tools accept only HTTP(S), can
+cleans process trees where the platform supports it. The optional deployment Sandbox backend sends
+approved Shell requests through a narrow sandboxd API into non-root, networkless, resource-limited
+per-Run Docker containers; only sandboxd has Docker socket access. Network-capable Tools accept only HTTP(S), can
 be disabled or host-allowlisted, and reject private/local/link-local/reserved targets; redirects are
-validated hop by hop. These are application-level guards, not an OS sandbox or kernel boundary.
+validated hop by hop. Permission and restricted execution remain application-level guards; the
+Docker backend adds a container boundary but is not VM isolation or a multi-tenant guarantee.
 
 Permission denial is a structured Tool result and audit/policy evidence, not automatically a Worker
 failure or redelivery trigger. ToolExecution deduplication and UNKNOWN semantics remain the authority
@@ -1158,9 +1161,8 @@ serialization redact credential-shaped fields and never expose restricted enviro
 NetworkPolicy governs URL-bearing Web Tools; Streamable HTTP MCP endpoints are static trusted Runtime
 configuration, not model-selected URLs, and are outside that Web URL policy. Their Tools and returned
 content remain subject to ordinary permission handling and are not inherently trusted. Remaining
-boundaries include no OS sandbox, no hard
-portable CPU/memory/process-count quota, no perfect DNS-rebinding defense, and no full authentication
-or secret-management platform.
+boundaries include no hard workspace disk quota, no controlled Shell egress, no perfect
+DNS-rebinding defense, and no full authentication or secret-management platform.
 
 ## 12.2 Canonical Runtime domain model
 

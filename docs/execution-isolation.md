@@ -1,11 +1,11 @@
-# Execution Isolation / Sandbox-lite v1
+# Execution Isolation
 
 Axiom routes subprocess-like Tools through an `ExecutionBackend` after Permission Policy has
 authorized the invocation. The default `RestrictedExecutionBackend` reduces accidental host
 exposure with workspace validation, environment filtering, bounded output, wall-clock timeout, and
 best-effort process-tree cleanup.
 
-> **This is not a complete OS sandbox.**
+> **`RestrictedExecutionBackend` is not an OS sandbox.**
 
 > **Network policy is application-level; it is not a firewall or OS network namespace.**
 
@@ -21,9 +21,12 @@ ToolExecutor
     ↓
 ExecutionBackend
 ├── LocalExecutionBackend
-└── RestrictedExecutionBackend
-    ↓
-subprocess lifecycle
+├── RestrictedExecutionBackend
+└── SandboxExecutionBackend
+    ↓ narrow internal API
+  sandboxd
+    ↓ Docker Engine
+  per-Run container
 ```
 
 `ExecutionRequest` contains the command, Run/invocation identity, cwd, workspace, timeout, output
@@ -34,6 +37,18 @@ cleanup method.
 `LocalExecutionBackend` preserves the complete host environment for explicit compatibility use. It
 still applies timeout, bounded streaming output, and process cleanup. `RestrictedExecutionBackend`
 is the default and additionally validates cwd and filters the inherited environment.
+
+`SandboxExecutionBackend` is opt-in and fail-closed. It maps the existing `ExecutionRequest` to
+the narrow sandboxd API; it never talks to Docker directly and never falls back to a local backend.
+sandboxd creates one container per Runtime `run_id`, reuses it for sequential Shell calls in the
+same Run, and uses Docker labels to rediscover it after a controller restart. Child Runs have their
+own `run_id` and therefore their own container.
+
+| Backend | Process boundary | Host filesystem boundary | Shell network | Resource limits |
+| --- | --- | --- | --- | --- |
+| `local` | none | none | host network | time/output only |
+| `restricted` | subprocess group | application-level cwd checks | host network | time/output only |
+| `sandbox` | Docker container per Run | container rootfs except workspace | `none` | CPU, memory, PIDs, time, output |
 
 Configuration is intentionally small:
 
@@ -49,9 +64,11 @@ Configuration is intentionally small:
 }
 ```
 
-`AXIOM_EXECUTION_BACKEND=local|restricted` and the comma-separated
+`AXIOM_EXECUTION_BACKEND=local|restricted|sandbox` and the comma-separated
 `AXIOM_EXECUTION_ALLOWED_ENV` provide environment-based overrides. The latter contains variable
-names, never values.
+names, never values. Sandbox controller, fixed image, workspace source, CPU, memory, PID, and tmpfs
+settings use the existing `AXIOM_SANDBOX_*` environment merge path. Agent requests cannot override
+the image, mounts, network mode, capabilities, devices, or resource policy.
 
 ## Workspace model
 
@@ -66,6 +83,12 @@ therefore cannot intentionally escape the configured workspace through their pat
 This is validation and application-level enforcement, not a filesystem jail. Once an approved
 Shell starts, cwd alone cannot prevent commands such as reading an absolute host path. Symlink races
 and other time-of-check/time-of-use changes also remain possible.
+
+The Docker backend exposes only `/workspace` from the dedicated deployment workspace. Its root
+filesystem is read-only and `/tmp` is a bounded tmpfs. In the single-user v1 deployment, different
+Run containers share the same workspace volume so edits remain visible and survive container
+replacement. Process/root-filesystem isolation is per Run; filesystem tenant isolation and a hard
+workspace disk quota are not implemented.
 
 ## Network policy
 
@@ -82,6 +105,10 @@ they are integrations, not automatically trusted content. Their returned Tools a
 pass through the ordinary Tool permission path. MCP stdio uses the filtered environment, while its
 transport process lifecycle remains owned by the SDK.
 
+Sandbox Shell containers use Docker `network_mode=none`. They cannot directly reach the Internet,
+Runtime API, PostgreSQL, Web, or sandboxd. Network-capable Axiom operations remain separate Web/MCP
+Tools governed by Permission and Network Policy. Stage 11 does not provide controlled Shell egress.
+
 ## Environment filtering
 
 Restricted execution starts from an empty environment and copies only configured names. Defaults
@@ -96,6 +123,11 @@ Variables such as provider API keys, cloud credentials, GitHub tokens, database 
 host application state are not inherited unless their names are explicitly allowlisted. Axiom does
 not inspect `.env` or infer safety from values. Traces record only `env_filtered_count`; environment
 values are never copied into execution attributes.
+
+The sandbox client applies the same allowlist before serialization. sandboxd validates names,
+counts, and value sizes and supplies only a small fixed base environment plus permitted values.
+Provider keys, Runtime API keys, PostgreSQL credentials, Docker variables, and controller state are
+not inherited by Sandbox containers.
 
 ## Timeout, cancellation, and process cleanup
 
@@ -115,6 +147,11 @@ therefore clean up an active Shell. The current threaded HTTP `POST /cancel` pat
 Run state but does not yet deliver cross-thread cancellation to an already executing subprocess;
 this remains an explicit limitation.
 
+For the Docker backend, timeout or cancellation force-removes the per-Run container, killing the
+active exec and descendants. The next command recreates the container while retaining the external
+workspace. `COMPLETED`, `FAILED`, and `CANCELLED` transitions request idempotent container removal.
+Cleanup failure is side-cleanup evidence and does not rewrite a durable Run outcome.
+
 ## Output and resource limits
 
 stdout and stderr are drained concurrently in bounded chunks. Axiom retains at most the configured
@@ -127,10 +164,10 @@ stdout_truncated, stderr_truncated,
 timed_out, exit_code, duration_ms
 ```
 
-Wall-clock timeout and output retention are portable v1 controls. CPU, memory, process-count, open
-file, and file-size limits are not enforced portably. POSIX `setrlimit`, Windows Job memory/CPU
-limits, and container-level quotas are deliberately deferred rather than presented as equivalent
-cross-platform guarantees.
+Wall-clock timeout and output retention apply to every backend. The Docker backend additionally
+configures cgroup CPU/memory limits and a PID limit. Memory termination is reported when Docker
+reliably exposes `OOMKilled`; otherwise Axiom reports a generic sandbox termination. Open-file and
+workspace disk quotas are not implemented.
 
 ## Permission and observability integration
 
@@ -159,9 +196,36 @@ for those transport processes remains owned by the SDK.
 CLI maintenance subprocesses and subprocesses created inside third-party libraries are trusted
 application operations and are not routed through the Tool execution backend.
 
+## Docker socket and ownership boundaries
+
+```text
+PostgreSQL lease/fencing = who may execute a Run
+Docker Sandbox           = where approved Shell code executes
+```
+
+Only sandboxd mounts `/var/run/docker.sock`. Workers, Runtime API, Web, PostgreSQL, and dynamic
+Sandbox containers do not. sandboxd is a trusted privileged infrastructure component: compromise
+of sandboxd is effectively compromise of the Docker host. Its narrow API is reachable only from
+Workers on the internal `sandbox-control` network and is not a generic Docker proxy.
+
+Worker takeover continues to use PostgreSQL ownership. A replacement Worker can rediscover the
+existing Run container through labels; it does not create a second lease system. If sandboxd
+restarts during an active exec, that invocation may become failed/UNKNOWN and the existing durable
+ToolExecution retry-suppression rules remain authoritative.
+
+## Threat model
+
+The Docker backend is intended to contain buggy or malicious approved Shell commands, including
+host-path traversal, environment-secret discovery, direct internal-service access, fork/process
+explosion, memory exhaustion, and orphaned descendants.
+
+It does not defend against Docker daemon compromise, kernel/container escape, a malicious trusted
+sandbox image, side channels, hostile multi-tenant workspace sharing, or incomplete host secret
+management. It is container isolation, not VM isolation.
+
 ## Security limitations
 
-Application-level isolation v1 does not provide:
+Local and restricted execution do not provide:
 
 - a full host filesystem jail;
 - syscall filtering, seccomp, AppArmor, or SELinux;
@@ -171,5 +235,6 @@ Application-level isolation v1 does not provide:
 - hardened multi-tenant code execution;
 - protection from an approved command exploiting the host kernel or available executables.
 
-Use `RestrictedExecutionBackend` as risk reduction for a trusted single-user local Runtime, not as a
-security boundary for hostile multi-tenant workloads.
+Use `RestrictedExecutionBackend` as risk reduction for a trusted single-user local Runtime. Use the
+Docker backend when a real container boundary is required, while retaining Permission Policy as the
+authorization layer and the limitations above.

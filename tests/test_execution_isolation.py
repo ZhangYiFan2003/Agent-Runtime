@@ -114,6 +114,15 @@ class BlockingBackend:
         raise AssertionError("unreachable")
 
 
+class CleanupBackend(RecordingBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleaned_runs: list[str] = []
+
+    async def cleanup_run(self, run_id: str) -> None:
+        self.cleaned_runs.append(run_id)
+
+
 def _config(tmp_path, *, hitl: str = "auto") -> AxiomConfig:
     config = AxiomConfig()
     config.policy.hitl_mode = hitl
@@ -444,6 +453,30 @@ def test_approved_shell_runs_through_injected_backend_once(tmp_path):
         assert len(backend.calls) == 1
         assert backend.calls[0].run_id == completed.run_id
         assert backend.calls[0].invocation_id == f"{completed.run_id}:call_bash"
+
+    asyncio.run(scenario())
+
+
+def test_terminal_run_cleans_its_execution_sandbox(tmp_path):
+    async def scenario():
+        backend = CleanupBackend()
+        runtime = _runtime(
+            ToolLlm("bash", {"command": "echo sandbox"}),
+            _registry(_builtin("bash")),
+            MemoryCheckpointStore(),
+            tmp_path,
+            config=_config(tmp_path, hitl="never"),
+            backend=backend,
+        )
+
+        completed = await runtime.start(
+            thread_id="thread-cleanup",
+            input="shell",
+            run_id="run-cleanup",
+        )
+
+        assert completed.status == RunStatus.COMPLETED
+        assert backend.cleaned_runs == ["run-cleanup"]
 
     asyncio.run(scenario())
 

@@ -34,6 +34,7 @@ from axiom.evaluation import (
     promote_badcase,
     save_result,
 )
+from axiom.execution import SandboxExecutionBackend, create_execution_backend
 from axiom.llm import create_llm_client
 from axiom.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
 from axiom.rl import RewardConfig, RewardPipeline, RLRolloutRunner, RolloutDataset
@@ -45,6 +46,7 @@ from axiom.runtime import (
 )
 from axiom.runtime.api import runtime_api_key
 from axiom.runtime.observability import RunMetrics, Span, SpanType, TraceBundle
+from axiom.sandbox import DockerEngineClient, SandboxController, SandboxHttpServer
 
 app = typer.Typer(
     name="axiom",
@@ -201,6 +203,10 @@ def runtime_worker(
     composition = None
     try:
         config = load_config(project_root=root)
+        if config.execution.backend == "sandbox":
+            backend = create_execution_backend(config, root)
+            if isinstance(backend, SandboxExecutionBackend):
+                asyncio.run(backend.healthcheck())
         composition = RuntimeApiServer(
             cwd=str(root),
             config=config,
@@ -209,7 +215,7 @@ def runtime_worker(
             data_dir=data_dir,
         )
         worker = composition.build_distributed_worker(worker_id=worker_id)
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         if composition is not None:
             composition.shutdown()
         typer.echo(str(exc), err=True)
@@ -220,6 +226,36 @@ def runtime_worker(
         asyncio.run(_run_distributed_worker(worker))
     finally:
         composition.shutdown()
+
+
+@app.command("sandboxd")
+def sandbox_controller(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Sandbox controller bind host"),
+    ] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Sandbox controller port")] = 8090,
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Configuration project root")] = None,
+) -> None:
+    """Run the trusted narrow Docker sandbox controller."""
+    root = (cwd or Path.cwd()).resolve()
+    config = load_config(project_root=root)
+    engine = DockerEngineClient(config.execution.sandbox)
+    server = SandboxHttpServer(
+        SandboxController(engine, config.execution.sandbox),
+        host=host,
+        port=port,
+    )
+    try:
+        engine.health()
+        typer.echo(f"Axiom sandbox controller listening on http://{host}:{port}")
+        server.serve_forever()
+    except (OSError, RuntimeError) as exc:
+        typer.echo(f"sandbox controller failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        server.shutdown()
+        engine.close()
 
 
 async def _run_distributed_worker(
