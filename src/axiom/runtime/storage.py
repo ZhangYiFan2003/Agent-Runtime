@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from axiom.artifacts import (
+    ArtifactMetadataStore,
+    PostgresArtifactMetadataStore,
+    SQLiteArtifactMetadataStore,
+)
 from axiom.config import StorageConfig
 from axiom.runtime.checkpoints import RuntimeStore, SQLiteCheckpointStore
 from axiom.runtime.control_plane import ControlOperationStore, SQLiteControlOperationStore
@@ -17,6 +22,7 @@ class DurableStorage:
     runtime: RuntimeStore
     events: EventRepository
     controls: ControlOperationStore
+    artifacts: ArtifactMetadataStore
     _close: object | None = None
 
     def close(self) -> None:
@@ -40,6 +46,7 @@ def create_durable_storage(
             runtime=SQLiteCheckpointStore(path),
             events=ThreadEventRepository(path),
             controls=SQLiteControlOperationStore(path),
+            artifacts=SQLiteArtifactMetadataStore(path),
         )
     if backend == "postgres":
         from axiom.runtime.postgres import (
@@ -66,6 +73,7 @@ def create_durable_storage(
             runtime=PostgresRuntimeStore(pool),
             events=PostgresEventRepository(pool),
             controls=PostgresControlOperationStore(pool),
+            artifacts=PostgresArtifactMetadataStore(pool),
             _close=pool,
         )
     raise ValueError(f"unsupported storage backend: {config.backend}")

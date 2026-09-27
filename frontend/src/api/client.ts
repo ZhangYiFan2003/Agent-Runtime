@@ -135,6 +135,35 @@ export async function apiGet<T>(path: string, options: ApiClientOptions): Promis
   return body as T;
 }
 
+/** Authenticated binary GET used for immutable Artifact downloads. */
+export async function apiGetBlob(path: string, options: ApiClientOptions): Promise<Blob> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const timeout = AbortSignal.timeout(options.timeoutMs ?? 60_000);
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+  const headers: Record<string, string> = { Accept: "*/*" };
+  if (options.apiKey) headers.Authorization = `Bearer ${options.apiKey}`;
+  let response: Response;
+  try {
+    response = await fetchImpl(joinUrl(options.baseUrl, path), { method: "GET", headers, signal });
+  } catch (error) {
+    throw new ApiError({
+      status: 0,
+      message: error instanceof Error ? error.message : "Network request failed",
+    });
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    let body: unknown = text;
+    try {
+      body = text === "" ? null : JSON.parse(text);
+    } catch {
+      // Plain-text error body.
+    }
+    throw new ApiError(normalizeErrorBody(response.status, body));
+  }
+  return response.blob();
+}
+
 export interface ApiPostOptions extends ApiClientOptions {
   /** JSON-serializable body; omitted (no Content-Type) when undefined. */
   body?: unknown;

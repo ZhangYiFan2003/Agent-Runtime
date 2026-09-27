@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { fetchRun, fetchRunChildren, fetchRunMetrics, fetchRunTrace } from "./run";
+import {
+  fetchArtifactContent,
+  fetchRun,
+  fetchRunArtifacts,
+  fetchRunChildren,
+  fetchRunMetrics,
+  fetchRunTrace,
+} from "./run";
 import { ApiError } from "./client";
 import { makeChildRunDto, makeRunViewDto } from "../test-fixtures/run";
 import { makeSpanDto, makeTraceDto } from "../test-fixtures/trace";
@@ -153,5 +160,60 @@ describe("fetchRunMetrics", () => {
     const fetchImpl: typeof fetch = async () =>
       jsonResponse(404, { error: { code: "trace_not_found", message: "no trace" } });
     await expect(fetchRunMetrics(BASE, "run_a", fetchImpl)).resolves.toBeNull();
+  });
+});
+
+describe("run artifacts", () => {
+  const artifact = {
+    artifact_id: "art_1",
+    sha256: "a".repeat(64),
+    run_id: "run_a",
+    thread_id: "thread_1",
+    invocation_id: "run_a:call_1",
+    tool_name: "publish_artifact",
+    name: "report.txt",
+    media_type: "text/plain",
+    size_bytes: 12,
+    kind: "file",
+    reused_from_artifact_id: null,
+    reused: false,
+    created_at: "2026-09-27T09:00:00+00:00",
+    metadata: { producer: "test", future_field: true },
+  };
+
+  it("parses and adapts a Run artifact list", async () => {
+    const fetchImpl: typeof fetch = async (input) => {
+      expect(String(input)).toContain("/v1/runs/run_a/artifacts");
+      return jsonResponse(200, { run_id: "run_a", artifacts: [artifact] });
+    };
+    const result = await fetchRunArtifacts(BASE, "run_a", fetchImpl);
+    expect(result.runId).toBe("run_a");
+    expect(result.artifacts[0]).toMatchObject({
+      artifactId: "art_1",
+      name: "report.txt",
+      sizeBytes: 12,
+      reused: false,
+    });
+    expect(result.artifacts[0].metadata.future_field).toBe(true);
+  });
+
+  it("downloads Artifact content through the authenticated binary client", async () => {
+    let authorization: string | null = null;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      expect(String(input)).toContain("/v1/artifacts/art_1/content");
+      authorization = (init?.headers as Record<string, string>).Authorization;
+      return new Response("artifact body", { status: 200, headers: { "Content-Type": "text/plain" } });
+    };
+    const blob = await fetchArtifactContent(BASE, "art_1", fetchImpl);
+    expect(await blob.text()).toBe("artifact body");
+    expect(authorization).toBe("Bearer key");
+  });
+
+  it("surfaces a normalized download error", async () => {
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse(404, { error: { code: "artifact_not_found", message: "artifact not found" } });
+    const error = await fetchArtifactContent(BASE, "missing", fetchImpl).catch((cause) => cause);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("artifact_not_found");
   });
 });

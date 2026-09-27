@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from axiom.artifacts.metadata import postgres_artifact_schema
 from axiom.runtime.capacity import AdmissionRejectedError, CapacitySnapshot
 from axiom.runtime.checkpoints import BudgetLedgerConflictError, CheckpointConflictError
 from axiom.runtime.control_plane import (
@@ -27,7 +28,7 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.ownership import OwnershipLostError, RunOwnership
 
-POSTGRES_SCHEMA_VERSION = 6
+POSTGRES_SCHEMA_VERSION = 7
 RUN_DELIVERY_EXHAUSTED = "RUN_DELIVERY_EXHAUSTED"
 
 
@@ -106,13 +107,15 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()
         version = int(row[0]) if row else POSTGRES_SCHEMA_VERSION
-        if version not in {1, 2, 3, 4, 5, POSTGRES_SCHEMA_VERSION}:
+        if version not in {1, 2, 3, 4, 5, 6, POSTGRES_SCHEMA_VERSION}:
             raise PostgresSchemaError(
                 f"unsupported PostgreSQL runtime schema version: {version}"
             )
         for statement in _SCHEMA_STATEMENTS:
             conn.execute(statement)
         for statement in _OWNERSHIP_MIGRATION_STATEMENTS:
+            conn.execute(statement)
+        for statement in postgres_artifact_schema():
             conn.execute(statement)
         conn.execute(
             """
@@ -624,6 +627,7 @@ class PostgresRuntimeStore:
             record.retry_backoff_seconds,
             record.started_at,
             record.completed_at,
+            _json(record.artifact_ids),
             updated_at,
         )
         with self.pool.connection() as conn:
@@ -635,10 +639,11 @@ class PostgresRuntimeStore:
                     invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
                     status, attempt, result, is_error, error, last_failure_category,
                     last_error_code, retry_state, retry_suppressed_reason,
-                    next_retry_at, retry_backoff_seconds, started_at, completed_at, updated_at
+                    next_retry_at, retry_backoff_seconds, started_at, completed_at,
+                    artifact_ids, updated_at
                 ) values (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s::jsonb, %s
                 )
                 on conflict(invocation_id) do update set
                     status = excluded.status,
@@ -654,6 +659,7 @@ class PostgresRuntimeStore:
                     retry_backoff_seconds = excluded.retry_backoff_seconds,
                     started_at = excluded.started_at,
                     completed_at = excluded.completed_at,
+                    artifact_ids = excluded.artifact_ids,
                     updated_at = excluded.updated_at
                 where tool_executions.arguments_hash = excluded.arguments_hash
                 returning invocation_id
@@ -1272,7 +1278,8 @@ _TOOL_SELECT = """
 select invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
        status, attempt, result, is_error, error, last_failure_category,
        last_error_code, retry_state, retry_suppressed_reason,
-       next_retry_at, retry_backoff_seconds, started_at, completed_at, updated_at
+       next_retry_at, retry_backoff_seconds, started_at, completed_at,
+       artifact_ids, updated_at
 from tool_executions
 """
 
@@ -1328,7 +1335,8 @@ def _tool_record(row: Sequence[object]) -> ToolExecutionRecord:
             "retry_backoff_seconds": row[15],
             "started_at": _timestamp(row[16]),
             "completed_at": _timestamp(row[17]),
-            "updated_at": _timestamp(row[18]),
+            "artifact_ids": row[18] if isinstance(row[18], list) else [],
+            "updated_at": _timestamp(row[19]),
         }
     )
 
@@ -1803,6 +1811,7 @@ _SCHEMA_STATEMENTS = (
         retry_backoff_seconds double precision not null default 0,
         started_at timestamptz,
         completed_at timestamptz,
+        artifact_ids jsonb not null default '[]'::jsonb,
         updated_at timestamptz not null
     )
     """,
@@ -1880,6 +1889,8 @@ _SCHEMA_STATEMENTS = (
 )
 
 _OWNERSHIP_MIGRATION_STATEMENTS = (
+    "alter table tool_executions add column if not exists "
+    "artifact_ids jsonb not null default '[]'::jsonb",
     "alter table runs add column if not exists runnable boolean not null default false",
     "alter table runs add column if not exists owner_worker_id text",
     "alter table runs add column if not exists lease_until timestamptz",

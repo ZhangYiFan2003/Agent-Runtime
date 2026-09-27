@@ -942,6 +942,34 @@ Sandbox containers cannot reach it. Gateway governance state is in-memory and si
 resets it and active streams fail into the existing durable Runtime recovery path. See
 [`docs/provider-gateway.md`](provider-gateway.md).
 
+### Content-addressed Artifact Store
+
+The optional Artifact layer separates immutable bytes from logical provenance-bearing references:
+
+```text
+ArtifactService
+├── Metadata: SQLite (local) / PostgreSQL (distributed authority)
+└── Blobs:    local filesystem / MinIO-compatible S3
+```
+
+SHA-256 is content identity and derives `blobs/sha256/<prefix>/<digest>` object keys. An
+`ArtifactRecord` has its own opaque ID and records the current Run, Thread, Tool invocation, name,
+media type, size, and optional source Artifact; equal content across Runs shares bytes without
+collapsing producer identity. `ToolExecution.artifact_ids` preserves the relationship across restart
+without embedding large content in Checkpoints or Events.
+
+The opt-in `publish_artifact` Tool is the production write path. Workspace containment, sensitive
+path policy, approval, bounded streaming hash/upload, and file/metadata size limits apply before a
+record is exposed. SQLite plus local Blobs supports standalone use. PostgreSQL plus internal MinIO
+gives all Workers one metadata and byte authority. Runtime API streams authenticated reads; Web never
+receives MinIO credentials.
+
+Explicit computation reuse uses a canonical, versioned producer descriptor and creates a new
+current-Run Artifact referencing the existing Blob. This is distinct from same-invocation
+ToolExecution idempotency and from automatic Blob deduplication. No existing Tool is inferred to be
+cacheable, and the Code Intelligence embedding cache remains independent. See
+[`docs/artifacts.md`](artifacts.md).
+
 ## 12. No-Progress / Loop Degeneration Detection
 
 `max_steps` bounds how long a Run may work; it cannot tell whether that work remains useful. The
@@ -1297,6 +1325,9 @@ CAS, ownership fence, stable Tool invocation ID and ToolExecution outcome—not 
   completed Children remain completed. This is targeted reconciliation, not a background scanner.
 - Runtime tool records provide best-effort deduplication after a persisted
   success, not exactly-once semantics for arbitrary external side effects.
+- Artifact storage is append/read only and has no automatic GC, retention policy, Range requests,
+  presigned URLs, or distributed single-flight for computation reuse. Deployment retention follows
+  the PostgreSQL and MinIO volume lifetimes.
 - Observability is local and unsampled. There is no distributed trace context,
   OpenTelemetry export, external dashboard, retention, or cross-process clock
   correction.

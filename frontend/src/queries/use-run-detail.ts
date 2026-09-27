@@ -1,5 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import { fetchRun, fetchRunChildren, fetchRunMetrics, fetchRunTrace } from "../api/run";
+import {
+  fetchRun,
+  fetchRunArtifacts,
+  fetchRunChildren,
+  fetchRunMetrics,
+  fetchRunTrace,
+} from "../api/run";
 import { getConnection } from "../lib/connection";
 import {
   DETAIL_REFETCH_INTERVAL_MS,
@@ -29,6 +35,16 @@ export function useRunChildren(runId: string, runStatus: string | undefined) {
   return useQuery({
     queryKey: queryKeys.children(runId),
     queryFn: () => fetchRunChildren(getConnection(), runId),
+    enabled: runId !== "" && runStatus !== undefined,
+    retry: 1,
+    refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),
+  });
+}
+
+export function useRunArtifacts(runId: string, runStatus: string | undefined) {
+  return useQuery({
+    queryKey: queryKeys.artifacts(runId),
+    queryFn: () => fetchRunArtifacts(getConnection(), runId),
     enabled: runId !== "" && runStatus !== undefined,
     retry: 1,
     refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),

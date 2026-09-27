@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 
+from axiom.artifacts import ArtifactBlob, ArtifactRecord, ArtifactReuseEntry
 from axiom.config import AxiomConfig, StorageConfig, config_to_public_dict, load_config
 from axiom.runtime.checkpoints import BudgetLedgerConflictError, CheckpointConflictError
 from axiom.runtime.control_plane import ApiError, ControlOperationName
@@ -76,6 +78,33 @@ def test_storage_configuration_defaults_to_sqlite_and_redacts_dsn(tmp_path):
 
     config.storage.postgres_dsn = "postgresql://user:secret@example.invalid/db"
     assert config_to_public_dict(config)["storage"]["postgres_dsn"] == "***"
+
+
+def test_artifact_metadata_store_contract(durable_storage):
+    blob = durable_storage.artifacts.upsert_blob(
+        ArtifactBlob("a" * 64, f"blobs/sha256/aa/{'a' * 64}", 4, "test")
+    )
+    artifact = durable_storage.artifacts.create_artifact(
+        ArtifactRecord(
+            artifact_id="art-contract",
+            blob_sha256=blob.sha256,
+            run_id="run-artifact",
+            thread_id="thread-artifact",
+            invocation_id="inv-artifact",
+            tool_name="publish_artifact",
+            name="result.txt",
+            media_type="text/plain",
+            size_bytes=4,
+        )
+    )
+    reuse = durable_storage.artifacts.put_reuse_entry(
+        ArtifactReuseEntry("reuse-key", artifact.artifact_id, "test", "v1")
+    )
+
+    assert durable_storage.artifacts.get_blob(blob.sha256) == blob
+    assert durable_storage.artifacts.get_artifact(artifact.artifact_id) == artifact
+    assert durable_storage.artifacts.list_run_artifacts("run-artifact") == [artifact]
+    assert durable_storage.artifacts.get_reuse_entry("reuse-key") == reuse
 
 
 def test_storage_configuration_reads_environment_without_changing_defaults(tmp_path):
@@ -436,6 +465,23 @@ def test_postgres_concurrent_checkpoint_cas_has_one_winner(postgres_storage):
     assert final is not None
     assert final.sequence == 2
     assert final.output_text in {"writer-a", "writer-b"}
+
+
+@pytest.mark.postgres
+def test_postgres_concurrent_artifact_blob_upsert_is_safe(postgres_storage):
+    blob = ArtifactBlob("b" * 64, f"blobs/sha256/bb/{'b' * 64}", 8, "s3")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(lambda _index: postgres_storage.artifacts.upsert_blob(blob), range(2))
+        )
+    assert results == [blob, blob]
+    pool = postgres_storage._close
+    with pool.connection() as conn:
+        count = conn.execute(
+            "select count(*) from artifact_blobs where sha256 = %s",
+            (blob.sha256,),
+        ).fetchone()[0]
+    assert count == 1
 
 
 @pytest.mark.postgres

@@ -7,4 +7,5 @@ export const queryKeys = {
   children: (runId: string) => ["runs", runId, "children"] as const,
   trace: (runId: string) => ["runs", runId, "trace"] as const,
   metrics: (runId: string) => ["runs", runId, "metrics"] as const,
+  artifacts: (runId: string) => ["runs", runId, "artifacts"] as const,
 };

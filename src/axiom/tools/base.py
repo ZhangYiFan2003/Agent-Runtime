@@ -9,6 +9,7 @@ from axiom.config import AxiomConfig
 from axiom.policy.permissions import PermissionRequest
 
 if TYPE_CHECKING:
+    from axiom.artifacts import ArtifactService
     from axiom.execution import ExecutionBackend
     from axiom.policy.permissions import PermissionDecision, PermissionPolicy
 
@@ -44,6 +45,7 @@ class ToolContext:
         Callable[[PermissionRequest, PermissionDecision], Awaitable[None] | None] | None
     ) = None
     execution_backend: ExecutionBackend | None = None
+    artifact_service: ArtifactService | None = None
     operation_timeout_seconds: float | None = None
 
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ApiError, apiGet, normalizeErrorBody } from "./client";
+import { ApiError, apiGet, apiGetBlob, normalizeErrorBody } from "./client";
 
 describe("normalizeErrorBody", () => {
   it("normalizes the structured error shape", () => {
@@ -81,5 +81,27 @@ describe("apiGet", () => {
     if (error instanceof ApiError) {
       expect(error.status).toBe(0);
     }
+  });
+});
+
+describe("apiGetBlob", () => {
+  const base = { baseUrl: "http://127.0.0.1:8080", apiKey: "test-key" };
+
+  it("returns binary content without attempting JSON parsing", async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response(new Uint8Array([0, 1, 2, 255]), { status: 200 });
+    const blob = await apiGetBlob("/v1/artifacts/art_1/content", { ...base, fetchImpl });
+    expect(Array.from(new Uint8Array(await blob.arrayBuffer()))).toEqual([0, 1, 2, 255]);
+  });
+
+  it("normalizes structured JSON errors", async () => {
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse(404, { error: { code: "artifact_content_not_found", message: "missing" } });
+    const error = await apiGetBlob("/v1/artifacts/missing/content", {
+      ...base,
+      fetchImpl,
+    }).catch((cause) => cause);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe("artifact_content_not_found");
   });
 });

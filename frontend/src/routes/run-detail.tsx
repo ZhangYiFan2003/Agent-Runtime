@@ -3,6 +3,7 @@ import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
 import { ApiError } from "../api/client";
 import {
   useRun,
+  useRunArtifacts,
   useRunChildren,
   useRunMetrics,
   useRunTrace,
@@ -20,6 +21,7 @@ import { Sheet, SheetContent, SheetTitle } from "../components/ui/sheet";
 import { Skeleton } from "../components/ui/skeleton";
 import { CopyId } from "../components/run/copy-id";
 import { RunBanners } from "../components/run/run-banners";
+import { RunArtifactsTable } from "../components/run/run-artifacts";
 import { RunChildrenTable } from "../components/run/run-children";
 import { RunHeader } from "../components/run/run-header";
 import { RunMetricsPanel } from "../components/run/run-metrics";
@@ -33,7 +35,7 @@ import { TraceWaterfall } from "../components/trace/waterfall";
 
 const routeApi = getRouteApi("/runs/$runId");
 
-type DetailTab = "overview" | "timeline" | "events" | "trace" | "metrics" | "children" | "output";
+type DetailTab = "overview" | "timeline" | "events" | "trace" | "metrics" | "children" | "artifacts" | "output";
 
 const DESKTOP_TABS: Array<{ key: DetailTab; label: string }> = [
   { key: "overview", label: "Overview" },
@@ -41,6 +43,7 @@ const DESKTOP_TABS: Array<{ key: DetailTab; label: string }> = [
   { key: "trace", label: "Trace" },
   { key: "metrics", label: "Metrics" },
   { key: "children", label: "Children" },
+  { key: "artifacts", label: "Artifacts" },
   { key: "output", label: "Output" },
 ];
 
@@ -51,6 +54,7 @@ const MOBILE_TABS: Array<{ key: DetailTab; label: string }> = [
   { key: "trace", label: "Trace" },
   { key: "metrics", label: "Metrics" },
   { key: "children", label: "Children" },
+  { key: "artifacts", label: "Artifacts" },
   { key: "output", label: "Output" },
 ];
 
@@ -147,6 +151,7 @@ export function RunDetailPage() {
   const traceQuery = useRunTrace(runId, runStatus);
   const metricsQuery = useRunMetrics(runId, runStatus);
   const childrenQuery = useRunChildren(runId, runStatus);
+  const artifactsQuery = useRunArtifacts(runId, runStatus);
   const controls = useRunControls(runId, { parentRunId: run?.parentRunId ?? null });
   const runtimeEvents = useRuntimeEvents({
     threadId: run?.threadId ?? null,
@@ -348,6 +353,12 @@ export function RunDetailPage() {
       }
       case "output":
         return <RunOutput run={run} />;
+      case "artifacts": {
+        if (artifactsQuery.isPending) return <PanelSkeleton />;
+        if (artifactsQuery.isError)
+          return <QueryError error={artifactsQuery.error} onRetry={() => void artifactsQuery.refetch()} />;
+        return <RunArtifactsTable artifacts={artifactsQuery.data?.artifacts ?? []} />;
+      }
     }
   })();
 

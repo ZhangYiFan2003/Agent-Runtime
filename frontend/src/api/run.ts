@@ -1,4 +1,5 @@
-import { apiGet, ApiError } from "./client";
+import { apiGet, apiGetBlob, ApiError } from "./client";
+import { runArtifactsSchema } from "./dto/artifact";
 import { childrenResponseSchema, runViewSchema } from "./dto/run";
 import { traceResponseSchema } from "./dto/trace";
 import { runMetricsSchema } from "./dto/metrics";
@@ -6,6 +7,7 @@ import { adaptChildRun, adaptRunView, type ChildRun, type RunView } from "./adap
 import { adaptSpan, adaptTrace, type Span, type Trace } from "./adapters/trace";
 import { adaptRunMetrics, type RunMetrics } from "./adapters/metrics";
 import type { ConnectionConfig } from "../lib/connection";
+import { adaptArtifact, type Artifact } from "./adapters/artifact";
 
 export interface RunChildren {
   parentRunId: string;
@@ -15,6 +17,37 @@ export interface RunChildren {
 export interface RunTrace {
   trace: Trace;
   spans: Span[];
+}
+
+export interface RunArtifacts {
+  runId: string;
+  artifacts: Artifact[];
+}
+
+export async function fetchRunArtifacts(
+  config: ConnectionConfig,
+  runId: string,
+  fetchImpl?: typeof fetch,
+): Promise<RunArtifacts> {
+  const raw: unknown = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/artifacts`, {
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    fetchImpl,
+  });
+  const dto = runArtifactsSchema.parse(raw);
+  return { runId: dto.run_id, artifacts: dto.artifacts.map(adaptArtifact) };
+}
+
+export function fetchArtifactContent(
+  config: ConnectionConfig,
+  artifactId: string,
+  fetchImpl?: typeof fetch,
+): Promise<Blob> {
+  return apiGetBlob(`/v1/artifacts/${encodeURIComponent(artifactId)}/content`, {
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    fetchImpl,
+  });
 }
 
 /** Fetches and parses `GET /v1/runs/{id}` → adapted RunView. Throws ApiError (404 = no such run). */

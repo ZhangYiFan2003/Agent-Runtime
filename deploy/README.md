@@ -14,9 +14,11 @@ Web (static SPA + same-origin reverse proxy)
   |
   v
 Runtime API (control and admission plane)
-  |
-  v
-PostgreSQL (durable Run, Event, control, ownership authority)
+  |                         |
+  v                         v
+PostgreSQL                MinIO
+(Run/Event/Artifact       (Artifact Blob bytes)
+ metadata authority)
   ^
   |
 Worker replicas (claim, heartbeat, fenced execution)
@@ -34,6 +36,11 @@ The API and Workers share a single-host `runtime_data` volume only for the exist
 observability, memory, and local task support. PostgreSQL remains authoritative for distributed
 Runs. Only `web` publishes a host port; Runtime API, Workers, and PostgreSQL stay on the Compose
 network.
+
+Runtime API and Workers reach MinIO only on the private `artifact-storage` network. PostgreSQL is
+the Artifact metadata authority; MinIO stores immutable SHA-256 Blob bytes in `artifact_data`.
+MinIO publishes no host port. Web downloads Artifact content through the authenticated Runtime API
+and never receives object-store credentials.
 
 Workers reach sandboxd only on the private `sandbox-control` network. Only sandboxd mounts the
 Docker socket. Runtime API, Web, PostgreSQL, Workers, and dynamically created Sandbox containers do
@@ -58,6 +65,9 @@ Replace every `CHANGE_ME`. `POSTGRES_PASSWORD` and the password embedded in
 `AXIOM_POSTGRES_DSN` must match. The Runtime keeps its existing single API key model; users enter
 `AXIOM_RUNTIME_API_KEY` in Web Console Settings after startup. Provider credentials are optional
 for startup and health checks, but real Agent Turns require a configured key in providerd.
+`MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` are local deployment credentials used only by MinIO,
+the one-shot bucket initializer, Runtime API, and Workers. They are not injected into Web,
+providerd, sandboxd, or per-Run Sandbox containers.
 
 The default gateway route contains one DeepSeek-compatible target. `AXIOM_PROVIDER_ROUTES_JSON` can
 replace it with an ordered route object using the `provider_gateway.routes` schema documented in
@@ -153,7 +163,8 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml up -d
 ```
 
 Back up the PostgreSQL database independently before upgrades. Docker volumes are persistence,
-not backups.
+not backups. Back up `artifact_data` together with PostgreSQL: database-only recovery can leave
+Artifact metadata pointing to missing Blobs, while MinIO-only recovery can leave orphan bytes.
 
 ## Security boundary
 
@@ -171,6 +182,11 @@ providerd is a separate trusted component with external LLM credentials. Comprom
 expose those credentials or issue provider calls. It is not connected to the Sandbox network and
 does not expose an Internet-facing listener. The gateway is not a tenant boundary, billing system,
 quality router, or HA service.
+
+MinIO is internal trusted storage. Artifact credentials remain in MinIO initialization, Runtime API,
+and Worker processes only. Sandbox containers retain `network=none` and receive neither MinIO
+credentials nor the `artifact-storage` network. Artifact retention follows the deployment volumes;
+automatic orphan GC and per-Run retention are not implemented.
 
 HTTP is suitable only for localhost or a trusted private network. For Internet-facing access,
 terminate TLS in a separately managed reverse proxy or load balancer and restrict access there.

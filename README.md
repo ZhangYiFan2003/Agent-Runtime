@@ -61,6 +61,8 @@ The deployment optionally routes approved Shell calls through a Docker-backed pe
 the privileged sandbox controller remains isolated from Workers behind a narrow internal API.
 Workers can also share an internal Provider Gateway for ordered health-aware routing, bounded
 provider admission, and circuit breaking without moving retry or cost authority out of the Runtime.
+Run outputs can be published to a content-addressed Artifact Store backed by local storage or the
+deployment's internal MinIO service, with PostgreSQL metadata and authenticated Console downloads.
 
 ## Features
 
@@ -88,6 +90,7 @@ provider admission, and circuit breaking without moving retry or cost authority 
 | Permission Policy | Evaluates capability, arguments, workspace scope, and Run context before Tool execution; supports durable per-invocation approval and policy audit spans. | Policy, restart approval, denial, audit, and Evaluation compatibility tested |
 | Execution Isolation | Routes approved Shell calls through Local/Restricted backends or an optional Docker-backed per-Run Sandbox with no network, a read-only rootfs, and resource limits. | Cross-platform local tests plus optional real-Docker security validation |
 | Provider Gateway | Shares provider concurrency, RPM admission, circuit state, and ordered pre-attempt fallback across distributed Workers while preserving Runtime retry and budget authority. | Offline fake-provider and two-client gateway integration tested |
+| Artifact Store | Publishes workspace files as immutable SHA-256 Blobs with distinct Run/Tool Artifact records, Local or MinIO storage, cross-Run Blob deduplication, and authenticated Run Inspector downloads. | Local contract, API, PostgreSQL, and optional MinIO integration tested |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
 | REPL | Interactive prompt-toolkit entrypoint and slash commands. | Not fully verified |
 
@@ -121,6 +124,7 @@ Key modules:
 - `src/axiom/memory/`: scoped typed memory persistence, Runtime history recovery, and budgeted memory context assembly.
 - `src/axiom/snapshot/`: workspace snapshot service.
 - `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, shared ReAct/Plan/Multi-Agent execution strategies, tool execution records, and durable task store.
+- `src/axiom/artifacts/`: content-addressed Blob storage, durable Artifact metadata, explicit reuse primitives, and the `publish_artifact` Tool. See [`docs/artifacts.md`](docs/artifacts.md).
 - `src/axiom/runtime/supervisor.py`: process-local ExecutionHandle registry and cross-thread cancellation bridge; it is not a recovery database.
 - `src/axiom/rl/`: trajectory construction, deterministic reward, rollout export, and the
   Agent Lightning v1 compatibility boundary. See [`docs/agentic-rl.md`](docs/agentic-rl.md).

@@ -362,6 +362,7 @@ class ToolExecutionRecord:
     retry_backoff_seconds: float = 0.0
     started_at: str | None = None
     completed_at: str | None = None
+    artifact_ids: list[str] = field(default_factory=list)
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     @property
@@ -395,6 +396,7 @@ class ToolExecutionRecord:
             "retry_backoff_seconds": self.retry_backoff_seconds,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
+            "artifact_ids": list(self.artifact_ids),
             "updated_at": self.updated_at,
         }
 
@@ -435,6 +437,9 @@ class ToolExecutionRecord:
             retry_backoff_seconds=float(data.get("retry_backoff_seconds") or 0.0),
             started_at=_optional_str(data.get("started_at")),
             completed_at=_optional_str(data.get("completed_at")),
+            artifact_ids=[
+                str(item) for item in data.get("artifact_ids", []) if isinstance(item, str)
+            ],
             updated_at=str(data.get("updated_at") or datetime.now(UTC).isoformat()),
         )
 

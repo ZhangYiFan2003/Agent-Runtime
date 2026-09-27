@@ -7,11 +7,11 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --extra postgres --no-install-project
+RUN uv sync --frozen --no-dev --extra postgres --extra artifact-s3 --no-install-project
 
 COPY README.md ./
 COPY src ./src
-RUN uv sync --frozen --no-dev --extra postgres --no-editable
+RUN uv sync --frozen --no-dev --extra postgres --extra artifact-s3 --no-editable
 
 FROM python:3.12-slim-bookworm AS runtime
 

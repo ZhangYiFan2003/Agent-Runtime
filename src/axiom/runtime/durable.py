@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from axiom.artifacts import ArtifactService
 from axiom.config import AxiomConfig
 from axiom.context import (
     ContextBudgetExceededError,
@@ -183,6 +184,7 @@ class DurableAgentRuntime:
         retry_random: Callable[[], float] | None = None,
         retry_sleep: Callable[[float], Awaitable[None]] | None = None,
         ownership: RunOwnership | None = None,
+        artifact_service: ArtifactService | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
@@ -196,6 +198,7 @@ class DurableAgentRuntime:
         self.retry_random = retry_random or random.random
         self.retry_sleep = retry_sleep or asyncio.sleep
         self.ownership = ownership
+        self.artifact_service = artifact_service
         self.event_sink = event_sink
         self.tracer = tracer
         self.permission_policy = permission_policy or DefaultPermissionPolicy(
@@ -1728,6 +1731,9 @@ class DurableAgentRuntime:
                 content=existing.result or "",
                 is_error=False,
                 tool_use_id=tool_call_id,
+                metadata={"artifact_ids": list(existing.artifact_ids)}
+                if existing.artifact_ids
+                else {},
             )
             return await self._apply_tool_result(
                 state,
@@ -2013,6 +2019,7 @@ class DurableAgentRuntime:
                 permission_policy=self.permission_policy,
                 preauthorized_invocation_id=invocation_id,
                 execution_backend=self.execution_backend,
+                artifact_service=self.artifact_service,
             )
             try:
                 remaining = await self.budget_manager.ensure_wall_time(state)
@@ -2075,6 +2082,12 @@ class DurableAgentRuntime:
                 )
                 raise
             if not result.is_error:
+                artifact_ids = result.metadata.get("artifact_ids")
+                record.artifact_ids = (
+                    [item for item in artifact_ids if isinstance(item, str)]
+                    if isinstance(artifact_ids, list)
+                    else []
+                )
                 record.status = ToolExecutionStatus.SUCCEEDED
                 record.result = result.content
                 record.is_error = False
@@ -2086,6 +2099,31 @@ class DurableAgentRuntime:
                 record.retry_suppressed_reason = None
                 record.next_retry_at = None
                 await self._save_tool_execution(record)
+                for artifact_id in record.artifact_ids:
+                    artifact = (
+                        self.artifact_service.get(artifact_id)
+                        if self.artifact_service is not None
+                        else None
+                    )
+                    await self._emit(
+                        "artifact.created",
+                        {
+                            "run_id": state.run_id,
+                            "invocation_id": invocation_id,
+                            "tool_name": name,
+                            "artifact_id": artifact_id,
+                            **(
+                                {
+                                    "name": artifact.name,
+                                    "size_bytes": artifact.size_bytes,
+                                    "sha256": artifact.blob_sha256,
+                                    "reused": artifact.reused,
+                                }
+                                if artifact is not None
+                                else {}
+                            ),
+                        },
+                    )
                 await self._finish_span(
                     tool_span,
                     SpanStatus.SUCCEEDED,

@@ -372,6 +372,7 @@ class SQLiteCheckpointStore:
                 record.retry_backoff_seconds,
                 record.started_at,
                 record.completed_at,
+                json.dumps(record.artifact_ids, separators=(",", ":")),
                 record.updated_at,
             )
             conn.execute(
@@ -380,8 +381,9 @@ class SQLiteCheckpointStore:
                     invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
                     status, attempt, result, is_error, error, last_failure_category,
                     last_error_code, retry_state, retry_suppressed_reason,
-                    next_retry_at, retry_backoff_seconds, started_at, completed_at, updated_at
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    next_retry_at, retry_backoff_seconds, started_at, completed_at,
+                    artifact_ids_json, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(invocation_id) do update set
                     status = excluded.status,
                     attempt = excluded.attempt,
@@ -396,6 +398,7 @@ class SQLiteCheckpointStore:
                     retry_backoff_seconds = excluded.retry_backoff_seconds,
                     started_at = excluded.started_at,
                     completed_at = excluded.completed_at,
+                    artifact_ids_json = excluded.artifact_ids_json,
                     updated_at = excluded.updated_at
                 """,
                 values,
@@ -408,7 +411,8 @@ class SQLiteCheckpointStore:
                 select invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
                        status, attempt, result, is_error, error, last_failure_category,
                        last_error_code, retry_state, retry_suppressed_reason,
-                       next_retry_at, retry_backoff_seconds, started_at, completed_at, updated_at
+                       next_retry_at, retry_backoff_seconds, started_at, completed_at,
+                       artifact_ids_json, updated_at
                 from tool_executions where invocation_id = ?
                 """,
                 (invocation_id,),
@@ -435,7 +439,8 @@ class SQLiteCheckpointStore:
                 "retry_backoff_seconds": row[15],
                 "started_at": row[16],
                 "completed_at": row[17],
-                "updated_at": row[18],
+                "artifact_ids": json.loads(str(row[18] or "[]")),
+                "updated_at": row[19],
             }
         )
 
@@ -446,7 +451,8 @@ class SQLiteCheckpointStore:
                 select invocation_id, run_id, tool_call_id, tool_name, arguments_hash,
                        status, attempt, result, is_error, error, last_failure_category,
                        last_error_code, retry_state, retry_suppressed_reason,
-                       next_retry_at, retry_backoff_seconds, started_at, completed_at, updated_at
+                       next_retry_at, retry_backoff_seconds, started_at, completed_at,
+                       artifact_ids_json, updated_at
                 from tool_executions where run_id = ? order by invocation_id
                 """,
                 (run_id,),
@@ -472,7 +478,8 @@ class SQLiteCheckpointStore:
                     "retry_backoff_seconds": row[15],
                     "started_at": row[16],
                     "completed_at": row[17],
-                    "updated_at": row[18],
+                    "artifact_ids": json.loads(str(row[18] or "[]")),
+                    "updated_at": row[19],
                 }
             )
             for row in rows
@@ -562,6 +569,7 @@ class SQLiteCheckpointStore:
                     retry_backoff_seconds real not null default 0,
                     started_at text,
                     completed_at text,
+                    artifact_ids_json text not null default '[]',
                     updated_at text not null
                 )
                 """
@@ -596,6 +604,7 @@ class SQLiteCheckpointStore:
             "retry_suppressed_reason": "text",
             "next_retry_at": "text",
             "retry_backoff_seconds": "real not null default 0",
+            "artifact_ids_json": "text not null default '[]'",
         }
         for name, declaration in additions.items():
             if name not in columns:

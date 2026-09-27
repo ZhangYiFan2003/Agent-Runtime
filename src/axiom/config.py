@@ -211,6 +211,26 @@ class StorageConfig:
 
 
 @dataclass(slots=True)
+class ArtifactS3Config:
+    endpoint: str = "http://minio:9000"
+    bucket: str = "axiom-artifacts"
+    access_key: str = ""
+    secret_key: str = ""
+    secure: bool = False
+    region: str = ""
+
+
+@dataclass(slots=True)
+class ArtifactConfig:
+    enabled: bool = False
+    backend: str = "local"
+    local_path: str = ""
+    max_file_bytes: int = 100 * 1024 * 1024
+    max_metadata_bytes: int = 16 * 1024
+    s3: ArtifactS3Config = field(default_factory=ArtifactS3Config)
+
+
+@dataclass(slots=True)
 class WorkerConfig:
     """Optional PostgreSQL distributed ownership Worker settings."""
 
@@ -317,6 +337,7 @@ class AxiomConfig:
     run_budget: RunBudgetConfig = field(default_factory=RunBudgetConfig)
     dependency: DependencyConfig = field(default_factory=DependencyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     capacity: CapacityConfig = field(default_factory=CapacityConfig)
     traffic: TrafficGovernanceConfig = field(default_factory=TrafficGovernanceConfig)
@@ -367,6 +388,20 @@ def load_config(
         raise ValueError(
             "PostgreSQL pool sizes must be positive and ordered, with a positive connect timeout"
         )
+    artifact_backend = config.artifacts.backend.strip().lower()
+    if artifact_backend not in {"local", "s3"}:
+        raise ValueError("artifacts.backend must be local or s3")
+    if config.artifacts.max_file_bytes <= 0 or config.artifacts.max_metadata_bytes <= 0:
+        raise ValueError("artifact size limits must be positive")
+    if config.artifacts.enabled and artifact_backend == "s3":
+        artifact_s3 = config.artifacts.s3
+        if not artifact_s3.endpoint.startswith(("http://", "https://")):
+            raise ValueError("artifacts.s3.endpoint must be HTTP(S)")
+        if not all(
+            value.strip()
+            for value in (artifact_s3.bucket, artifact_s3.access_key, artifact_s3.secret_key)
+        ):
+            raise ValueError("S3 artifact storage requires bucket and credentials")
     if config.worker.distributed_enabled and storage_backend != "postgres":
         raise ValueError("distributed Worker ownership requires storage.backend=postgres")
     if config.worker.distributed_enabled and (
@@ -498,6 +533,10 @@ def config_to_public_dict(config: AxiomConfig) -> dict[str, Any]:
         data["embedding"]["api_key"] = "***"
     if data.get("storage", {}).get("postgres_dsn"):
         data["storage"]["postgres_dsn"] = "***"
+    if data.get("artifacts", {}).get("s3", {}).get("access_key"):
+        data["artifacts"]["s3"]["access_key"] = "***"
+    if data.get("artifacts", {}).get("s3", {}).get("secret_key"):
+        data["artifacts"]["s3"]["secret_key"] = "***"
     return data
 
 
@@ -547,6 +586,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     run_budget = result.setdefault("run_budget", {})
     progress = result.setdefault("progress", {})
     storage = result.setdefault("storage", {})
+    artifacts = result.setdefault("artifacts", {})
     worker = result.setdefault("worker", {})
     capacity = result.setdefault("capacity", {})
     traffic = result.setdefault("traffic", {})
@@ -566,6 +606,33 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 storage[config_key] = caster(raw)
+
+    artifact_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_ARTIFACTS_ENABLED", "enabled", _as_bool),
+        ("AXIOM_ARTIFACTS_BACKEND", "backend", str),
+        ("AXIOM_ARTIFACTS_LOCAL_PATH", "local_path", str),
+        ("AXIOM_ARTIFACTS_MAX_FILE_BYTES", "max_file_bytes", int),
+        ("AXIOM_ARTIFACTS_MAX_METADATA_BYTES", "max_metadata_bytes", int),
+    ]
+    for env_key, config_key, caster in artifact_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                artifacts[config_key] = caster(raw)
+    artifact_s3 = artifacts.setdefault("s3", {})
+    artifact_s3_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_ARTIFACT_S3_ENDPOINT", "endpoint", str),
+        ("AXIOM_ARTIFACT_S3_BUCKET", "bucket", str),
+        ("AXIOM_ARTIFACT_S3_ACCESS_KEY", "access_key", str),
+        ("AXIOM_ARTIFACT_S3_SECRET_KEY", "secret_key", str),
+        ("AXIOM_ARTIFACT_S3_SECURE", "secure", _as_bool),
+        ("AXIOM_ARTIFACT_S3_REGION", "region", str),
+    ]
+    for env_key, config_key, caster in artifact_s3_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                artifact_s3[config_key] = caster(raw)
 
     worker_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_DISTRIBUTED_WORKER", "distributed_enabled", _as_bool),
@@ -827,6 +894,8 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         str(route): [ProviderTargetConfig(**target) for target in targets]
         for route, targets in gateway_data.get("routes", {}).items()
     }
+    artifact_data = dict(data.get("artifacts", {}))
+    artifact_data["s3"] = ArtifactS3Config(**artifact_data.get("s3", {}))
     return AxiomConfig(
         llm=LlmConfig(**data.get("llm", {})),
         provider_gateway=ProviderGatewayConfig(**gateway_data),
@@ -842,6 +911,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         run_budget=RunBudgetConfig(**data.get("run_budget", {})),
         dependency=DependencyConfig(**data.get("dependency", {})),
         storage=StorageConfig(**data.get("storage", {})),
+        artifacts=ArtifactConfig(**artifact_data),
         worker=WorkerConfig(**data.get("worker", {})),
         capacity=CapacityConfig(**data.get("capacity", {})),
         progress=ProgressConfig(**data.get("progress", {})),

@@ -17,6 +17,14 @@ x-provider-client-environment: &provider-client-environment
   AXIOM_MODEL: ${AXIOM_GATEWAY_ROUTE:-default}
   AXIOM_GATEWAY_ROUTE: ${AXIOM_GATEWAY_ROUTE:-default}
   AXIOM_GATEWAY_URL: http://providerd:8070
+x-artifact-client-environment: &artifact-client-environment
+  AXIOM_ARTIFACTS_ENABLED: "true"
+  AXIOM_ARTIFACTS_BACKEND: s3
+  AXIOM_ARTIFACT_S3_ENDPOINT: http://minio:9000
+  AXIOM_ARTIFACT_S3_BUCKET: ${AXIOM_ARTIFACT_S3_BUCKET:-axiom-artifacts}
+  AXIOM_ARTIFACT_S3_ACCESS_KEY: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+  AXIOM_ARTIFACT_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+  AXIOM_ARTIFACT_S3_SECURE: "false"
 x-sandbox-environment: &sandbox-environment
   AXIOM_SANDBOX_IMAGE: ${AXIOM_SANDBOX_IMAGE:-axiom-sandbox:local}
   AXIOM_SANDBOX_WORKSPACE_SOURCE: ${AXIOM_SANDBOX_WORKSPACE_SOURCE:-axiom_workspace_data}
@@ -44,6 +52,52 @@ services:
     networks:
       - internal
 
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:d7c906993247627c19f37fc1fa302c34cf2d209ae0e7dc7d52fb0be6ac2849ba
+    command: server /data
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    volumes:
+      - artifact_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      - artifact-storage
+
+  minio-init:
+    image: axiom-runtime:local
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      AXIOM_ARTIFACT_S3_BUCKET: ${AXIOM_ARTIFACT_S3_BUCKET:-axiom-artifacts}
+    entrypoint: ["python", "-c"]
+    command:
+      - |
+        import os
+        from minio import Minio
+
+        client = Minio(
+            "minio:9000",
+            access_key=os.environ["MINIO_ROOT_USER"],
+            secret_key=os.environ["MINIO_ROOT_PASSWORD"],
+            secure=False,
+        )
+        bucket = os.environ["AXIOM_ARTIFACT_S3_BUCKET"]
+        if not client.bucket_exists(bucket):
+            client.make_bucket(bucket)
+    networks:
+      - artifact-storage
+
   runtime-api:
     image: axiom-runtime:local
     build:
@@ -63,11 +117,13 @@ services:
       - /var/lib/axiom
     restart: unless-stopped
     environment:
-      <<: *runtime-environment
+      <<: [*runtime-environment, *artifact-client-environment]
       AXIOM_RUNTIME_API_KEY: ${AXIOM_RUNTIME_API_KEY:?AXIOM_RUNTIME_API_KEY is required}
     depends_on:
       postgres:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - ${AXIOM_WORKSPACE_MOUNT:-workspace_data}:/workspace
       - runtime_data:/var/lib/axiom
@@ -86,6 +142,7 @@ services:
     stop_grace_period: 15s
     networks:
       - internal
+      - artifact-storage
 
   worker:
     image: axiom-runtime:local
@@ -97,7 +154,7 @@ services:
       - /var/lib/axiom
     restart: unless-stopped
     environment:
-      <<: [*runtime-environment, *sandbox-environment, *provider-client-environment]
+      <<: [*runtime-environment, *sandbox-environment, *provider-client-environment, *artifact-client-environment]
       AXIOM_EXECUTION_BACKEND: sandbox
       AXIOM_SANDBOX_CONTROLLER_URL: http://sandboxd:8090
     depends_on:
@@ -107,6 +164,8 @@ services:
         condition: service_healthy
       providerd:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - ${AXIOM_WORKSPACE_MOUNT:-workspace_data}:/workspace
       - runtime_data:/var/lib/axiom
@@ -115,6 +174,7 @@ services:
       - internal
       - sandbox-control
       - provider-control
+      - artifact-storage
 
   providerd:
     image: axiom-runtime:local
@@ -212,6 +272,7 @@ services:
 
 volumes:
   postgres_data:
+  artifact_data:
   runtime_data:
   workspace_data:
 
@@ -222,5 +283,8 @@ networks:
     driver: bridge
     internal: true
   provider-control:
+    driver: bridge
+    internal: true
+  artifact-storage:
     driver: bridge
     internal: true

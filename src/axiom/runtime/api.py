@@ -17,6 +17,13 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from axiom.agent import QueryEngine
+from axiom.artifacts import (
+    ArtifactMetadataStore,
+    ArtifactNotFoundError,
+    ArtifactService,
+    SQLiteArtifactMetadataStore,
+    build_artifact_service,
+)
 from axiom.bootstrap import build_tool_registry
 from axiom.config import AxiomConfig
 from axiom.llm import create_llm_client
@@ -95,6 +102,8 @@ class RuntimeApiServer:
         checkpoint_store: RuntimeStore | None = None,
         event_repository: EventRepository | None = None,
         control_operation_store: ControlOperationStore | None = None,
+        artifact_metadata_store: ArtifactMetadataStore | None = None,
+        artifact_service: ArtifactService | None = None,
         durable_storage=None,
         observability_store: ObservabilityStore | None = None,
         retry_policy: RetryPolicy | None = None,
@@ -131,6 +140,11 @@ class RuntimeApiServer:
             self.control_operations = self._durable_storage.controls
             self.checkpoint_store = self._durable_storage.runtime
             self.storage_backend = self._durable_storage.backend
+            artifact_metadata = getattr(
+                self._durable_storage,
+                "artifacts",
+                artifact_metadata_store or SQLiteArtifactMetadataStore(runtime_db),
+            )
         else:
             if config.storage.backend.strip().lower() == "postgres" and not all(injected):
                 raise ValueError(
@@ -148,6 +162,12 @@ class RuntimeApiServer:
                 self.checkpoint_store.backend,
             }
             self.storage_backend = backends.pop() if len(backends) == 1 else "custom"
+            artifact_metadata = artifact_metadata_store or SQLiteArtifactMetadataStore(runtime_db)
+        self.artifact_service = artifact_service or build_artifact_service(
+            config=config.artifacts,
+            metadata=artifact_metadata,
+            data_dir=self.data_dir,
+        )
         self.observability_store = observability_store or SQLiteObservabilityStore(
             self.data_dir / "runtime.db"
         )
@@ -399,6 +419,11 @@ class RuntimeApiServer:
                     "database": "ok" if self.repository.database_ok() else "error",
                     "storage_backend": self.storage_backend,
                     "sse": self._sse_health(),
+                    **(
+                        {"artifact_store": self.artifact_service.health()}
+                        if self.artifact_service is not None
+                        else {}
+                    ),
                     **({"capacity": capacity} if capacity is not None else {}),
                     **(
                         {"distributed_runtime": distributed}
@@ -546,6 +571,23 @@ class RuntimeApiServer:
                         ],
                     },
                 )
+            elif method == "GET" and path.startswith("/v1/runs/") and path.endswith(
+                "/artifacts"
+            ):
+                run_id = path.split("/")[3]
+                state = asyncio.run(self.checkpoint_store.load(run_id))
+                if state is None:
+                    raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
+                artifacts = (
+                    self.artifact_service.list_run(run_id)
+                    if self.artifact_service is not None
+                    else []
+                )
+                _send_json(
+                    request,
+                    200,
+                    {"run_id": run_id, "artifacts": [item.public_dict() for item in artifacts]},
+                )
             elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/interrupts"):
                 run_id = path.split("/")[3]
                 state = asyncio.run(self.checkpoint_store.load(run_id))
@@ -563,6 +605,21 @@ class RuntimeApiServer:
                 if state is None:
                     raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
                 _send_json(request, 200, asyncio.run(self._run_view(state)))
+            elif method == "GET" and path.startswith("/v1/artifacts/") and path.endswith(
+                "/content"
+            ):
+                artifact_id = path.split("/")[3]
+                self._send_artifact_content(request, artifact_id)
+            elif method == "GET" and path.startswith("/v1/artifacts/"):
+                artifact_id = path.split("/")[3]
+                artifact = (
+                    self.artifact_service.get(artifact_id)
+                    if self.artifact_service is not None
+                    else None
+                )
+                if artifact is None:
+                    raise ApiError("artifact_not_found", "artifact not found", 404)
+                _send_json(request, 200, artifact.public_dict())
             elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/resume"):
                 run_id = path.split("/")[3]
                 result = self._execute_control_operation(
@@ -656,6 +713,40 @@ class RuntimeApiServer:
             _send_json(request, error.http_status, error.to_dict())
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": _safe_error(exc)})
+
+    def _send_artifact_content(
+        self,
+        request: BaseHTTPRequestHandler,
+        artifact_id: str,
+    ) -> None:
+        artifact = (
+            self.artifact_service.get(artifact_id)
+            if self.artifact_service is not None
+            else None
+        )
+        if artifact is None or self.artifact_service is None:
+            raise ApiError("artifact_not_found", "artifact not found", 404)
+        try:
+            chunks = self.artifact_service.iter_content(artifact_id)
+        except ArtifactNotFoundError as exc:
+            raise ApiError("artifact_content_not_found", str(exc), 404) from exc
+        filename = "".join(
+            character
+            if character.isascii() and (character.isalnum() or character in "._-")
+            else "_"
+            for character in artifact.name
+        ) or "artifact"
+        request.send_response(200)
+        request.send_header("content-type", artifact.media_type)
+        request.send_header("content-length", str(artifact.size_bytes))
+        request.send_header("content-disposition", f'attachment; filename="{filename}"')
+        request.send_header("cache-control", "private, immutable")
+        request.end_headers()
+        try:
+            for chunk in chunks:
+                request.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionError, OSError):
+            return
 
     def _capacity_health(self) -> dict[str, object] | None:
         snapshot = getattr(self.checkpoint_store, "capacity_snapshot", None)
@@ -1418,6 +1509,7 @@ class RuntimeApiServer:
             execution_strategy=execution_strategy,
             active_run_supervisor=self.active_run_supervisor,
             ownership=ownership,
+            artifact_service=self.artifact_service,
         )
 
     def _runtime_event_sink(self, thread_id: str):

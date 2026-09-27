@@ -33,6 +33,9 @@ dev = [
 postgres = [
   "psycopg[binary,pool]>=3.2,<4",
 ]
+artifact-s3 = [
+  "minio>=7.2,<8",
+]
 rl = [
   "agentlightning>=1.0,<2; python_version >= '3.12'",
 ]
@@ -54,6 +57,7 @@ pythonpath = ["."]
 markers = [
   "postgres: requires a real PostgreSQL integration database",
   "docker: requires the optional live sandboxd Docker integration environment",
+  "minio: requires the optional live MinIO artifact integration environment",
 ]
 
 [tool.ruff]
