@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from axiom.config import LlmConfig
+from axiom.llm.base import LlmClient
 from axiom.llm.openai_compatible import OpenAICompatibleClient
+from axiom.provider_gateway.client import GatewayLlmClient
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -22,8 +24,16 @@ MODEL_CONTEXT_WINDOWS = {
 }
 
 
-def create_llm_client(config: LlmConfig) -> OpenAICompatibleClient:
+def create_llm_client(config: LlmConfig) -> LlmClient:
     provider = config.provider.lower()
+    if provider == "gateway":
+        return GatewayLlmClient(
+            route_name=config.route or config.model,
+            gateway_url=config.gateway_url,
+            max_tokens=config.max_tokens,
+            temperature=config.temperature,
+            timeout=config.timeout,
+        )
     if provider == "deepseek":
         base_url = config.base_url or DEEPSEEK_BASE_URL
         context = MODEL_CONTEXT_WINDOWS.get(config.model, 64_000)

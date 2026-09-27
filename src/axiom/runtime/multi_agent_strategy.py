@@ -12,7 +12,7 @@ from enum import StrEnum
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
-from axiom.runtime.budget import BudgetExceededError
+from axiom.runtime.budget import BudgetExceededError, UnknownModelPricingError
 from axiom.runtime.checkpoints import CheckpointConflictError
 from axiom.runtime.models import Checkpoint, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType, now
@@ -972,7 +972,15 @@ class MultiAgentExecutionStrategy:
         text = ""
         prompt_tokens = 0
         completion_tokens = 0
+        cached_input_tokens = 0
+        reasoning_tokens = 0
         finish_reason = "end_turn"
+        provider = runtime.llm_client.provider_name
+        model = runtime.llm_client.model_name
+        route = getattr(runtime.llm_client, "route_name", None)
+        target_id: str | None = None
+        gateway_wait_ms: float | None = None
+        circuit_state: str | None = None
         model_operation_id: str | None = None
         model_reserved = False
         model_accounted = False
@@ -1008,7 +1016,14 @@ class MultiAgentExecutionStrategy:
                 system_prompt=role_system_prompt,
             ):
                 event_type = event.get("type")
-                if event_type == "text_delta":
+                if event_type == "provider_selected":
+                    provider = str(event.get("provider") or provider)
+                    model = str(event.get("model") or model)
+                    route = str(event.get("route") or route or "") or None
+                    target_id = str(event.get("target_id") or "") or None
+                    gateway_wait_ms = _optional_float(event.get("gateway_wait_ms"))
+                    circuit_state = str(event.get("circuit_state") or "") or None
+                elif event_type == "text_delta":
                     if first_token_at is None:
                         first_token_at = now()
                     text += str(event.get("text") or "")
@@ -1017,15 +1032,24 @@ class MultiAgentExecutionStrategy:
                     if isinstance(usage, dict):
                         prompt_tokens += int(usage.get("input_tokens") or 0)
                         completion_tokens += int(usage.get("output_tokens") or 0)
+                        cached_input_tokens += int(usage.get("cached_input_tokens") or 0)
+                        reasoning_tokens += int(usage.get("reasoning_tokens") or 0)
                 elif event_type == "message_end":
                     finish_reason = str(event.get("stop_reason") or "end_turn")
                 elif event_type == "error":
-                    raise RuntimeError(str(event.get("error") or f"{role} failed"))
+                    error = event.get("error")
+                    if isinstance(error, BaseException):
+                        raise error
+                    raise RuntimeError(str(error or f"{role} failed"))
             await runtime.budget_manager.complete_model_call(
                 state,
                 model_operation_id,
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,
+                cached_input_tokens=cached_input_tokens,
+                reasoning_tokens=reasoning_tokens,
+                provider=provider,
+                model=model,
             )
             model_accounted = True
             if progress_state.recovery_signal_pending:
@@ -1033,12 +1057,16 @@ class MultiAgentExecutionStrategy:
                 state.progress_state = progress_state.to_dict()
         except Exception as exc:  # noqa: BLE001 - durable strategy failure boundary
             if model_operation_id is not None and model_reserved and not model_accounted:
-                with suppress(BudgetExceededError):
+                with suppress(BudgetExceededError, UnknownModelPricingError):
                     await runtime.budget_manager.complete_model_call(
                         state,
                         model_operation_id,
                         input_tokens=prompt_tokens,
                         output_tokens=completion_tokens,
+                        cached_input_tokens=cached_input_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        provider=getattr(exc, "provider", None) or provider,
+                        model=getattr(exc, "model", None) or model,
                     )
             latency_ms = round((time.perf_counter() - started) * 1000, 3)
             await runtime._finish_span(
@@ -1072,6 +1100,22 @@ class MultiAgentExecutionStrategy:
                 "first_token_at": first_token_at,
                 "latency_ms": latency_ms,
                 "finish_reason": finish_reason,
+                "cached_input_tokens": cached_input_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "provider": provider,
+                "model": model,
+                **({"llm.route": route} if route is not None else {}),
+                **({"provider.target": target_id} if target_id is not None else {}),
+                **(
+                    {"provider.gateway_wait_ms": gateway_wait_ms}
+                    if gateway_wait_ms is not None
+                    else {}
+                ),
+                **(
+                    {"provider.circuit_state": circuit_state}
+                    if circuit_state is not None
+                    else {}
+                ),
                 **context_attributes,
             },
         )
@@ -1298,6 +1342,13 @@ def _preview(text: str, max_len: int = 160) -> str:
 
 def _optional_str(value: Any) -> str | None:
     return str(value) if value is not None else None
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 async def _none_checkpoint() -> Checkpoint | None:

@@ -158,3 +158,35 @@ def test_sqlite_does_not_require_postgres_pool_configuration(tmp_path):
         env={},
     )
     assert config.storage.backend == "sqlite"
+
+
+def test_provider_gateway_routes_use_existing_config_and_env_merge(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    routes = {
+        "fast": [
+            {
+                "id": "local-fake",
+                "provider": "fake",
+                "model": "fast-model",
+                "base_url": "http://provider.invalid/v1",
+                "api_key_env": "FAKE_PROVIDER_KEY",
+                "max_concurrency": 2,
+                "max_pending": 1,
+            }
+        ]
+    }
+    config = load_config(
+        project_root=tmp_path,
+        env={
+            "AXIOM_PROVIDER": "gateway",
+            "AXIOM_GATEWAY_ROUTE": "fast",
+            "AXIOM_GATEWAY_URL": "http://providerd:8070",
+            "AXIOM_PROVIDER_ROUTES_JSON": json.dumps(routes),
+        },
+    )
+
+    target = config.provider_gateway.routes["fast"][0]
+    assert config.llm.provider == "gateway"
+    assert config.llm.route == "fast"
+    assert target.provider == "fake"
+    assert target.api_key_env == "FAKE_PROVIDER_KEY"

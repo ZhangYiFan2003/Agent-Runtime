@@ -59,6 +59,8 @@ the Web Console, Runtime API, PostgreSQL durable authority, and horizontally sca
 processes behind one same-origin HTTP entrypoint. See [`deploy/README.md`](deploy/README.md).
 The deployment optionally routes approved Shell calls through a Docker-backed per-Run container;
 the privileged sandbox controller remains isolated from Workers behind a narrow internal API.
+Workers can also share an internal Provider Gateway for ordered health-aware routing, bounded
+provider admission, and circuit breaking without moving retry or cost authority out of the Runtime.
 
 ## Features
 
@@ -85,6 +87,7 @@ the privileged sandbox controller remains isolated from Workers behind a narrow 
 | Agentic RL Bridge | Converts durable Agent Runs into validated trajectories, decomposed deterministic reward, and trainer-facing rollouts. A real TRL GRPO/LoRA experiment completed verified model updates but did not improve held-out success (0/30 to 0/30). | Bridge smoke-tested; capability gain not achieved |
 | Permission Policy | Evaluates capability, arguments, workspace scope, and Run context before Tool execution; supports durable per-invocation approval and policy audit spans. | Policy, restart approval, denial, audit, and Evaluation compatibility tested |
 | Execution Isolation | Routes approved Shell calls through Local/Restricted backends or an optional Docker-backed per-Run Sandbox with no network, a read-only rootfs, and resource limits. | Cross-platform local tests plus optional real-Docker security validation |
+| Provider Gateway | Shares provider concurrency, RPM admission, circuit state, and ordered pre-attempt fallback across distributed Workers while preserving Runtime retry and budget authority. | Offline fake-provider and two-client gateway integration tested |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
 | REPL | Interactive prompt-toolkit entrypoint and slash commands. | Not fully verified |
 

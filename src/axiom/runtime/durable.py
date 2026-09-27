@@ -38,6 +38,7 @@ from axiom.runtime.budget import (
     ModelPricingRegistry,
     RunBudgetPolicy,
     RunBudgetState,
+    UnknownModelPricingError,
 )
 from axiom.runtime.checkpoints import (
     CheckpointConflictError,
@@ -111,6 +112,13 @@ class _LlmCallResult:
     reasoning_tokens: int
     first_token_at: str | None
     ttft_ms: float | None
+    provider: str
+    model: str
+    route: str | None = None
+    target_id: str | None = None
+    gateway_wait_ms: float | None = None
+    circuit_state: str | None = None
+    rate_limited: bool = False
 
 
 class _LlmStreamError(RuntimeError):
@@ -122,12 +130,26 @@ class _LlmStreamError(RuntimeError):
         completion_tokens: int,
         cached_input_tokens: int,
         reasoning_tokens: int,
+        provider: str,
+        model: str,
+        route: str | None = None,
+        target_id: str | None = None,
+        gateway_wait_ms: float | None = None,
+        circuit_state: str | None = None,
+        rate_limited: bool = False,
     ) -> None:
         super().__init__(message)
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.cached_input_tokens = cached_input_tokens
         self.reasoning_tokens = reasoning_tokens
+        self.provider = provider
+        self.model = model
+        self.route = route
+        self.target_id = target_id
+        self.gateway_wait_ms = gateway_wait_ms
+        self.circuit_state = circuit_state
+        self.rate_limited = rate_limited
 
 
 class DurableAgentRuntime:
@@ -196,6 +218,9 @@ class DurableAgentRuntime:
             provider=llm_client.provider_name,
             model=llm_client.model_name,
             pricing_registry=ModelPricingRegistry.from_config(config.run_budget.model_pricing),
+            pricing_targets=_configured_pricing_targets(config)
+            if llm_client.provider_name == "gateway"
+            else None,
             observability_store=tracer.store if tracer is not None else None,
             ownership=ownership,
         )
@@ -979,6 +1004,7 @@ class DurableAgentRuntime:
                 "agent.step.started",
                 {"run_id": state.run_id, "step_index": step_index, "kind": "llm"},
             )
+            llm_route = getattr(self.llm_client, "route_name", None)
             llm_span = await self._start_span(
                 SpanType.LLM,
                 "llm.chat",
@@ -986,6 +1012,11 @@ class DurableAgentRuntime:
                 attributes={
                     "provider": self.llm_client.provider_name,
                     "model": self.llm_client.model_name,
+                    **(
+                        {"llm.route": llm_route}
+                        if llm_route
+                        else {}
+                    ),
                     "temperature": self.config.llm.temperature,
                     "retry_count": attempt - 1,
                 },
@@ -998,6 +1029,11 @@ class DurableAgentRuntime:
                     "span_id": _span_id(llm_span),
                     "provider": self.llm_client.provider_name,
                     "model": self.llm_client.model_name,
+                    **(
+                        {"route": llm_route}
+                        if llm_route
+                        else {}
+                    ),
                     "attempt": attempt,
                 },
             )
@@ -1006,6 +1042,8 @@ class DurableAgentRuntime:
             model_reserved = False
             model_accounted = False
             partial_usage = (0, 0, 0, 0)
+            partial_provider = self.llm_client.provider_name
+            partial_model = self.llm_client.model_name
             try:
                 effective_system_prompt = system_prompt or self.system_prompt
                 progress_state = ProgressState.from_dict(state.progress_state)
@@ -1076,6 +1114,8 @@ class DurableAgentRuntime:
                         stream_error.cached_input_tokens,
                         stream_error.reasoning_tokens,
                     )
+                    partial_provider = stream_error.provider
+                    partial_model = stream_error.model
                     await self.budget_manager.complete_model_call(
                         state,
                         model_operation_id,
@@ -1083,6 +1123,8 @@ class DurableAgentRuntime:
                         output_tokens=stream_error.completion_tokens,
                         cached_input_tokens=stream_error.cached_input_tokens,
                         reasoning_tokens=stream_error.reasoning_tokens,
+                        provider=stream_error.provider,
+                        model=stream_error.model,
                     )
                     model_accounted = True
                     raise
@@ -1092,6 +1134,8 @@ class DurableAgentRuntime:
                     llm_result.cached_input_tokens,
                     llm_result.reasoning_tokens,
                 )
+                partial_provider = llm_result.provider
+                partial_model = llm_result.model
                 await self.budget_manager.complete_model_call(
                     state,
                     model_operation_id,
@@ -1099,6 +1143,8 @@ class DurableAgentRuntime:
                     output_tokens=llm_result.completion_tokens,
                     cached_input_tokens=llm_result.cached_input_tokens,
                     reasoning_tokens=llm_result.reasoning_tokens,
+                    provider=llm_result.provider,
+                    model=llm_result.model,
                 )
                 model_accounted = True
                 if progress_state.recovery_signal_pending:
@@ -1114,8 +1160,15 @@ class DurableAgentRuntime:
                             output_tokens=partial_usage[1],
                             cached_input_tokens=partial_usage[2],
                             reasoning_tokens=partial_usage[3],
+                            provider=partial_provider,
+                            model=partial_model,
                         )
                 message = _safe_error(exc)
+                provider_attributes = _provider_observability_attributes(
+                    exc,
+                    provider=partial_provider,
+                    model=partial_model,
+                )
                 latency_ms = round((time.perf_counter() - call_started) * 1000, 3)
                 context_attributes = (
                     projection.observability_attributes(
@@ -1150,6 +1203,7 @@ class DurableAgentRuntime:
                         "prompt_tokens": partial_usage[0],
                         "completion_tokens": partial_usage[1],
                         "total_tokens": partial_usage[0] + partial_usage[1],
+                        **provider_attributes,
                         **context_attributes,
                     },
                 )
@@ -1163,14 +1217,24 @@ class DurableAgentRuntime:
                         "attempt": attempt,
                         **(
                             {"code": exc.code}
-                            if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError))
+                            if isinstance(
+                                exc,
+                                (
+                                    ContextBudgetExceededError,
+                                    BudgetExceededError,
+                                    UnknownModelPricingError,
+                                ),
+                            )
                             else {}
                         ),
                     },
                 )
                 if isinstance(exc, BudgetExceededError):
                     await self.budget_manager.record_hard_limit(state, exc)
-                if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError)):
+                if isinstance(
+                    exc,
+                    (ContextBudgetExceededError, BudgetExceededError, UnknownModelPricingError),
+                ):
                     decision = RetryDecision(
                         retry=False,
                         category=DependencyFailureCategory.PERMANENT_ERROR,
@@ -1209,7 +1273,11 @@ class DurableAgentRuntime:
                     message=message,
                     step="llm",
                     metadata={
-                        **(exc.metadata() if isinstance(exc, BudgetExceededError) else {}),
+                        **(
+                            exc.metadata()
+                            if isinstance(exc, (BudgetExceededError, UnknownModelPricingError))
+                            else {}
+                        ),
                         **retry_metadata,
                     },
                 )
@@ -1235,6 +1303,7 @@ class DurableAgentRuntime:
                         "step_index": state.step_index,
                         "kind": "llm",
                         "attempt": attempt,
+                        **provider_attributes,
                         "error": message,
                         **self._retry_metadata("model", attempt, decision),
                     },
@@ -1277,6 +1346,11 @@ class DurableAgentRuntime:
                     "retry_count": attempt - 1,
                     "dependency.retry_attempt": attempt,
                     "dependency.retry_count": attempt - 1,
+                    **_provider_observability_attributes(
+                        llm_result,
+                        provider=llm_result.provider,
+                        model=llm_result.model,
+                    ),
                     **projection.observability_attributes(
                         compaction_count=compaction_count_from_strategy_state(state.strategy_state)
                     ),
@@ -1292,6 +1366,11 @@ class DurableAgentRuntime:
                     "ttft_ms": llm_result.ttft_ms,
                     "latency_ms": latency_ms,
                     "finish_reason": llm_result.stop_reason,
+                    **_provider_observability_attributes(
+                        llm_result,
+                        provider=llm_result.provider,
+                        model=llm_result.model,
+                    ),
                 },
             )
 
@@ -1458,6 +1537,13 @@ class DurableAgentRuntime:
         first_token_at: str | None = None
         ttft_ms: float | None = None
         tool_states: dict[int, dict[str, Any]] = {}
+        provider = self.llm_client.provider_name
+        model = self.llm_client.model_name
+        route = getattr(self.llm_client, "route_name", None)
+        target_id: str | None = None
+        gateway_wait_ms: float | None = None
+        circuit_state: str | None = None
+        rate_limited = False
         try:
             async for event in self.llm_client.chat(
                 messages if messages is not None else state.messages,
@@ -1465,6 +1551,15 @@ class DurableAgentRuntime:
                 system_prompt=system_prompt or self.system_prompt,
             ):
                 event_type = event.get("type")
+                if event_type == "provider_selected":
+                    provider = str(event.get("provider") or provider)
+                    model = str(event.get("model") or model)
+                    route = str(event.get("route") or route or "") or None
+                    target_id = str(event.get("target_id") or "") or None
+                    gateway_wait_ms = _optional_float(event.get("gateway_wait_ms"))
+                    circuit_state = str(event.get("circuit_state") or "") or None
+                    rate_limited = bool(event.get("rate_limited"))
+                    continue
                 if (
                     event_type in {"text_delta", "thinking_delta", "tool_call_delta"}
                     and first_token_at is None
@@ -1496,6 +1591,14 @@ class DurableAgentRuntime:
                 completion_tokens=completion_tokens,
                 cached_input_tokens=cached_input_tokens,
                 reasoning_tokens=reasoning_tokens,
+                provider=getattr(exc, "provider", None) or provider,
+                model=getattr(exc, "model", None) or model,
+                route=route,
+                target_id=getattr(exc, "target_id", None) or target_id,
+                gateway_wait_ms=gateway_wait_ms,
+                circuit_state=circuit_state,
+                rate_limited=rate_limited
+                or getattr(exc, "failure_category", None) == "rate_limited",
             ) from exc
         return _LlmCallResult(
             text=text,
@@ -1507,6 +1610,13 @@ class DurableAgentRuntime:
             reasoning_tokens=reasoning_tokens,
             first_token_at=first_token_at,
             ttft_ms=ttft_ms,
+            provider=provider,
+            model=model,
+            route=route,
+            target_id=target_id,
+            gateway_wait_ms=gateway_wait_ms,
+            circuit_state=circuit_state,
+            rate_limited=rate_limited,
         )
 
     async def _execute_pending_tool(
@@ -2436,7 +2546,10 @@ class DurableAgentRuntime:
 
     @staticmethod
     def _dependency_error_code(exc: Exception, decision: RetryDecision) -> str:
-        if isinstance(exc, (ContextBudgetExceededError, BudgetExceededError)):
+        if isinstance(
+            exc,
+            (ContextBudgetExceededError, BudgetExceededError, UnknownModelPricingError),
+        ):
             return exc.code
         if decision.blocked_by_deadline:
             return DEPENDENCY_DEADLINE_EXCEEDED
@@ -2739,6 +2852,41 @@ def _normalize_decision(decision: str | None) -> str | None:
 def _safe_error(exc: Exception) -> str:
     text = str(exc) or type(exc).__name__
     return text[:4000]
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _provider_observability_attributes(
+    value: object,
+    *,
+    provider: str,
+    model: str,
+) -> dict[str, object]:
+    attributes: dict[str, object] = {"provider": provider, "model": model}
+    optional = {
+        "llm.route": getattr(value, "route", None),
+        "provider.target": getattr(value, "target_id", None),
+        "provider.gateway_wait_ms": getattr(value, "gateway_wait_ms", None),
+        "provider.circuit_state": getattr(value, "circuit_state", None),
+    }
+    attributes.update({key: item for key, item in optional.items() if item is not None})
+    if getattr(value, "rate_limited", False):
+        attributes["provider.rate_limited"] = True
+    return attributes
+
+
+def _configured_pricing_targets(config: AxiomConfig) -> list[tuple[str, str]]:
+    targets: list[tuple[str, str]] = []
+    for key in config.run_budget.model_pricing:
+        provider, separator, model = key.partition("/")
+        if separator:
+            targets.append((provider, model))
+    return targets
 
 
 def _now() -> str:

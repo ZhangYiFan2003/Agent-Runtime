@@ -10,7 +10,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from axiom.plan import ExecutionPlan, Planner, PlannerResult, PlanStatus, Task, TaskStatus
-from axiom.runtime.budget import BudgetExceededError
+from axiom.runtime.budget import BudgetExceededError, UnknownModelPricingError
 from axiom.runtime.checkpoints import CheckpointConflictError
 from axiom.runtime.models import Checkpoint, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType
@@ -505,12 +505,14 @@ class PlanExecuteStrategy:
             )
         except Exception as exc:  # noqa: BLE001 - persisted Run failure boundary
             if model_operation_id is not None and model_reserved:
-                with suppress(BudgetExceededError):
+                with suppress(BudgetExceededError, UnknownModelPricingError):
                     await runtime.budget_manager.complete_model_call(
                         state,
                         model_operation_id,
                         input_tokens=0,
                         output_tokens=0,
+                        provider=getattr(exc, "provider", None),
+                        model=getattr(exc, "model", None),
                     )
             latency_ms = round((time.perf_counter() - started) * 1000, 3)
             await runtime._finish_span(
@@ -529,8 +531,10 @@ class PlanExecuteStrategy:
                     model_operation_id,
                     input_tokens=result.prompt_tokens,
                     output_tokens=result.completion_tokens,
+                    provider=result.provider,
+                    model=result.model,
                 )
-            except BudgetExceededError as exc:
+            except (BudgetExceededError, UnknownModelPricingError) as exc:
                 await runtime._finish_span(
                     llm_span,
                     SpanStatus.FAILED,
@@ -553,6 +557,7 @@ class PlanExecuteStrategy:
                 "latency_ms": latency_ms,
                 "finish_reason": result.finish_reason,
                 "planner_shortcut": not result.used_llm,
+                **_provider_attributes(result),
                 **result.context_attributes,
             },
         )
@@ -1105,6 +1110,18 @@ async def _none_checkpoint() -> Checkpoint | None:
 
 def _span_id(span: Any) -> str | None:
     return str(span.span_id) if span is not None else None
+
+
+def _provider_attributes(result: Any) -> dict[str, object]:
+    values = {
+        "provider": getattr(result, "provider", None),
+        "model": getattr(result, "model", None),
+        "llm.route": getattr(result, "route", None),
+        "provider.target": getattr(result, "target_id", None),
+        "provider.gateway_wait_ms": getattr(result, "gateway_wait_ms", None),
+        "provider.circuit_state": getattr(result, "circuit_state", None),
+    }
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def _preview(text: str, max_len: int = 160) -> str:

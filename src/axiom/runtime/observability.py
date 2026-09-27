@@ -144,6 +144,11 @@ class RunMetrics:
     retried_tool_calls: int = 0
     dependency_timeouts: int = 0
     rate_limit_failures: int = 0
+    provider_attempts: int = 0
+    provider_failures: int = 0
+    provider_rate_limited_count: int = 0
+    provider_gateway_wait_ms: float = 0.0
+    provider_targets: tuple[str, ...] = ()
     retry_exhausted_count: int = 0
     retry_backoff_ms: float = 0.0
     cached_input_tokens: int = 0
@@ -197,6 +202,11 @@ class RunMetrics:
             "retried_tool_calls": self.retried_tool_calls,
             "dependency_timeouts": self.dependency_timeouts,
             "rate_limit_failures": self.rate_limit_failures,
+            "provider_attempts": self.provider_attempts,
+            "provider_failures": self.provider_failures,
+            "provider_rate_limited_count": self.provider_rate_limited_count,
+            "provider_gateway_wait_ms": self.provider_gateway_wait_ms,
+            "provider_targets": list(self.provider_targets),
             "retry_exhausted_count": self.retry_exhausted_count,
             "retry_backoff_ms": self.retry_backoff_ms,
             "cached_input_tokens": self.cached_input_tokens,
@@ -305,6 +315,28 @@ class RunMetrics:
             rate_limit_failures=sum(
                 span.attributes.get("dependency.failure_category") == "rate_limited"
                 for span in [*llm, *tools]
+            ),
+            provider_attempts=sum(bool(span.attributes.get("provider.target")) for span in llm),
+            provider_failures=sum(
+                bool(span.attributes.get("provider.target"))
+                and span.status == SpanStatus.FAILED
+                for span in llm
+            ),
+            provider_rate_limited_count=sum(
+                bool(span.attributes.get("provider.rate_limited")) for span in llm
+            ),
+            provider_gateway_wait_ms=round(
+                sum(_float_attribute(span, "provider.gateway_wait_ms") for span in llm),
+                3,
+            ),
+            provider_targets=tuple(
+                sorted(
+                    {
+                        f"{span.attributes.get('provider')}/{span.attributes.get('model')}"
+                        for span in llm
+                        if span.attributes.get("provider.target")
+                    }
+                )
             ),
             retry_exhausted_count=sum(
                 bool(span.attributes.get("dependency.retry_exhausted"))

@@ -20,12 +20,14 @@ PostgreSQL (durable Run, Event, control, ownership authority)
   ^
   |
 Worker replicas (claim, heartbeat, fenced execution)
-  |
-  v
-sandboxd (trusted Docker controller)
-  |
-  v
-per-Run Sandbox containers (network none)
+  |                                  |
+  v                                  v
+sandboxd                         providerd
+(trusted Docker controller)     (trusted Provider Gateway)
+  |                                  |
+  v                                  v
+per-Run Sandbox containers      external LLM Providers
+(network none)
 ```
 
 The API and Workers share a single-host `runtime_data` volume only for the existing SQLite-backed
@@ -36,6 +38,10 @@ network.
 Workers reach sandboxd only on the private `sandbox-control` network. Only sandboxd mounts the
 Docker socket. Runtime API, Web, PostgreSQL, Workers, and dynamically created Sandbox containers do
 not receive Docker daemon access. Sandbox containers join no Compose network.
+
+Workers reach providerd only on the private `provider-control` network. Only providerd receives
+external provider credentials. Runtime API, Web, PostgreSQL, sandboxd, and Sandbox containers do not
+join that network; providerd and sandboxd publish no host ports.
 
 ## Prerequisites
 
@@ -51,7 +57,13 @@ cp deploy/env.example deploy/.env
 Replace every `CHANGE_ME`. `POSTGRES_PASSWORD` and the password embedded in
 `AXIOM_POSTGRES_DSN` must match. The Runtime keeps its existing single API key model; users enter
 `AXIOM_RUNTIME_API_KEY` in Web Console Settings after startup. Provider credentials are optional
-for startup and health checks, but real Agent Turns require a configured provider key.
+for startup and health checks, but real Agent Turns require a configured key in providerd.
+
+The default gateway route contains one DeepSeek-compatible target. `AXIOM_PROVIDER_ROUTES_JSON` can
+replace it with an ordered route object using the `provider_gateway.routes` schema documented in
+[`docs/provider-gateway.md`](../docs/provider-gateway.md). Targets reference credential environment
+variable names; do not place credential values in the route JSON. In gateway mode, Workers receive
+only `AXIOM_GATEWAY_ROUTE` and the internal providerd URL.
 
 The default workspace is an isolated named volume. To work on host files, set
 `AXIOM_WORKSPACE_MOUNT` to an absolute path containing only a dedicated Agent workspace. Do not
@@ -72,7 +84,7 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml ps
 ```
 
 The `sandbox-image` profile is build-only; it does not create a long-running service. At startup,
-Workers fail closed if sandboxd, Docker, or the configured Sandbox image is unavailable.
+Workers fail closed if sandboxd, Docker, the configured Sandbox image, or providerd is unavailable.
 
 Open `http://SERVER:8080` by default. Change `AXIOM_WEB_PORT` when another host port is required.
 
@@ -94,6 +106,22 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml logs -f worker
 ```
 
 Services log to stdout/stderr.
+
+providerd exposes internal-only `/health` and `/v1/providers` status. These responses include route
+count, target identity, circuit state, admission counts, cooldown, and governance counters, but no
+credentials, authorization headers, or base URLs.
+
+## Provider routing lifecycle
+
+Every Runtime model attempt reaches providerd once. providerd selects the first ordered target that
+is eligible under shared concurrency, bounded pending admission, optional RPM, circuit state, and
+rate-limit cooldown. It can choose a secondary only before an upstream request starts. It never
+retries or changes providers after an upstream request or partial stream begins; the durable Runtime
+remains the retry authority and charges every real attempt to RunBudget.
+
+Gateway streams identify the actual provider/model before substantive output. Runtime cost is
+reserved conservatively across route targets and reconciled using actual target pricing and usage.
+Provider Gateway governance is process-local to the single providerd replica and resets on restart.
 
 ## Shell sandbox lifecycle
 
@@ -138,6 +166,11 @@ sandboxd is a trusted privileged infrastructure component with Docker daemon aut
 of sandboxd is effectively compromise of the Docker host. The Sandbox does not protect against
 kernel/container escape, a malicious trusted image, side channels, or hostile multi-tenant access.
 It also has no hard workspace disk quota or controlled Shell egress.
+
+providerd is a separate trusted component with external LLM credentials. Compromise of providerd can
+expose those credentials or issue provider calls. It is not connected to the Sandbox network and
+does not expose an Internet-facing listener. The gateway is not a tenant boundary, billing system,
+quality router, or HA service.
 
 HTTP is suitable only for localhost or a trusted private network. For Internet-facing access,
 terminate TLS in a separately managed reverse proxy or load balancer and restrict access there.

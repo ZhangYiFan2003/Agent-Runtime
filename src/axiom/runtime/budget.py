@@ -328,6 +328,21 @@ class BudgetExceededError(RuntimeError):
         }
 
 
+class UnknownModelPricingError(RuntimeError):
+    code = "COST_PRICING_UNKNOWN"
+
+    def __init__(self, *, provider: str, model: str, run_id: str) -> None:
+        self.provider = provider
+        self.model = model
+        self.run_id = run_id
+        super().__init__(
+            f"selected model pricing is unknown: {provider}/{model}, run_id={run_id}"
+        )
+
+    def metadata(self) -> dict[str, Any]:
+        return {"provider": self.provider, "model": self.model, "run_id": self.run_id}
+
+
 class BudgetManager:
     """Atomic, restart-safe ledger shared by a root Run and all descendants."""
 
@@ -339,6 +354,7 @@ class BudgetManager:
         provider: str,
         model: str,
         pricing_registry: ModelPricingRegistry | None = None,
+        pricing_targets: list[tuple[str, str]] | None = None,
         observability_store: ObservabilityStore | None = None,
         ownership: RunOwnership | None = None,
     ) -> None:
@@ -348,12 +364,23 @@ class BudgetManager:
         self.model = model
         self.pricing_registry = pricing_registry or ModelPricingRegistry()
         self.pricing = self.pricing_registry.resolve(provider, model)
+        self.pricing_targets = list(pricing_targets or [])
+        target_pricing = [
+            self.pricing_registry.resolve(target_provider, target_model)
+            for target_provider, target_model in self.pricing_targets
+        ]
+        self.reservation_pricing = self.pricing or _conservative_pricing(target_pricing)
         self.observability_store = observability_store
         self.ownership = ownership
         self._lock = asyncio.Lock()
         self._elapsed_anchors: dict[str, tuple[float, float]] = {}
-        if policy.max_cost_usd is not None and self.pricing is None:
-            raise ValueError(f"max_cost_usd requires configured pricing for {provider}/{model}")
+        if policy.max_cost_usd is not None and self.reservation_pricing is None:
+            target = (
+                "all provider gateway targets"
+                if self.pricing_targets
+                else f"{provider}/{model}"
+            )
+            raise ValueError(f"max_cost_usd requires configured pricing for {target}")
 
     async def initialize(self, state: Checkpoint) -> RunBudgetState:
         owner = state.budget_owner_run_id or state.run_id
@@ -370,7 +397,7 @@ class BudgetManager:
                     "policy": policy.to_dict(),
                     "created_at": state.created_at,
                     "pricing": self.pricing.to_dict() if self.pricing else None,
-                    "usage": _empty_usage(self.pricing is not None),
+                    "usage": _empty_usage(self.pricing is not None or bool(self.pricing_targets)),
                     "soft_dimensions": [],
                     "hard_dimension": None,
                 },
@@ -406,7 +433,7 @@ class BudgetManager:
             self._preflight(data, state.run_id, "output_tokens", 0)
             self._preflight(data, state.run_id, "total_tokens", estimate)
             run = _run_entry(data, state.run_id)
-            pricing = _pricing_from_entry(run)
+            pricing = self.reservation_pricing
             reserved_cost = (
                 pricing.cost(input_tokens=estimate, output_tokens=0)
                 if pricing is not None
@@ -421,6 +448,7 @@ class BudgetManager:
                 "status": "reserved",
                 "reserved_input_tokens": estimate,
                 "reserved_cost_usd": _decimal_text(reserved_cost),
+                "reservation_pricing": pricing.to_dict() if pricing is not None else None,
             }
             self._mark_soft(data, state.run_id)
 
@@ -438,9 +466,12 @@ class BudgetManager:
         output_tokens: int,
         cached_input_tokens: int = 0,
         reasoning_tokens: int = 0,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> RunBudgetState:
         owner = state.budget_owner_run_id or state.run_id
         violation: list[BudgetExceededError] = []
+        pricing_error: list[UnknownModelPricingError] = []
 
         def mutate(data: dict[str, Any]) -> None:
             operations = data.setdefault("operations", {})
@@ -450,7 +481,11 @@ class BudgetManager:
             if operation.get("status") == "completed":
                 return
             run = _run_entry(data, state.run_id)
-            pricing = _pricing_from_entry(run)
+            pricing = (
+                self.pricing_registry.resolve(provider, model)
+                if provider is not None and model is not None
+                else _pricing_from_entry(run)
+            )
             actual_input = max(0, int(input_tokens))
             actual_output = max(0, int(output_tokens))
             cached = min(max(0, int(cached_input_tokens)), actual_input)
@@ -458,7 +493,7 @@ class BudgetManager:
             run["usage"]["output_tokens"] += actual_output
             run["usage"]["cached_input_tokens"] += cached
             run["usage"]["reasoning_tokens"] += max(0, int(reasoning_tokens))
-            if pricing is not None:
+            if pricing is not None and bool(run["usage"].get("cost_known")):
                 current = Decimal(str(run["usage"].get("cost_usd") or "0"))
                 run["usage"]["cost_usd"] = str(
                     current
@@ -469,6 +504,17 @@ class BudgetManager:
                     )
                 )
                 run["usage"]["cost_known"] = True
+            elif pricing is None and provider not in (None, "gateway"):
+                run["usage"]["cost_usd"] = None
+                run["usage"]["cost_known"] = False
+                if self.policy.max_cost_usd is not None:
+                    pricing_error.append(
+                        UnknownModelPricingError(
+                            provider=provider or "unknown",
+                            model=model or "unknown",
+                            run_id=state.run_id,
+                        )
+                    )
             operation.update(
                 {
                     "status": "completed",
@@ -476,6 +522,9 @@ class BudgetManager:
                     "output_tokens": actual_output,
                     "cached_input_tokens": cached,
                     "reasoning_tokens": max(0, int(reasoning_tokens)),
+                    "provider": provider or self.provider,
+                    "model": model or self.model,
+                    "pricing": pricing.to_dict() if pricing is not None else None,
                 }
             )
             error = self._first_violation(data, state.run_id)
@@ -488,6 +537,8 @@ class BudgetManager:
         record = await self._mutate(owner, mutate)
         snapshot = self._snapshot(record, state.run_id)
         await self._publish(snapshot)
+        if pricing_error:
+            raise pricing_error[0]
         if violation:
             raise violation[0]
         return snapshot
@@ -910,6 +961,22 @@ def _usage_dimension(usage: RunBudgetUsage, dimension: str) -> int | float | Dec
 def _pricing_from_entry(run: dict[str, Any]) -> ModelPricing | None:
     raw = run.get("pricing")
     return ModelPricing.from_dict(raw) if isinstance(raw, dict) else None
+
+
+def _conservative_pricing(values: list[ModelPricing | None]) -> ModelPricing | None:
+    if not values or any(value is None for value in values):
+        return None
+    pricing = [value for value in values if value is not None]
+    return ModelPricing(
+        provider="gateway",
+        model="route-reservation",
+        input_per_million_usd=max(value.input_per_million_usd for value in pricing),
+        output_per_million_usd=max(value.output_per_million_usd for value in pricing),
+        cached_input_per_million_usd=max(
+            value.cached_input_per_million_usd or value.input_per_million_usd
+            for value in pricing
+        ),
+    )
 
 
 def _elapsed(created_at: str) -> float:

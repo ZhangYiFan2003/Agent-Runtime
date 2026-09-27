@@ -916,6 +916,32 @@ rate limiter, queue, backpressure, or cross-Run dependency-health state. HTTP/MC
 also have transport behavior that the Runtime cannot observe; duplicate external effects remain
 ambiguous without downstream idempotency or operation-status support.
 
+### Shared Provider Gateway
+
+Distributed Workers can opt into `GatewayLlmClient`, which streams normalized requests and events
+through one internal `providerd` process. providerd owns shared per-target concurrency, bounded
+pending admission, optional RPM tokens, 429 cooldown, and `CLOSED / OPEN / HALF_OPEN` circuit state.
+Routes are deterministic ordered target lists. A target can be skipped only before an upstream call
+when shared admission or health state makes it unavailable.
+
+Runtime retry remains the sole decision about whether another model attempt is allowed. providerd
+performs exactly one upstream attempt after selection and never switches providers after a request or
+partial stream begins. A later Runtime retry is a new charged attempt and can select another target.
+This preserves model-call, token, deadline, retry, cost, and Trace truth.
+
+`RunBudget` remains the per-Run/tree resource and cost authority. Gateway routes reserve input cost
+using the conservative maximum of Worker-side pricing entries for possible targets; completion
+reconciles with the actual provider/model carried by the gateway stream. Unknown selected-target
+pricing remains explicitly unknown and cannot satisfy a hard cost policy. LLM spans record route,
+actual provider/model, target, gateway wait, circuit state, and
+rate-limit evidence; existing metrics aggregate that evidence without a second provider trace store.
+
+In the single-host deployment, only providerd receives external provider credentials and joins the
+Worker-only `provider-control` network. Web, Runtime API, PostgreSQL, sandboxd, and networkless
+Sandbox containers cannot reach it. Gateway governance state is in-memory and single-replica; restart
+resets it and active streams fail into the existing durable Runtime recovery path. See
+[`docs/provider-gateway.md`](provider-gateway.md).
+
 ## 12. No-Progress / Loop Degeneration Detection
 
 `max_steps` bounds how long a Run may work; it cannot tell whether that work remains useful. The

@@ -43,6 +43,12 @@ class PlannerResult:
     finish_reason: str = "end_turn"
     ttft_ms: float | None = None
     context_attributes: dict[str, object] = field(default_factory=dict)
+    provider: str | None = None
+    model: str | None = None
+    route: str | None = None
+    target_id: str | None = None
+    gateway_wait_ms: float | None = None
+    circuit_state: str | None = None
 
 
 class Planner:
@@ -89,6 +95,12 @@ class Planner:
             finish_reason=response.finish_reason,
             ttft_ms=response.ttft_ms,
             context_attributes=response.context_attributes,
+            provider=response.provider,
+            model=response.model,
+            route=response.route,
+            target_id=response.target_id,
+            gateway_wait_ms=response.gateway_wait_ms,
+            circuit_state=response.circuit_state,
         )
 
     async def replan(self, failed_plan: ExecutionPlan, failure_reason: str) -> ExecutionPlan:
@@ -166,6 +178,12 @@ async def _collect_text(
     finish_reason = "end_turn"
     started = time.perf_counter()
     ttft_ms: float | None = None
+    provider = llm_client.provider_name
+    model = llm_client.model_name
+    route = getattr(llm_client, "route_name", None)
+    target_id: str | None = None
+    gateway_wait_ms: float | None = None
+    circuit_state: str | None = None
     projection = await context_manager.prepare(
         messages,
         system_prompt=system_prompt,
@@ -174,7 +192,14 @@ async def _collect_text(
     )
     async for event in llm_client.chat(projection.messages, [], system_prompt=system_prompt):
         event_type = event.get("type")
-        if event_type == "text_delta":
+        if event_type == "provider_selected":
+            provider = str(event.get("provider") or provider)
+            model = str(event.get("model") or model)
+            route = str(event.get("route") or route or "") or None
+            target_id = str(event.get("target_id") or "") or None
+            gateway_wait_ms = _optional_float(event.get("gateway_wait_ms"))
+            circuit_state = str(event.get("circuit_state") or "") or None
+        elif event_type == "text_delta":
             if ttft_ms is None:
                 ttft_ms = round((time.perf_counter() - started) * 1000, 3)
             text += str(event.get("text") or "")
@@ -194,6 +219,12 @@ async def _collect_text(
         finish_reason=finish_reason,
         ttft_ms=ttft_ms,
         context_attributes=projection.observability_attributes(compaction_count=0),
+        provider=provider,
+        model=model,
+        route=route,
+        target_id=target_id,
+        gateway_wait_ms=gateway_wait_ms,
+        circuit_state=circuit_state,
     )
 
 
@@ -205,6 +236,19 @@ class _PlannerResponse:
     finish_reason: str
     ttft_ms: float | None
     context_attributes: dict[str, object]
+    provider: str
+    model: str
+    route: str | None
+    target_id: str | None
+    gateway_wait_ms: float | None
+    circuit_state: str | None
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

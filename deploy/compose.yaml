@@ -12,9 +12,11 @@ x-runtime-environment: &runtime-environment
   AXIOM_MAX_ACTIVE_RUNS: ${AXIOM_MAX_ACTIVE_RUNS:-4}
   AXIOM_MAX_QUEUED_RUNS_PER_PRINCIPAL: ${AXIOM_MAX_QUEUED_RUNS_PER_PRINCIPAL:-100}
   AXIOM_MAX_ACTIVE_RUNS_PER_PRINCIPAL: ${AXIOM_MAX_ACTIVE_RUNS_PER_PRINCIPAL:-4}
-  AXIOM_PROVIDER: ${AXIOM_PROVIDER:-deepseek}
-  AXIOM_MODEL: ${AXIOM_MODEL:-deepseek-v4-flash}
-  AXIOM_API_KEY: ${AXIOM_API_KEY:-}
+x-provider-client-environment: &provider-client-environment
+  AXIOM_PROVIDER: gateway
+  AXIOM_MODEL: ${AXIOM_GATEWAY_ROUTE:-default}
+  AXIOM_GATEWAY_ROUTE: ${AXIOM_GATEWAY_ROUTE:-default}
+  AXIOM_GATEWAY_URL: http://providerd:8070
 x-sandbox-environment: &sandbox-environment
   AXIOM_SANDBOX_IMAGE: ${AXIOM_SANDBOX_IMAGE:-axiom-sandbox:local}
   AXIOM_SANDBOX_WORKSPACE_SOURCE: ${AXIOM_SANDBOX_WORKSPACE_SOURCE:-axiom_workspace_data}
@@ -95,13 +97,15 @@ services:
       - /var/lib/axiom
     restart: unless-stopped
     environment:
-      <<: [*runtime-environment, *sandbox-environment]
+      <<: [*runtime-environment, *sandbox-environment, *provider-client-environment]
       AXIOM_EXECUTION_BACKEND: sandbox
       AXIOM_SANDBOX_CONTROLLER_URL: http://sandboxd:8090
     depends_on:
       postgres:
         condition: service_healthy
       sandboxd:
+        condition: service_healthy
+      providerd:
         condition: service_healthy
     volumes:
       - ${AXIOM_WORKSPACE_MOUNT:-workspace_data}:/workspace
@@ -110,6 +114,41 @@ services:
     networks:
       - internal
       - sandbox-control
+      - provider-control
+
+  providerd:
+    image: axiom-runtime:local
+    command:
+      - providerd
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8070"
+      - --cwd
+      - /workspace
+    restart: unless-stopped
+    environment:
+      AXIOM_API_KEY: ${AXIOM_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AXIOM_PROVIDER_ROUTES_JSON: ${AXIOM_PROVIDER_ROUTES_JSON:-}
+      AXIOM_PROVIDER_GATEWAY_REQUEST_MAX_BYTES: ${AXIOM_PROVIDER_GATEWAY_REQUEST_MAX_BYTES:-2097152}
+      AXIOM_PROVIDER_GATEWAY_MAX_MESSAGES: ${AXIOM_PROVIDER_GATEWAY_MAX_MESSAGES:-512}
+      AXIOM_PROVIDER_GATEWAY_MAX_TOOL_SCHEMA_BYTES: ${AXIOM_PROVIDER_GATEWAY_MAX_TOOL_SCHEMA_BYTES:-524288}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8070/health', timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    networks:
+      - provider-control
 
   sandboxd:
     image: axiom-runtime:local
@@ -180,5 +219,8 @@ networks:
   internal:
     driver: bridge
   sandbox-control:
+    driver: bridge
+    internal: true
+  provider-control:
     driver: bridge
     internal: true

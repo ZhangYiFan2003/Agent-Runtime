@@ -35,8 +35,9 @@ from axiom.evaluation import (
     save_result,
 )
 from axiom.execution import SandboxExecutionBackend, create_execution_backend
-from axiom.llm import create_llm_client
+from axiom.llm import GatewayLlmClient, create_llm_client
 from axiom.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
+from axiom.provider_gateway import ProviderGateway, ProviderGatewayHttpServer
 from axiom.rl import RewardConfig, RewardPipeline, RLRolloutRunner, RolloutDataset
 from axiom.runtime import (
     ObservabilityService,
@@ -123,7 +124,13 @@ def doctor(
         "node": _version_of("node"),
         "npx": shutil.which("npx") or "missing",
         "rg": shutil.which("rg") or "missing",
-        "api_key": "configured" if config.llm.api_key else "missing",
+        "api_key": (
+            "gateway-managed"
+            if config.llm.provider.casefold() == "gateway"
+            else "configured"
+            if config.llm.api_key
+            else "missing"
+        ),
         "provider": config.llm.provider,
         "model": config.llm.model,
         "cwd": str(root),
@@ -207,6 +214,10 @@ def runtime_worker(
             backend = create_execution_backend(config, root)
             if isinstance(backend, SandboxExecutionBackend):
                 asyncio.run(backend.healthcheck())
+        if config.llm.provider.casefold() == "gateway":
+            llm_client = create_llm_client(config.llm)
+            if isinstance(llm_client, GatewayLlmClient):
+                asyncio.run(llm_client.healthcheck())
         composition = RuntimeApiServer(
             cwd=str(root),
             config=config,
@@ -256,6 +267,30 @@ def sandbox_controller(
     finally:
         server.shutdown()
         engine.close()
+
+
+@app.command("providerd")
+def provider_gateway(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Provider gateway bind host"),
+    ] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Provider gateway port")] = 8070,
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Configuration project root")] = None,
+) -> None:
+    """Run the trusted shared LLM provider gateway."""
+    root = (cwd or Path.cwd()).resolve()
+    config = load_config(project_root=root)
+    gateway = ProviderGateway(config.provider_gateway)
+    server = ProviderGatewayHttpServer(gateway, host=host, port=port)
+    try:
+        typer.echo(f"Axiom provider gateway listening on http://{host}:{port}")
+        server.serve_forever()
+    except OSError as exc:
+        typer.echo(f"provider gateway failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        server.shutdown()
 
 
 async def _run_distributed_worker(
@@ -680,7 +715,7 @@ def mcp_list(
 
 async def _run_prompt(prompt: str, cwd: str, config) -> None:
     config.render_mode = "plain"
-    if not config.llm.api_key:
+    if not config.llm.api_key and config.llm.provider.casefold() != "gateway":
         typer.echo(
             "Fatal error: AXIOM_API_KEY is not configured. Set it in env, "
             "~/.axiom/config.json, or project .axiom/config.json.",
@@ -715,7 +750,7 @@ async def _execute_evaluation_dataset(
     dataset = load_dataset(dataset_path)
     config = load_config(project_root=cwd)
     config.render_mode = "plain"
-    if not config.llm.api_key:
+    if not config.llm.api_key and config.llm.provider.casefold() != "gateway":
         raise ValueError("AXIOM_API_KEY is not configured")
     registry, manager = await build_tool_registry(config=config, cwd=str(cwd))
     if manager and manager.last_errors:
@@ -752,7 +787,7 @@ async def _execute_rl_dataset(
     dataset = load_dataset(dataset_path)
     config = load_config(project_root=cwd)
     config.render_mode = "plain"
-    if not config.llm.api_key:
+    if not config.llm.api_key and config.llm.provider.casefold() != "gateway":
         raise ValueError("AXIOM_API_KEY is not configured")
     registry, manager = await build_tool_registry(config=config, cwd=str(cwd))
     if manager and manager.last_errors:

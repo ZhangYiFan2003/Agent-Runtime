@@ -22,6 +22,42 @@ class LlmConfig:
     max_tokens: int = 8192
     temperature: float = 0.7
     timeout: float = 120.0
+    route: str = "default"
+    gateway_url: str = "http://providerd:8070"
+
+
+@dataclass(slots=True)
+class ProviderTargetConfig:
+    id: str = "deepseek-primary"
+    provider: str = "deepseek"
+    model: str = "deepseek-v4-flash"
+    base_url: str = "https://api.deepseek.com/v1"
+    api_key_env: str = "AXIOM_API_KEY"
+    context_window: int = 1_000_000
+    max_tokens: int = 8192
+    temperature: float = 0.7
+    timeout: float = 120.0
+    prompt_cache: bool = True
+    max_concurrency: int = 4
+    max_pending: int = 8
+    admission_timeout_seconds: float = 0.25
+    requests_per_minute: int | None = None
+    failure_threshold: int = 3
+    open_seconds: float = 30.0
+    half_open_max_probes: int = 1
+    rate_limit_cooldown_seconds: float = 5.0
+
+
+def _default_provider_routes() -> dict[str, list[ProviderTargetConfig]]:
+    return {"default": [ProviderTargetConfig()]}
+
+
+@dataclass(slots=True)
+class ProviderGatewayConfig:
+    routes: dict[str, list[ProviderTargetConfig]] = field(default_factory=_default_provider_routes)
+    request_max_bytes: int = 2 * 1024 * 1024
+    max_messages: int = 512
+    max_tool_schema_bytes: int = 512 * 1024
 
 
 @dataclass(slots=True)
@@ -268,6 +304,7 @@ class FeatureConfig:
 @dataclass(slots=True)
 class AxiomConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
+    provider_gateway: ProviderGatewayConfig = field(default_factory=ProviderGatewayConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     render_mode: str = "inline"
     tools: ToolsConfig = field(default_factory=ToolsConfig)
@@ -395,6 +432,54 @@ def load_config(
         or sandbox.command_max_bytes >= sandbox.request_max_bytes
     ):
         raise ValueError("execution.sandbox limits must be positive and request-bounded")
+    gateway = config.provider_gateway
+    if gateway.request_max_bytes <= 0 or gateway.max_messages <= 0:
+        raise ValueError("provider_gateway request and message limits must be positive")
+    if (
+        gateway.max_tool_schema_bytes <= 0
+        or gateway.max_tool_schema_bytes >= gateway.request_max_bytes
+    ):
+        raise ValueError("provider_gateway tool schema limit must be positive and request-bounded")
+    if not gateway.routes:
+        raise ValueError("provider_gateway.routes must define at least one route")
+    target_ids: set[str] = set()
+    for route, targets in gateway.routes.items():
+        if not route.strip() or not targets:
+            raise ValueError("provider gateway routes require a name and at least one target")
+        for target in targets:
+            if not all(
+                value.strip()
+                for value in (
+                    target.id,
+                    target.provider,
+                    target.model,
+                    target.base_url,
+                    target.api_key_env,
+                )
+            ):
+                raise ValueError("provider gateway target identity and endpoint are required")
+            if target.id in target_ids:
+                raise ValueError(f"provider gateway target id must be unique: {target.id}")
+            target_ids.add(target.id)
+            if not target.base_url.startswith(("http://", "https://")):
+                raise ValueError("provider gateway target base_url must be HTTP(S)")
+            if (
+                target.context_window <= 0
+                or target.max_tokens <= 0
+                or target.timeout <= 0
+                or target.max_concurrency <= 0
+                or target.max_pending < 0
+                or target.admission_timeout_seconds < 0
+                or (
+                    target.requests_per_minute is not None
+                    and target.requests_per_minute <= 0
+                )
+                or target.failure_threshold <= 0
+                or target.open_seconds <= 0
+                or target.half_open_max_probes <= 0
+                or target.rate_limit_cooldown_seconds <= 0
+            ):
+                raise ValueError("provider gateway target limits must be positive")
     return config
 
 
@@ -465,6 +550,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     worker = result.setdefault("worker", {})
     capacity = result.setdefault("capacity", {})
     traffic = result.setdefault("traffic", {})
+    provider_gateway = result.setdefault("provider_gateway", {})
     policy = result.setdefault("policy", {})
 
     storage_mappings: list[tuple[str, str, Any]] = [
@@ -527,12 +613,31 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("AXIOM_BASE_URL", "base_url", str),
         ("AXIOM_MAX_TOKENS", "max_tokens", int),
         ("AXIOM_TEMPERATURE", "temperature", float),
+        ("AXIOM_GATEWAY_ROUTE", "route", str),
+        ("AXIOM_GATEWAY_URL", "gateway_url", str),
     ]
     for env_key, config_key, caster in mappings:
         raw = env.get(env_key)
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 llm[config_key] = caster(raw)
+
+    gateway_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_PROVIDER_GATEWAY_REQUEST_MAX_BYTES", "request_max_bytes", int),
+        ("AXIOM_PROVIDER_GATEWAY_MAX_MESSAGES", "max_messages", int),
+        ("AXIOM_PROVIDER_GATEWAY_MAX_TOOL_SCHEMA_BYTES", "max_tool_schema_bytes", int),
+    ]
+    for env_key, config_key, caster in gateway_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                provider_gateway[config_key] = caster(raw)
+    routes_json = env.get("AXIOM_PROVIDER_ROUTES_JSON")
+    if routes_json not in (None, ""):
+        with suppress(TypeError, ValueError, json.JSONDecodeError):
+            parsed_routes = json.loads(str(routes_json))
+            if isinstance(parsed_routes, dict):
+                provider_gateway["routes"] = parsed_routes
 
     context_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_CONTEXT_WINDOW", "model_context_window", int),
@@ -717,8 +822,14 @@ def _config_to_dict(config: AxiomConfig) -> dict[str, Any]:
 def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
     execution_data = dict(data.get("execution", {}))
     execution_data["sandbox"] = SandboxConfig(**execution_data.get("sandbox", {}))
+    gateway_data = dict(data.get("provider_gateway", {}))
+    gateway_data["routes"] = {
+        str(route): [ProviderTargetConfig(**target) for target in targets]
+        for route, targets in gateway_data.get("routes", {}).items()
+    }
     return AxiomConfig(
         llm=LlmConfig(**data.get("llm", {})),
+        provider_gateway=ProviderGatewayConfig(**gateway_data),
         embedding=EmbeddingConfig(**data.get("embedding", {})),
         render_mode=data.get("render_mode", "inline"),
         tools=ToolsConfig(**data.get("tools", {})),
