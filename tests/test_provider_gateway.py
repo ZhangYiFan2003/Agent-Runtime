@@ -37,6 +37,7 @@ from axiom.runtime import (
     RunStatus,
     SpanType,
 )
+from axiom.runtime.api import RuntimeApiServer
 from axiom.runtime.budget import BudgetManager, UnknownModelPricingError
 from axiom.runtime.dependency import DependencyFailureCategory, RetryClassifier
 from axiom.runtime.models import Checkpoint
@@ -132,6 +133,20 @@ def _target(target_id: str, **overrides) -> ProviderTargetConfig:
     }
     values.update(overrides)
     return ProviderTargetConfig(**values)
+
+
+def test_gateway_runtime_api_does_not_require_external_provider_credential():
+    server = object.__new__(RuntimeApiServer)
+    server.config = AxiomConfig(
+        llm=LlmConfig(
+            provider="gateway",
+            route="default",
+            gateway_url="http://providerd:8070",
+            api_key="",
+        )
+    )
+
+    server._ensure_llm_key()
 
 
 def _gateway(

@@ -959,6 +959,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         provenance=ProvenanceConfig(**data.get("provenance", {})),
         worker=WorkerConfig(**data.get("worker", {})),
         capacity=CapacityConfig(**data.get("capacity", {})),
+        traffic=TrafficGovernanceConfig(**data.get("traffic", {})),
         progress=ProgressConfig(**data.get("progress", {})),
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),

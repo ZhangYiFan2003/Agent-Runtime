@@ -469,6 +469,8 @@ class DurableAgentRuntime:
             raise ValueError("distributed Run resume requires PostgreSQL storage")
         async with self._run_lock(run_id):
             state = await self._require(run_id)
+            if self.tracer is not None:
+                await self.tracer.start_run(state)
             if state.status == RunStatus.CANCELLED:
                 raise ValueError("cancelled run cannot be resumed")
             if state.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
@@ -491,6 +493,7 @@ class DurableAgentRuntime:
             state.interrupt = None
             state.error = None
             await self._save_checkpoint(state, operation="resume.queued")
+            await self._update_run_trace(state.status)
             await mark_runnable(run_id)
             await self._emit("run.resume_queued", {"run_id": run_id})
             return state

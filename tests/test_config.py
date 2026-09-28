@@ -182,6 +182,10 @@ def test_provider_gateway_routes_use_existing_config_and_env_merge(tmp_path, mon
             "AXIOM_GATEWAY_ROUTE": "fast",
             "AXIOM_GATEWAY_URL": "http://providerd:8070",
             "AXIOM_PROVIDER_ROUTES_JSON": json.dumps(routes),
+            "AXIOM_GLOBAL_SUBMISSION_RATE": "2.5",
+            "AXIOM_GLOBAL_SUBMISSION_BURST": "12",
+            "AXIOM_PRINCIPAL_SUBMISSION_RATE": "1.5",
+            "AXIOM_PRINCIPAL_SUBMISSION_BURST": "6",
         },
     )
 
@@ -190,3 +194,7 @@ def test_provider_gateway_routes_use_existing_config_and_env_merge(tmp_path, mon
     assert config.llm.route == "fast"
     assert target.provider == "fake"
     assert target.api_key_env == "FAKE_PROVIDER_KEY"
+    assert config.traffic.global_submission_rate == 2.5
+    assert config.traffic.global_submission_burst == 12
+    assert config.traffic.principal_submission_rate == 1.5
+    assert config.traffic.principal_submission_burst == 6

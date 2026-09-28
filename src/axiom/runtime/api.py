@@ -1199,7 +1199,7 @@ class RuntimeApiServer:
         context = RuntimeRequestContext(
             thread_id=state.thread_id,
             message=state.input,
-            history=state.history,
+            history=list(state.messages),
             cwd=self.cwd,
             config=self.config,
             turn_id=state.turn_id,
@@ -1827,7 +1827,7 @@ class RuntimeApiServer:
         )
 
     def _ensure_llm_key(self) -> None:
-        if not self.config.llm.api_key:
+        if self.config.llm.provider.casefold() != "gateway" and not self.config.llm.api_key:
             raise ValueError(
                 "AXIOM_API_KEY is not configured. Runtime turns/tasks need a working LLM key."
             )

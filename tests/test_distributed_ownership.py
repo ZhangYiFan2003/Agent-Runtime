@@ -679,6 +679,49 @@ def test_approval_resume_does_not_consume_redelivery_allowance(
 
 
 @pytest.mark.postgres
+def test_distributed_api_resume_requeues_persisted_messages(postgres_storage, tmp_path):
+    config = AxiomConfig()
+    config.worker.distributed_enabled = True
+    state: Checkpoint
+
+    def factory(context: RuntimeTurnContext) -> QueryEngine:
+        assert context.history == state.messages
+        return QueryEngine(
+            llm_client=_TakeoverLlm(),
+            tool_registry=ToolRegistry(),
+            config=context.config,
+            cwd=context.cwd,
+        )
+
+    server = RuntimeApiServer(
+        cwd=str(tmp_path),
+        config=config,
+        api_key="test-key",
+        workers=0,
+        data_dir=tmp_path / "api",
+        engine_factory=factory,
+        durable_storage=postgres_storage,
+    )
+    state = Checkpoint.create(
+        thread_id=server.repository.create_thread(),
+        run_id="run-api-resume",
+        input="approve the tool",
+    )
+    state.status = RunStatus.WAITING_APPROVAL
+    state.interrupt = Interrupt(
+        kind="tool_approval",
+        reason="approval required",
+        invocation_id="approval-api-call",
+    )
+    asyncio.run(postgres_storage.runtime.save(state))
+
+    result = asyncio.run(server._queue_distributed_resume(state, decision="approve"))
+
+    assert result["status"] == RunStatus.RUNNING
+    assert result["queued"] is True
+
+
+@pytest.mark.postgres
 @pytest.mark.parametrize("terminal", [RunStatus.COMPLETED, RunStatus.FAILED])
 def test_authoritative_terminal_outcome_is_not_redelivered(postgres_storage, terminal):
     state = asyncio.run(_runnable(postgres_storage, f"run-{terminal.value.lower()}"))

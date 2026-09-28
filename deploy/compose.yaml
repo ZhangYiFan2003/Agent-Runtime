@@ -12,6 +12,10 @@ x-runtime-environment: &runtime-environment
   AXIOM_MAX_ACTIVE_RUNS: ${AXIOM_MAX_ACTIVE_RUNS:-4}
   AXIOM_MAX_QUEUED_RUNS_PER_PRINCIPAL: ${AXIOM_MAX_QUEUED_RUNS_PER_PRINCIPAL:-100}
   AXIOM_MAX_ACTIVE_RUNS_PER_PRINCIPAL: ${AXIOM_MAX_ACTIVE_RUNS_PER_PRINCIPAL:-4}
+  AXIOM_GLOBAL_SUBMISSION_RATE: ${AXIOM_GLOBAL_SUBMISSION_RATE:-}
+  AXIOM_GLOBAL_SUBMISSION_BURST: ${AXIOM_GLOBAL_SUBMISSION_BURST:-}
+  AXIOM_PRINCIPAL_SUBMISSION_RATE: ${AXIOM_PRINCIPAL_SUBMISSION_RATE:-}
+  AXIOM_PRINCIPAL_SUBMISSION_BURST: ${AXIOM_PRINCIPAL_SUBMISSION_BURST:-}
   AXIOM_PROVENANCE_ENABLED: "true"
   AXIOM_PROVENANCE_PROMPT_GUIDANCE_ENABLED: "true"
 x-provider-client-environment: &provider-client-environment
@@ -119,7 +123,7 @@ services:
       - /var/lib/axiom
     restart: unless-stopped
     environment:
-      <<: [*runtime-environment, *artifact-client-environment]
+      <<: [*runtime-environment, *provider-client-environment, *artifact-client-environment]
       AXIOM_RUNTIME_API_KEY: ${AXIOM_RUNTIME_API_KEY:?AXIOM_RUNTIME_API_KEY is required}
     depends_on:
       postgres:
