@@ -8,6 +8,7 @@ import pytest
 from axiom.rag.models import CodeSearchResult
 from benchmarks.agent_runtime.run_agent_benchmark import validate_dataset
 from benchmarks.recovery.run_fault_injection import (
+    _safe_failure_summary,
     classify_execution,
     load_scenarios,
 )
@@ -172,3 +173,7 @@ def test_recovery_result_classification() -> None:
     assert passed["duplicate_tool_executions"] == 0
     assert passed["incorrect_terminal_states"] == 0
     assert failed["classification"] == "failure"
+
+
+def test_recovery_failure_summary_redacts_private_paths() -> None:
+    assert _safe_failure_summary(r"failed at C:\Users\person\work\test.py") == "failed at <local>"

@@ -93,6 +93,9 @@ Three maintained evidence suites keep different claims separate:
 - `recovery/`: 25 deterministic fault scenarios with two repetitions by
   default. No model provider is required; four distributed-redelivery cases
   require a real PostgreSQL test DSN.
+- `deployment/`: bounded real-Compose load, saturation, and service-level
+  failure injection using a deterministic local provider. Machine-specific
+  reports are written to `.tmp/stage15/` and are not CI thresholds.
 
 Committed artifacts are evidence snapshots, not CI performance thresholds.
 Synthetic Tool concurrency remains `ToolExecutor.execute_all` only and is not

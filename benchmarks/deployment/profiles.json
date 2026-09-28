@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "smoke": {
+      "workers": 1,
+      "concurrency": 2,
+      "runs": 4,
+      "warmups": 1,
+      "provider_latency_ms": 25,
+      "run_timeout_seconds": 30
+    },
+    "moderate-1-worker": {
+      "workers": 1,
+      "concurrency": 4,
+      "runs": 12,
+      "warmups": 2,
+      "provider_latency_ms": 50,
+      "run_timeout_seconds": 45
+    },
+    "moderate-2-workers": {
+      "workers": 2,
+      "concurrency": 4,
+      "runs": 12,
+      "warmups": 2,
+      "provider_latency_ms": 50,
+      "run_timeout_seconds": 45
+    },
+    "saturation": {
+      "workers": 1,
+      "concurrency": 8,
+      "runs": 16,
+      "warmups": 1,
+      "provider_latency_ms": 250,
+      "run_timeout_seconds": 60,
+      "max_active_runs": 2,
+      "max_queued_runs": 5,
+      "provider_max_concurrency": 1,
+      "provider_max_pending": 1,
+      "submission_rate": 2.0,
+      "submission_burst": 12
+    },
+    "soak-2-workers": {
+      "workers": 2,
+      "concurrency": 4,
+      "runs": 120,
+      "warmups": 2,
+      "provider_latency_ms": 250,
+      "run_timeout_seconds": 60
+    }
+  }
+}

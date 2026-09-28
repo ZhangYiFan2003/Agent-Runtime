@@ -121,6 +121,26 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml logs -f worker
 
 Services log to stdout/stderr.
 
+## Reliability validation
+
+The bounded Stage 15 harness starts an isolated Compose project with fake process-local
+credentials and a deterministic local provider. It does not read this deployment's `.env` or call
+an external LLM:
+
+```powershell
+uv run python -m benchmarks.deployment.run_load --profiles smoke moderate-1-worker moderate-2-workers saturation --build
+uv run python -m benchmarks.deployment.run_faults --build
+```
+
+Results are written under `.tmp/stage15/`. See
+[`benchmarks/deployment/README.md`](../benchmarks/deployment/README.md) for safe project cleanup,
+profile bounds, and interpretation, and
+[`docs/operations-reliability.md`](../docs/operations-reliability.md) for the current fault model.
+
+`GET /health` reports API-local task workers, not distributed Worker replica membership. For
+distributed diagnosis, use Compose service state plus PostgreSQL capacity/lease evidence and
+persisted ownership events. providerd's governance state is process-local and resets on restart.
+
 providerd exposes internal-only `/health` and `/v1/providers` status. These responses include route
 count, target identity, circuit state, admission counts, cooldown, and governance counters, but no
 credentials, authorization headers, or base URLs.

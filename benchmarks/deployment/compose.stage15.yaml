@@ -1,0 +1,43 @@
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${STAGE15_POSTGRES_PORT:-15432}:5432"
+
+  fake-provider:
+    image: python:3.12-slim-bookworm
+    command:
+      - python
+      - /stage15/fake_provider.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8060"
+    restart: "no"
+    environment:
+      STAGE15_PROVIDER_MODE: ${STAGE15_PROVIDER_MODE:-healthy}
+      STAGE15_PROVIDER_LATENCY_MS: ${STAGE15_PROVIDER_LATENCY_MS:-25}
+    volumes:
+      - ../benchmarks/deployment:/stage15:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8060/health', timeout=2).read()
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - provider-control
+
+  providerd:
+    depends_on:
+      fake-provider:
+        condition: service_healthy
+    environment:
+      AXIOM_API_KEY: stage15-fake-provider
+      AXIOM_PROVIDER_ROUTES_JSON: >-
+        {"default":[{"id":"stage15-fake","provider":"openai","model":"stage15-fake","base_url":"http://fake-provider:8060/v1","api_key_env":"AXIOM_API_KEY","context_window":32768,"max_tokens":256,"temperature":0.0,"timeout":10.0,"prompt_cache":false,"max_concurrency":${STAGE15_PROVIDER_MAX_CONCURRENCY:-2},"max_pending":${STAGE15_PROVIDER_MAX_PENDING:-2},"admission_timeout_seconds":0.2,"failure_threshold":1,"open_seconds":2.0,"half_open_max_probes":1,"rate_limit_cooldown_seconds":1.0}]}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {"id": "worker-loss", "fault": "stop one owning Worker", "expected_outcome": "recovered", "timeout_seconds": 75},
+    {"id": "providerd-unavailable", "fault": "stop providerd", "expected_outcome": "expected-safe", "timeout_seconds": 60},
+    {"id": "provider-target-500", "fault": "fake upstream returns HTTP 500", "expected_outcome": "expected-safe", "timeout_seconds": 60},
+    {"id": "sandboxd-unavailable", "fault": "stop sandboxd before approved Shell execution", "expected_outcome": "expected-safe", "timeout_seconds": 60},
+    {"id": "minio-unavailable", "fault": "stop MinIO before Artifact publish", "expected_outcome": "expected-safe", "timeout_seconds": 60},
+    {"id": "postgres-unavailable", "fault": "stop PostgreSQL authority", "expected_outcome": "expected-safe", "timeout_seconds": 60},
+    {"id": "runtime-api-restart", "fault": "restart Runtime API during Worker execution", "expected_outcome": "recovered", "timeout_seconds": 75},
+    {"id": "web-restart", "fault": "restart Web/Nginx during Worker execution", "expected_outcome": "recovered", "timeout_seconds": 60},
+    {"id": "providerd-state-reset", "fault": "restart providerd after opening target circuit", "expected_outcome": "recovered", "timeout_seconds": 60},
+    {"id": "sandboxd-restart", "fault": "restart sandboxd while a managed Run sandbox exists", "expected_outcome": "recovered", "timeout_seconds": 75}
+  ]
+}

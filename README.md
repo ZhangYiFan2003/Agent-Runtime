@@ -65,6 +65,9 @@ Run outputs can be published to a content-addressed Artifact Store backed by loc
 deployment's internal MinIO service, with PostgreSQL metadata and authenticated Console downloads.
 Runs can also record opt-in evidence-backed Claims over Tool executions, Artifacts, Code locations,
 and Trace spans, then inspect citation markers and provenance in the Console.
+Bounded real-Compose load, saturation, and service-level failure evidence is maintained under
+[`benchmarks/deployment/`](benchmarks/deployment/); see
+[`docs/operations-reliability.md`](docs/operations-reliability.md) for the verified fault model.
 
 ## Features
 
@@ -339,10 +342,9 @@ Verified in the current baseline:
 Partially verified or intentionally bounded:
 
 - MCP server long-running stdio/http transport lifecycle remains partially verified.
-- Runtime API public deployment, load testing, distributed queues, real-provider CI, and unlimited live streaming are not verified.
-- Distributed execution/locking, checkpoint compaction, automatic recovery scanning,
-  cross-process cancellation, leases/heartbeats, automatic abandoned-Run ownership takeover,
-  and exactly-once semantics for arbitrary external tool side effects are not implemented.
+- Public Internet deployment, multi-host HA, real-provider CI, and unlimited live streaming are not verified.
+- Cross-process cancellation, checkpoint compaction, and exactly-once semantics for arbitrary
+  external tool side effects remain intentionally bounded; ambiguous effects stop expected-safe.
 - Semantic memory retrieval, production LLM extraction quality evaluation, remote summarization/extraction CI, and cross-project preference sharing are not implemented yet.
 - Interactive REPL behavior is less extensively covered than non-interactive paths.
 - Real provider streaming has manual smoke coverage plus unit-level streaming/rendering paths, but not exhaustive provider matrix coverage.

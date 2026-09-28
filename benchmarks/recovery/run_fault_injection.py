@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -75,12 +76,24 @@ def main() -> None:
             "distributed-redelivery scenarios require AXIOM_TEST_POSTGRES_DSN"
         )
     repetitions = args.repetitions or int(matrix["repetitions"])
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    pytest_temp = args.output.parent / "pytest-recovery"
     results = []
     for repetition in range(1, repetitions + 1):
         for scenario in matrix["scenarios"]:
             started = time.perf_counter()
             run = subprocess.run(
-                [sys.executable, "-m", "pytest", "-q", scenario["test"], "-p", "no:cacheprovider"],
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    scenario["test"],
+                    "--basetemp",
+                    str(pytest_temp),
+                    "-p",
+                    "no:cacheprovider",
+                ],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -98,7 +111,7 @@ def main() -> None:
                     "repetition": repetition,
                     "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                     **classified,
-                    "failure_summary": "" if passed else output[-2000:],
+                    "failure_summary": "" if passed else _safe_failure_summary(output[-2000:]),
                 }
             )
     passed = [item for item in results if item["passed"]]
@@ -142,7 +155,6 @@ def main() -> None:
             ),
         ],
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(serialize_report(report), encoding="utf-8")
     args.output.with_suffix(".md").write_text(_markdown(report), encoding="utf-8")
     print(_markdown(report))
@@ -152,6 +164,15 @@ def main() -> None:
 
 def _known_sum(items: list[dict[str, Any]], key: str) -> int:
     return sum(item[key] for item in items if item[key] is not None)
+
+
+def _safe_failure_summary(output: str) -> str:
+    summary = output
+    for marker in (str(Path.cwd()), str(Path.home())):
+        summary = summary.replace(marker, "<local>")
+    summary = re.sub(r"(?i)\b[A-Z]:\\[^\r\n'\"]+", "<local>", summary)
+    summary = re.sub(r"/home/[^\s'\"]+", "<local>", summary)
+    return summary
 
 
 def _git_commit() -> str:
