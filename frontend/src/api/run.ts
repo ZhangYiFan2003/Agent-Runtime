@@ -8,6 +8,8 @@ import { adaptSpan, adaptTrace, type Span, type Trace } from "./adapters/trace";
 import { adaptRunMetrics, type RunMetrics } from "./adapters/metrics";
 import type { ConnectionConfig } from "../lib/connection";
 import { adaptArtifact, type Artifact } from "./adapters/artifact";
+import { claimProvenanceSchema, runClaimsSchema } from "./dto/claim";
+import { adaptClaim, adaptEvidence, type Claim, type Evidence } from "./adapters/claim";
 
 export interface RunChildren {
   parentRunId: string;
@@ -22,6 +24,43 @@ export interface RunTrace {
 export interface RunArtifacts {
   runId: string;
   artifacts: Artifact[];
+}
+
+export interface RunClaims {
+  runId: string;
+  claims: Claim[];
+}
+
+export interface ClaimProvenance {
+  claim: Claim;
+  evidence: Evidence[];
+}
+
+export async function fetchRunClaims(
+  config: ConnectionConfig,
+  runId: string,
+  fetchImpl?: typeof fetch,
+): Promise<RunClaims> {
+  const raw: unknown = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/claims`, {
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    fetchImpl,
+  });
+  const dto = runClaimsSchema.parse(raw);
+  return { runId: dto.run_id, claims: dto.claims.map(adaptClaim) };
+}
+
+export async function fetchClaimProvenance(
+  config: ConnectionConfig,
+  claimId: string,
+  fetchImpl?: typeof fetch,
+): Promise<ClaimProvenance> {
+  const raw: unknown = await apiGet(
+    `/v1/claims/${encodeURIComponent(claimId)}/provenance`,
+    { baseUrl: config.baseUrl, apiKey: config.apiKey, fetchImpl },
+  );
+  const dto = claimProvenanceSchema.parse(raw);
+  return { claim: adaptClaim(dto.claim), evidence: dto.evidence.map(adaptEvidence) };
 }
 
 export async function fetchRunArtifacts(

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from axiom.artifacts import ArtifactService
     from axiom.execution import ExecutionBackend
     from axiom.policy.permissions import PermissionDecision, PermissionPolicy
+    from axiom.provenance import ProvenanceService
 
 DangerLevel = Literal["safe", "medium", "high"]
 ToolDecision = Literal["approve", "deny", "skip"]
@@ -46,6 +47,7 @@ class ToolContext:
     ) = None
     execution_backend: ExecutionBackend | None = None
     artifact_service: ArtifactService | None = None
+    provenance_service: ProvenanceService | None = None
     operation_timeout_seconds: float | None = None
 
 

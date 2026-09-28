@@ -910,6 +910,8 @@ class PlanExecuteStrategy:
             context_manager=runtime.context_manager,
             budget_manager=runtime.budget_manager,
             ownership=runtime.ownership,
+            artifact_service=runtime.artifact_service,
+            provenance_service=runtime.provenance_service,
             max_turns=self.max_task_turns,
         )
 

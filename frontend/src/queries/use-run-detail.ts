@@ -2,6 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import {
   fetchRun,
   fetchRunArtifacts,
+  fetchClaimProvenance,
+  fetchRunClaims,
   fetchRunChildren,
   fetchRunMetrics,
   fetchRunTrace,
@@ -48,6 +50,25 @@ export function useRunArtifacts(runId: string, runStatus: string | undefined) {
     enabled: runId !== "" && runStatus !== undefined,
     retry: 1,
     refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),
+  });
+}
+
+export function useRunClaims(runId: string, runStatus: string | undefined) {
+  return useQuery({
+    queryKey: queryKeys.claims(runId),
+    queryFn: () => fetchRunClaims(getConnection(), runId),
+    enabled: runId !== "" && runStatus !== undefined,
+    retry: 1,
+    refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),
+  });
+}
+
+export function useClaimProvenance(claimId: string | null) {
+  return useQuery({
+    queryKey: queryKeys.claimProvenance(claimId ?? ""),
+    queryFn: () => fetchClaimProvenance(getConnection(), claimId as string),
+    enabled: claimId !== null && claimId !== "",
+    retry: 1,
   });
 }
 

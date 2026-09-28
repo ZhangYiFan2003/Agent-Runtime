@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   fetchArtifactContent,
+  fetchClaimProvenance,
   fetchRun,
   fetchRunArtifacts,
+  fetchRunClaims,
   fetchRunChildren,
   fetchRunMetrics,
   fetchRunTrace,
@@ -215,5 +217,60 @@ describe("run artifacts", () => {
     const error = await fetchArtifactContent(BASE, "missing", fetchImpl).catch((cause) => cause);
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).code).toBe("artifact_not_found");
+  });
+});
+
+describe("run claims", () => {
+  const claim = {
+    claim_id: "clm_1",
+    run_id: "run_a",
+    thread_id: "thread_1",
+    turn_id: "turn_1",
+    text: "The tool completed successfully.",
+    claim_kind: "result",
+    evidence_count: 1,
+    citation_marker: "[claim:clm_1]",
+    integrity: "VALID",
+    created_at: "2026-09-27T10:00:00+00:00",
+  };
+
+  it("parses and adapts a Run claim list", async () => {
+    const fetchImpl: typeof fetch = async (input) => {
+      expect(String(input)).toContain("/v1/runs/run_a/claims");
+      return jsonResponse(200, { run_id: "run_a", claims: [{ ...claim, future: true }] });
+    };
+    const result = await fetchRunClaims(BASE, "run_a", fetchImpl);
+    expect(result.claims[0]).toMatchObject({
+      claimId: "clm_1",
+      evidenceCount: 1,
+      citationMarker: "[claim:clm_1]",
+      integrity: "VALID",
+    });
+  });
+
+  it("preserves source-specific locator fields in the provenance view", async () => {
+    const fetchImpl: typeof fetch = async (input) => {
+      expect(String(input)).toContain("/v1/claims/clm_1/provenance");
+      return jsonResponse(200, {
+        claim,
+        evidence: [
+          {
+            evidence_id: "evd_1",
+            source_type: "CODE_LOCATION",
+            source_id: "src/main.py:4-7",
+            source_run_id: "run_a",
+            relation: "supports",
+            summary: "src/main.py:4-7",
+            locator: { path: "src/main.py", start_line: 4, end_line: 7, excerpt: "x = 1" },
+            source_digest: "a".repeat(64),
+            integrity: "VALID",
+            created_at: claim.created_at,
+          },
+        ],
+      });
+    };
+    const result = await fetchClaimProvenance(BASE, "clm_1", fetchImpl);
+    expect(result.evidence[0].sourceType).toBe("CODE_LOCATION");
+    expect(result.evidence[0].locator).toMatchObject({ path: "src/main.py", start_line: 4 });
   });
 });

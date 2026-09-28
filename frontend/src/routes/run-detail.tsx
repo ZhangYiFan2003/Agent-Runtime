@@ -1,9 +1,11 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
 import { ApiError } from "../api/client";
 import {
   useRun,
+  useClaimProvenance,
   useRunArtifacts,
+  useRunClaims,
   useRunChildren,
   useRunMetrics,
   useRunTrace,
@@ -22,6 +24,7 @@ import { Skeleton } from "../components/ui/skeleton";
 import { CopyId } from "../components/run/copy-id";
 import { RunBanners } from "../components/run/run-banners";
 import { RunArtifactsTable } from "../components/run/run-artifacts";
+import { RunClaimsPanel } from "../components/run/run-claims";
 import { RunChildrenTable } from "../components/run/run-children";
 import { RunHeader } from "../components/run/run-header";
 import { RunMetricsPanel } from "../components/run/run-metrics";
@@ -35,7 +38,7 @@ import { TraceWaterfall } from "../components/trace/waterfall";
 
 const routeApi = getRouteApi("/runs/$runId");
 
-type DetailTab = "overview" | "timeline" | "events" | "trace" | "metrics" | "children" | "artifacts" | "output";
+type DetailTab = "overview" | "timeline" | "events" | "trace" | "metrics" | "children" | "artifacts" | "claims" | "output";
 
 const DESKTOP_TABS: Array<{ key: DetailTab; label: string }> = [
   { key: "overview", label: "Overview" },
@@ -44,6 +47,7 @@ const DESKTOP_TABS: Array<{ key: DetailTab; label: string }> = [
   { key: "metrics", label: "Metrics" },
   { key: "children", label: "Children" },
   { key: "artifacts", label: "Artifacts" },
+  { key: "claims", label: "Claims" },
   { key: "output", label: "Output" },
 ];
 
@@ -55,6 +59,7 @@ const MOBILE_TABS: Array<{ key: DetailTab; label: string }> = [
   { key: "metrics", label: "Metrics" },
   { key: "children", label: "Children" },
   { key: "artifacts", label: "Artifacts" },
+  { key: "claims", label: "Claims" },
   { key: "output", label: "Output" },
 ];
 
@@ -152,6 +157,9 @@ export function RunDetailPage() {
   const metricsQuery = useRunMetrics(runId, runStatus);
   const childrenQuery = useRunChildren(runId, runStatus);
   const artifactsQuery = useRunArtifacts(runId, runStatus);
+  const claimsQuery = useRunClaims(runId, runStatus);
+  const selectedClaimId = search.claim ?? null;
+  const claimProvenanceQuery = useClaimProvenance(selectedClaimId);
   const controls = useRunControls(runId, { parentRunId: run?.parentRunId ?? null });
   const runtimeEvents = useRuntimeEvents({
     threadId: run?.threadId ?? null,
@@ -163,6 +171,10 @@ export function RunDetailPage() {
   // The mobile bottom-sheet inspector is portaled to document.body, so it
   // cannot be hidden with a `md:hidden` wrapper — gate rendering instead.
   const isDesktop = useMediaQuery("(min-width: 768px)");
+
+  useEffect(() => {
+    if (selectedClaimId !== null) setTab("claims");
+  }, [selectedClaimId]);
 
   const spans = useMemo(() => traceQuery.data?.spans ?? [], [traceQuery.data]);
   const selectedSpanId = search.span ?? null;
@@ -210,6 +222,16 @@ export function RunDetailPage() {
     });
   const toggleEvent = (eventId: number) =>
     selectEvent(eventId === selectedEventId ? null : eventId);
+  const selectClaim = (claimId: string) =>
+    void navigate({
+      to: "/runs/$runId",
+      params: { runId },
+      search: { claim: claimId },
+    });
+  const openEvidenceSpan = (spanId: string) => {
+    setTab("trace");
+    selectSpan(spanId);
+  };
   const openRun = (id: string) =>
     void navigate({ to: "/runs/$runId", params: { runId: id }, search: {} });
 
@@ -358,6 +380,22 @@ export function RunDetailPage() {
         if (artifactsQuery.isError)
           return <QueryError error={artifactsQuery.error} onRetry={() => void artifactsQuery.refetch()} />;
         return <RunArtifactsTable artifacts={artifactsQuery.data?.artifacts ?? []} />;
+      }
+      case "claims": {
+        if (claimsQuery.isPending) return <PanelSkeleton />;
+        if (claimsQuery.isError)
+          return <QueryError error={claimsQuery.error} onRetry={() => void claimsQuery.refetch()} />;
+        return (
+          <RunClaimsPanel
+            claims={claimsQuery.data?.claims ?? []}
+            selectedClaimId={selectedClaimId}
+            provenance={claimProvenanceQuery.data}
+            provenancePending={claimProvenanceQuery.isPending}
+            provenanceError={claimProvenanceQuery.isError}
+            onSelectClaim={selectClaim}
+            onOpenSpan={openEvidenceSpan}
+          />
+        );
       }
     }
   })();

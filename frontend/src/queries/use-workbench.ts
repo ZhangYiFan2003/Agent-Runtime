@@ -189,8 +189,9 @@ export function useWorkbench(): Workbench {
         prompt: submission.threadId === threadId ? submission.prompt : null,
         boundaryEventId: promptBoundary,
         responseText: submission.responseText,
+        responseRunId: submission.confirmedRunId,
       }),
-    [events, submission.prompt, submission.threadId, submission.responseText, threadId, promptBoundary],
+    [events, submission.prompt, submission.threadId, submission.responseText, submission.confirmedRunId, threadId, promptBoundary],
   );
 
   return {

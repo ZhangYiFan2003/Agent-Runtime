@@ -80,6 +80,7 @@ describe("projectWorkbenchEvents", () => {
     expect(items[0]).toMatchObject({ kind: "lifecycle", label: "Run started · run_a" });
     expect(items[1]).toMatchObject({ kind: "user", text: "find the bug", pending: false });
     expect(items[3]).toMatchObject({ kind: "assistant", text: "Found it." });
+    expect(items[3]).toMatchObject({ runId: "run_1" });
     expect(items[4]).toMatchObject({ kind: "lifecycle", label: "Run completed · run_a" });
     expect(items[5]).toMatchObject({ kind: "lifecycle", label: "Turn completed · 1234 tokens" });
     expect(items[6]).toMatchObject({ kind: "other", eventType: "quantum.entangled" });
@@ -135,6 +136,14 @@ describe("projectWorkbenchEvents", () => {
     });
     expect(fallback).toHaveLength(1);
     expect(fallback[0]).toMatchObject({ kind: "assistant", text: "All done.", fromResponse: true });
+
+    const linkedFallback = composeWorkbenchItems([], {
+      prompt: null,
+      boundaryEventId: boundary,
+      responseText: "Supported [claim:clm_abc]",
+      responseRunId: "run_confirmed",
+    });
+    expect(linkedFallback[0]).toMatchObject({ kind: "assistant", runId: "run_confirmed" });
   });
 
   it("discovers the active run from turn.started/user.message run_ids and excludes terminal runs", () => {

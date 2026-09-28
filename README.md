@@ -63,6 +63,8 @@ Workers can also share an internal Provider Gateway for ordered health-aware rou
 provider admission, and circuit breaking without moving retry or cost authority out of the Runtime.
 Run outputs can be published to a content-addressed Artifact Store backed by local storage or the
 deployment's internal MinIO service, with PostgreSQL metadata and authenticated Console downloads.
+Runs can also record opt-in evidence-backed Claims over Tool executions, Artifacts, Code locations,
+and Trace spans, then inspect citation markers and provenance in the Console.
 
 ## Features
 
@@ -91,6 +93,7 @@ deployment's internal MinIO service, with PostgreSQL metadata and authenticated 
 | Execution Isolation | Routes approved Shell calls through Local/Restricted backends or an optional Docker-backed per-Run Sandbox with no network, a read-only rootfs, and resource limits. | Cross-platform local tests plus optional real-Docker security validation |
 | Provider Gateway | Shares provider concurrency, RPM admission, circuit state, and ordered pre-attempt fallback across distributed Workers while preserving Runtime retry and budget authority. | Offline fake-provider and two-client gateway integration tested |
 | Artifact Store | Publishes workspace files as immutable SHA-256 Blobs with distinct Run/Tool Artifact records, Local or MinIO storage, cross-Run Blob deduplication, and authenticated Run Inspector downloads. | Local contract, API, PostgreSQL, and optional MinIO integration tested |
+| Claim Provenance | Records durable Claims linked to bounded Tool, Artifact, Code, and Trace evidence with Run-lineage validation, citation markers, integrity checks, API reads, and a Console Claims view. | SQLite, API, Runtime, Completion, and Console contracts tested |
 | Streaming | Parses OpenAI-compatible streaming events and renders incremental output. | Partially tested |
 | REPL | Interactive prompt-toolkit entrypoint and slash commands. | Not fully verified |
 
@@ -109,6 +112,7 @@ flowchart TD
     E --> H["Skills"]
     E --> I["MCP"]
     E --> J["Code Context"]
+    C --> K["Claim Provenance"]
 ```
 
 Key modules:
@@ -125,6 +129,7 @@ Key modules:
 - `src/axiom/snapshot/`: workspace snapshot service.
 - `src/axiom/runtime/`: local Runtime API, Run/checkpoint model, shared ReAct/Plan/Multi-Agent execution strategies, tool execution records, and durable task store.
 - `src/axiom/artifacts/`: content-addressed Blob storage, durable Artifact metadata, explicit reuse primitives, and the `publish_artifact` Tool. See [`docs/artifacts.md`](docs/artifacts.md).
+- `src/axiom/provenance/`: durable Claim/Evidence storage, source resolution, citation parsing, and the opt-in `record_claim` Tool. See [`docs/provenance.md`](docs/provenance.md).
 - `src/axiom/runtime/supervisor.py`: process-local ExecutionHandle registry and cross-thread cancellation bridge; it is not a recovery database.
 - `src/axiom/rl/`: trajectory construction, deterministic reward, rollout export, and the
   Agent Lightning v1 compatibility boundary. See [`docs/agentic-rl.md`](docs/agentic-rl.md).

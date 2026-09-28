@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ArrowDown, ChevronRight, Loader2 } from "lucide-react";
+import { Link } from "@tanstack/react-router";
 import type { WorkbenchItem } from "../../lib/workbench-projection";
 import { replayStatusLabel, type ReplayStatus } from "../../lib/events-view";
 import { formatDurationMs, formatEventTime } from "../../lib/format";
@@ -90,6 +91,33 @@ const LIFECYCLE_TONE: Record<string, string> = {
   warn: "text-warn",
 };
 
+const CLAIM_CITATION = /(\[claim:(clm_[A-Za-z0-9]+)\])/g;
+
+function AssistantText({ text, runId }: { text: string; runId: string | null }) {
+  const parts = text.split(CLAIM_CITATION);
+  return (
+    <>
+      {parts.map((part, index) => {
+        if (index % 3 === 2) return null;
+        if (index % 3 !== 1) return part;
+        const claimId = parts[index + 1];
+        if (runId === null || claimId === undefined) return part;
+        return (
+          <Link
+            key={`${claimId}-${index}`}
+            to="/runs/$runId"
+            params={{ runId }}
+            search={{ claim: claimId }}
+            className="font-mono text-info underline decoration-info/40 underline-offset-2 hover:text-fg-0"
+          >
+            {part}
+          </Link>
+        );
+      })}
+    </>
+  );
+}
+
 function FeedRow({ item }: { item: WorkbenchItem }) {
   switch (item.kind) {
     case "user":
@@ -124,7 +152,7 @@ function FeedRow({ item }: { item: WorkbenchItem }) {
             <Timestamp iso={item.timestamp} />
           </div>
           <div className="mt-0.5 text-13 break-words whitespace-pre-wrap text-fg-1">
-            {item.text}
+            <AssistantText text={item.text} runId={item.runId} />
           </div>
         </div>
       );

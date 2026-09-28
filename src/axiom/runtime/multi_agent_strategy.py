@@ -1111,11 +1111,7 @@ class MultiAgentExecutionStrategy:
                     if gateway_wait_ms is not None
                     else {}
                 ),
-                **(
-                    {"provider.circuit_state": circuit_state}
-                    if circuit_state is not None
-                    else {}
-                ),
+                **({"provider.circuit_state": circuit_state} if circuit_state is not None else {}),
                 **context_attributes,
             },
         )
@@ -1157,6 +1153,8 @@ class MultiAgentExecutionStrategy:
             context_manager=runtime.context_manager,
             budget_manager=runtime.budget_manager,
             ownership=runtime.ownership,
+            artifact_service=runtime.artifact_service,
+            provenance_service=runtime.provenance_service,
             max_turns=self.child_max_turns,
         )
 

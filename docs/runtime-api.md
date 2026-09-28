@@ -28,6 +28,9 @@ GET /v1/runs/{run_id}/children
 GET /v1/runs/{run_id}/interrupts
 GET /v1/runs/{run_id}/trace
 GET /v1/runs/{run_id}/metrics
+GET /v1/runs/{run_id}/claims
+GET /v1/claims/{claim_id}
+GET /v1/claims/{claim_id}/provenance
 GET /v1/runtime/active-runs
 ```
 
@@ -50,6 +53,11 @@ returns safe identity, strategy, registration, owner-thread, Task completion, an
 flag fields. It does not expose checkpoint bodies, messages, prompts, Tool arguments, event-loop
 or Task representations, or environment data. A durable non-terminal Run is not guaranteed to
 appear: waiting Runs and `RUNNING` checkpoints from an earlier process normally have no handle.
+
+Claim endpoints are authenticated read projections. A Claim list exposes bounded text, citation,
+evidence count, and aggregate integrity. The provenance endpoint resolves source-specific bounded
+locators without returning Tool result bodies, Artifact bytes, or arbitrary Span attributes. Claim
+creation is available only through the durable `record_claim` Tool; there is no HTTP mutation API.
 
 ## Control operations and idempotency
 

@@ -46,11 +46,15 @@ export interface RunDetailSearch {
   span?: string;
   /** Selected event id (persisted event feed). Mutually exclusive with span. */
   event?: number;
+  /** Selected durable Claim shown in the Claims tab. */
+  claim?: string;
 }
 
 export function parseRunDetailSearch(search: Record<string, unknown>): RunDetailSearch {
   const span = search.span;
   if (typeof span === "string" && span !== "") return { span };
+  const claim = search.claim;
+  if (typeof claim === "string" && /^clm_[A-Za-z0-9]+$/.test(claim)) return { claim };
   const event = search.event;
   if (typeof event === "number" && Number.isInteger(event) && event >= 0) return { event };
   // Tolerate stringified event ids from hand-edited URLs.

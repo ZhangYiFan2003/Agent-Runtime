@@ -33,6 +33,7 @@ export type WorkbenchItem =
       eventId: number | null;
       timestamp: string | null;
       text: string;
+      runId: string | null;
       /** True when the text came from the turn-POST response, not an event. */
       fromResponse: boolean;
     }
@@ -221,6 +222,7 @@ export function projectWorkbenchEvents(events: RuntimeEvent[]): WorkbenchItem[] 
         eventId: event.eventId,
         timestamp: event.timestamp,
         text,
+        runId: event.runId,
         fromResponse: false,
       });
       continue;
@@ -352,6 +354,8 @@ export interface PendingSubmissionView {
   /** Assistant text from a completed turn-POST 200 (fallback when the
    *  assistant.message event has not arrived). */
   responseText: string | null;
+  /** Run confirmed by the turn response, used to link fallback citations. */
+  responseRunId?: string | null;
 }
 
 /** True when a real user.message event covers the pending local echo. */
@@ -416,6 +420,7 @@ export function composeWorkbenchItems(
       eventId: null,
       timestamp: null,
       text: pending.responseText,
+      runId: pending.responseRunId ?? null,
       fromResponse: true,
     });
   }

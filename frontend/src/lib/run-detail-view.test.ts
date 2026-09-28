@@ -68,6 +68,13 @@ describe("parseRunDetailSearch", () => {
     expect(parseRunDetailSearch({ span: "span_1", event: 42 })).toEqual({ span: "span_1" });
     expect(parseRunDetailSearch({ event: 42, span: "" })).toEqual({ event: 42 });
   });
+
+  it("accepts only well-formed Claim selections", () => {
+    expect(parseRunDetailSearch({ claim: "clm_abc123" })).toEqual({ claim: "clm_abc123" });
+    expect(parseRunDetailSearch({ claim: "not-a-claim" })).toEqual({});
+    expect(parseRunDetailSearch({ claim: ["clm_abc"] })).toEqual({});
+    expect(parseRunDetailSearch({ claim: "clm_abc", event: 42 })).toEqual({ claim: "clm_abc" });
+  });
 });
 
 describe("deriveRunActions", () => {

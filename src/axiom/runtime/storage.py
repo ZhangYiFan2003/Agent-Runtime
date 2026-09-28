@@ -9,6 +9,11 @@ from axiom.artifacts import (
     SQLiteArtifactMetadataStore,
 )
 from axiom.config import StorageConfig
+from axiom.provenance import (
+    PostgresProvenanceStore,
+    ProvenanceStore,
+    SQLiteProvenanceStore,
+)
 from axiom.runtime.checkpoints import RuntimeStore, SQLiteCheckpointStore
 from axiom.runtime.control_plane import ControlOperationStore, SQLiteControlOperationStore
 from axiom.runtime.events import EventRepository, ThreadEventRepository
@@ -23,6 +28,7 @@ class DurableStorage:
     events: EventRepository
     controls: ControlOperationStore
     artifacts: ArtifactMetadataStore
+    provenance: ProvenanceStore
     _close: object | None = None
 
     def close(self) -> None:
@@ -38,15 +44,18 @@ def create_durable_storage(
 ) -> DurableStorage:
     backend = config.backend.strip().lower()
     if backend == "sqlite":
-        path = Path(config.sqlite_path).expanduser() if config.sqlite_path else Path(
-            default_sqlite_path
-        ).expanduser()
+        path = (
+            Path(config.sqlite_path).expanduser()
+            if config.sqlite_path
+            else Path(default_sqlite_path).expanduser()
+        )
         return DurableStorage(
             backend="sqlite",
             runtime=SQLiteCheckpointStore(path),
             events=ThreadEventRepository(path),
             controls=SQLiteControlOperationStore(path),
             artifacts=SQLiteArtifactMetadataStore(path),
+            provenance=SQLiteProvenanceStore(path),
         )
     if backend == "postgres":
         from axiom.runtime.postgres import (
@@ -74,6 +83,7 @@ def create_durable_storage(
             events=PostgresEventRepository(pool),
             controls=PostgresControlOperationStore(pool),
             artifacts=PostgresArtifactMetadataStore(pool),
+            provenance=PostgresProvenanceStore(pool),
             _close=pool,
         )
     raise ValueError(f"unsupported storage backend: {config.backend}")

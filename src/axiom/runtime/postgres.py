@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from axiom.artifacts.metadata import postgres_artifact_schema
+from axiom.provenance import postgres_provenance_schema
 from axiom.runtime.capacity import AdmissionRejectedError, CapacitySnapshot
 from axiom.runtime.checkpoints import BudgetLedgerConflictError, CheckpointConflictError
 from axiom.runtime.control_plane import (
@@ -28,7 +29,7 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.ownership import OwnershipLostError, RunOwnership
 
-POSTGRES_SCHEMA_VERSION = 7
+POSTGRES_SCHEMA_VERSION = 8
 RUN_DELIVERY_EXHAUSTED = "RUN_DELIVERY_EXHAUSTED"
 
 
@@ -107,15 +108,15 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()
         version = int(row[0]) if row else POSTGRES_SCHEMA_VERSION
-        if version not in {1, 2, 3, 4, 5, 6, POSTGRES_SCHEMA_VERSION}:
-            raise PostgresSchemaError(
-                f"unsupported PostgreSQL runtime schema version: {version}"
-            )
+        if version not in {1, 2, 3, 4, 5, 6, 7, POSTGRES_SCHEMA_VERSION}:
+            raise PostgresSchemaError(f"unsupported PostgreSQL runtime schema version: {version}")
         for statement in _SCHEMA_STATEMENTS:
             conn.execute(statement)
         for statement in _OWNERSHIP_MIGRATION_STATEMENTS:
             conn.execute(statement)
         for statement in postgres_artifact_schema():
+            conn.execute(statement)
+        for statement in postgres_provenance_schema():
             conn.execute(statement)
         conn.execute(
             """
@@ -174,9 +175,7 @@ class PostgresRuntimeStore:
     async def requeue_delivery_exhausted(self, run_id: str) -> Checkpoint:
         return await asyncio.to_thread(self._requeue_delivery_exhausted, run_id)
 
-    async def save(
-        self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None
-    ) -> None:
+    async def save(self, checkpoint: Checkpoint, *, ownership: RunOwnership | None = None) -> None:
         await asyncio.to_thread(self._save, checkpoint, ownership)
 
     async def load(self, run_id: str) -> Checkpoint | None:
@@ -263,9 +262,7 @@ class PostgresRuntimeStore:
         _require_positive_lease(lease_seconds)
         return await asyncio.to_thread(self._renew_lease, ownership, lease_seconds)
 
-    async def release_lease(
-        self, ownership: RunOwnership, *, runnable: bool = True
-    ) -> bool:
+    async def release_lease(self, ownership: RunOwnership, *, runnable: bool = True) -> bool:
         return await asyncio.to_thread(self._release_lease, ownership, runnable)
 
     async def get_ownership(self, run_id: str) -> RunOwnership | None:
@@ -280,9 +277,7 @@ class PostgresRuntimeStore:
         max_queued_runs: int | None = None,
         max_active_runs: int | None = None,
     ) -> CapacitySnapshot:
-        return await asyncio.to_thread(
-            self._capacity_snapshot, max_queued_runs, max_active_runs
-        )
+        return await asyncio.to_thread(self._capacity_snapshot, max_queued_runs, max_active_runs)
 
     async def consume_submission_tokens(
         self,
@@ -322,9 +317,7 @@ class PostgresRuntimeStore:
             queued = _queued_count(conn)
             if max_queued_runs is not None and queued >= max_queued_runs:
                 self._admission_rejections += 1
-                raise AdmissionRejectedError(
-                    queued_runs=queued, max_queued_runs=max_queued_runs
-                )
+                raise AdmissionRejectedError(queued_runs=queued, max_queued_runs=max_queued_runs)
             _check_principal_queue_quota(
                 conn, checkpoint.principal_key, max_queued_runs_per_principal
             )
@@ -376,9 +369,7 @@ class PostgresRuntimeStore:
             queued = _queued_count(conn)
             if max_queued_runs is not None and queued >= max_queued_runs:
                 self._admission_rejections += 1
-                raise AdmissionRejectedError(
-                    queued_runs=queued, max_queued_runs=max_queued_runs
-                )
+                raise AdmissionRejectedError(queued_runs=queued, max_queued_runs=max_queued_runs)
             _check_principal_queue_quota(
                 conn, checkpoint.principal_key, max_queued_runs_per_principal
             )
@@ -728,9 +719,7 @@ class PostgresRuntimeStore:
                     ),
                 ).fetchone()
             if row is None:
-                raise BudgetLedgerConflictError(
-                    f"stale budget ledger for {record.owner_run_id}"
-                )
+                raise BudgetLedgerConflictError(f"stale budget ledger for {record.owner_run_id}")
         record.version += 1
 
     def _mark_runnable(self, run_id: str) -> None:
@@ -778,7 +767,7 @@ class PostgresRuntimeStore:
                 where candidate.run_id = %s and {_RUN_IS_CLAIMABLE}
                   and (%s::integer is null or (
                     select count(*) from runs as active
-                    where {_RUN_IS_ACTIVE.replace('candidate.', 'active.')}
+                    where {_RUN_IS_ACTIVE.replace("candidate.", "active.")}
                       and active.state_json ->> 'principal_key'
                           = candidate.state_json ->> 'principal_key'
                   ) < %s::integer)
@@ -827,7 +816,7 @@ class PostgresRuntimeStore:
                 where {_RUN_IS_CLAIMABLE}
                   and (%s::integer is null or (
                     select count(*) from runs as active
-                    where {_RUN_IS_ACTIVE.replace('candidate.', 'active.')}
+                    where {_RUN_IS_ACTIVE.replace("candidate.", "active.")}
                       and active.state_json ->> 'principal_key'
                           = candidate.state_json ->> 'principal_key'
                   ) < %s::integer)
@@ -847,8 +836,12 @@ class PostgresRuntimeStore:
                 for update skip locked
                 limit 1
                 """,
-                (max_active_runs_per_principal, max_active_runs_per_principal,
-                 aging_boost_cap, aging_interval_seconds),
+                (
+                    max_active_runs_per_principal,
+                    max_active_runs_per_principal,
+                    aging_boost_cap,
+                    aging_interval_seconds,
+                ),
             ).fetchone()
             if _delivery_is_exhausted(candidate, max_run_delivery_attempts):
                 _mark_delivery_exhausted(
@@ -881,11 +874,7 @@ class PostgresRuntimeStore:
         delivery_attempt = int(candidate[2])
         takeover = previous_worker_id is not None
         next_attempt = (
-            delivery_attempt + 1
-            if takeover
-            else 1
-            if delivery_attempt == 0
-            else delivery_attempt
+            delivery_attempt + 1 if takeover else 1 if delivery_attempt == 0 else delivery_attempt
         )
         row = conn.execute(
             """
@@ -955,9 +944,7 @@ class PostgresRuntimeStore:
             manual_requeues=self._manual_requeues,
         )
 
-    def _renew_lease(
-        self, ownership: RunOwnership, lease_seconds: float
-    ) -> RunOwnership | None:
+    def _renew_lease(self, ownership: RunOwnership, lease_seconds: float) -> RunOwnership | None:
         with self.pool.connection() as conn:
             row = conn.execute(
                 """
@@ -1048,9 +1035,7 @@ class PostgresEventRepository:
     def create_thread(self) -> str:
         thread_id = f"thread_{uuid4().hex}"
         with self.pool.connection() as conn:
-            conn.execute(
-                "insert into threads(id, created_at) values (%s, %s)", (thread_id, _now())
-            )
+            conn.execute("insert into threads(id, created_at) values (%s, %s)", (thread_id, _now()))
         self.append_event(thread_id, "thread.created", {"id": thread_id})
         return thread_id
 
@@ -1471,9 +1456,7 @@ def _mark_delivery_exhausted(
         ),
     ).fetchone()
     if row is None:
-        raise CheckpointConflictError(
-            f"stale delivery exhaustion transition for {state.run_id}"
-        )
+        raise CheckpointConflictError(f"stale delivery exhaustion transition for {state.run_id}")
     conn.execute(
         """
         insert into checkpoints(
@@ -1534,16 +1517,12 @@ def _lock_capacity_coordination(conn) -> None:
 
 
 def _queued_count(conn) -> int:
-    row = conn.execute(
-        f"select count(*) from runs as candidate where {_RUN_IS_QUEUED}"
-    ).fetchone()
+    row = conn.execute(f"select count(*) from runs as candidate where {_RUN_IS_QUEUED}").fetchone()
     return int(row[0])
 
 
 def _active_count(conn) -> int:
-    row = conn.execute(
-        f"select count(*) from runs as candidate where {_RUN_IS_ACTIVE}"
-    ).fetchone()
+    row = conn.execute(f"select count(*) from runs as candidate where {_RUN_IS_ACTIVE}").fetchone()
     return int(row[0])
 
 

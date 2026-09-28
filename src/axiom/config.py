@@ -231,6 +231,18 @@ class ArtifactConfig:
 
 
 @dataclass(slots=True)
+class ProvenanceConfig:
+    enabled: bool = False
+    prompt_guidance_enabled: bool = True
+    max_claim_chars: int = 4_000
+    max_summary_chars: int = 1_000
+    max_metadata_bytes: int = 16 * 1024
+    max_code_lines: int = 60
+    max_excerpt_chars: int = 8_000
+    max_evidence_per_claim: int = 16
+
+
+@dataclass(slots=True)
 class WorkerConfig:
     """Optional PostgreSQL distributed ownership Worker settings."""
 
@@ -338,6 +350,7 @@ class AxiomConfig:
     dependency: DependencyConfig = field(default_factory=DependencyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
+    provenance: ProvenanceConfig = field(default_factory=ProvenanceConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     capacity: CapacityConfig = field(default_factory=CapacityConfig)
     traffic: TrafficGovernanceConfig = field(default_factory=TrafficGovernanceConfig)
@@ -402,6 +415,16 @@ def load_config(
             for value in (artifact_s3.bucket, artifact_s3.access_key, artifact_s3.secret_key)
         ):
             raise ValueError("S3 artifact storage requires bucket and credentials")
+    provenance_limits = (
+        config.provenance.max_claim_chars,
+        config.provenance.max_summary_chars,
+        config.provenance.max_metadata_bytes,
+        config.provenance.max_code_lines,
+        config.provenance.max_excerpt_chars,
+        config.provenance.max_evidence_per_claim,
+    )
+    if any(value <= 0 for value in provenance_limits):
+        raise ValueError("provenance limits must be positive")
     if config.worker.distributed_enabled and storage_backend != "postgres":
         raise ValueError("distributed Worker ownership requires storage.backend=postgres")
     if config.worker.distributed_enabled and (
@@ -505,10 +528,7 @@ def load_config(
                 or target.max_concurrency <= 0
                 or target.max_pending < 0
                 or target.admission_timeout_seconds < 0
-                or (
-                    target.requests_per_minute is not None
-                    and target.requests_per_minute <= 0
-                )
+                or (target.requests_per_minute is not None and target.requests_per_minute <= 0)
                 or target.failure_threshold <= 0
                 or target.open_seconds <= 0
                 or target.half_open_max_probes <= 0
@@ -587,6 +607,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     progress = result.setdefault("progress", {})
     storage = result.setdefault("storage", {})
     artifacts = result.setdefault("artifacts", {})
+    provenance = result.setdefault("provenance", {})
     worker = result.setdefault("worker", {})
     capacity = result.setdefault("capacity", {})
     traffic = result.setdefault("traffic", {})
@@ -619,6 +640,29 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 artifacts[config_key] = caster(raw)
+    provenance_mappings: list[tuple[str, str, Any]] = [
+        ("AXIOM_PROVENANCE_ENABLED", "enabled", _as_bool),
+        (
+            "AXIOM_PROVENANCE_PROMPT_GUIDANCE_ENABLED",
+            "prompt_guidance_enabled",
+            _as_bool,
+        ),
+        ("AXIOM_PROVENANCE_MAX_CLAIM_CHARS", "max_claim_chars", int),
+        ("AXIOM_PROVENANCE_MAX_SUMMARY_CHARS", "max_summary_chars", int),
+        ("AXIOM_PROVENANCE_MAX_METADATA_BYTES", "max_metadata_bytes", int),
+        ("AXIOM_PROVENANCE_MAX_CODE_LINES", "max_code_lines", int),
+        ("AXIOM_PROVENANCE_MAX_EXCERPT_CHARS", "max_excerpt_chars", int),
+        (
+            "AXIOM_PROVENANCE_MAX_EVIDENCE_PER_CLAIM",
+            "max_evidence_per_claim",
+            int,
+        ),
+    ]
+    for env_key, config_key, caster in provenance_mappings:
+        raw = env.get(env_key)
+        if raw not in (None, ""):
+            with suppress(TypeError, ValueError):
+                provenance[config_key] = caster(raw)
     artifact_s3 = artifacts.setdefault("s3", {})
     artifact_s3_mappings: list[tuple[str, str, Any]] = [
         ("AXIOM_ARTIFACT_S3_ENDPOINT", "endpoint", str),
@@ -912,6 +956,7 @@ def _dict_to_config(data: dict[str, Any]) -> AxiomConfig:
         dependency=DependencyConfig(**data.get("dependency", {})),
         storage=StorageConfig(**data.get("storage", {})),
         artifacts=ArtifactConfig(**artifact_data),
+        provenance=ProvenanceConfig(**data.get("provenance", {})),
         worker=WorkerConfig(**data.get("worker", {})),
         capacity=CapacityConfig(**data.get("capacity", {})),
         progress=ProgressConfig(**data.get("progress", {})),

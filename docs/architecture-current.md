@@ -970,6 +970,32 @@ ToolExecution idempotency and from automatic Blob deduplication. No existing Too
 cacheable, and the Code Intelligence embedding cache remains independent. See
 [`docs/artifacts.md`](artifacts.md).
 
+### Claim provenance
+
+The optional provenance layer records one atomic `Claim -> Evidence -> Runtime Source` bundle. The
+supported Runtime sources are durable Tool executions, Artifacts, workspace Code locations, and
+Trace spans. Evidence carries only bounded locators, summaries, and digests; Tool results, Artifact
+bytes, and arbitrary Span attributes stay in their existing authorities.
+
+```text
+Assistant Output
+   └─ [claim:clm_...]
+         └─ ClaimRecord
+              └─ ClaimEvidenceLink
+                   └─ EvidenceRecord
+                        ├─ ToolExecution
+                        ├─ ArtifactRecord -> Blob SHA-256
+                        ├─ Code snapshot
+                        └─ Trace Span
+```
+
+Claims may cite their own Run or descendant Runs in the same Thread. Persisted Run lineage is the
+authorization boundary, and unrelated sources fail before commit. SQLite and PostgreSQL implement
+the same metadata contract. The opt-in `record_claim` Tool is idempotent by durable invocation ID;
+authenticated APIs and the Web Console are read-only projections. Optional CompletionVerifier
+checks validate structural evidence and citation resolution without introducing a semantic judge.
+See [`docs/provenance.md`](provenance.md).
+
 ## 12. No-Progress / Loop Degeneration Detection
 
 `max_steps` bounds how long a Run may work; it cannot tell whether that work remains useful. The

@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from axiom.artifacts import ArtifactService
 from axiom.config import AxiomConfig
@@ -97,6 +97,26 @@ from axiom.tools.base import Tool, ToolContext, ToolResult
 from axiom.tools.executor import ToolExecutor
 from axiom.tools.registry import ToolRegistry
 from axiom.types import Message
+
+if TYPE_CHECKING:
+    from axiom.provenance import ProvenanceService
+
+
+_PROVENANCE_GUIDANCE = (
+    "For material factual conclusions supported by Runtime evidence, use record_claim and "
+    "include its returned [claim:...] citation marker. Never fabricate Claim or evidence IDs."
+)
+
+
+def _system_prompt_with_provenance(system_prompt: str, config: AxiomConfig) -> str:
+    if (
+        not config.provenance.enabled
+        or not config.provenance.prompt_guidance_enabled
+        or _PROVENANCE_GUIDANCE in system_prompt
+    ):
+        return system_prompt
+    return f"{system_prompt}\n\n{_PROVENANCE_GUIDANCE}"
+
 
 EventSink = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 StepExecutor = Callable[[StepContext], Awaitable[StepResult]]
@@ -185,11 +205,12 @@ class DurableAgentRuntime:
         retry_sleep: Callable[[float], Awaitable[None]] | None = None,
         ownership: RunOwnership | None = None,
         artifact_service: ArtifactService | None = None,
+        provenance_service: ProvenanceService | None = None,
         max_turns: int = 20,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
-        self.system_prompt = system_prompt
+        self.system_prompt = _system_prompt_with_provenance(system_prompt, config)
         self.cwd = cwd
         self.config = config
         self.store = store
@@ -199,6 +220,7 @@ class DurableAgentRuntime:
         self.retry_sleep = retry_sleep or asyncio.sleep
         self.ownership = ownership
         self.artifact_service = artifact_service
+        self.provenance_service = provenance_service
         self.event_sink = event_sink
         self.tracer = tracer
         self.permission_policy = permission_policy or DefaultPermissionPolicy(
@@ -440,9 +462,7 @@ class DurableAgentRuntime:
 
         return await self._supervise(state, execute)
 
-    async def queue_resume(
-        self, run_id: str, *, decision: str | None = None
-    ) -> Checkpoint:
+    async def queue_resume(self, run_id: str, *, decision: str | None = None) -> Checkpoint:
         """Persist a control transition and requeue it for capacity-gated execution."""
         mark_runnable = getattr(self.store, "mark_runnable", None)
         if mark_runnable is None or getattr(self.store, "backend", None) != "postgres":
@@ -843,9 +863,7 @@ class DurableAgentRuntime:
             proposed_action = NextAction.COMPLETE
         elif state.pending_tool_calls and state.next_tool_index < len(state.pending_tool_calls):
             call = state.pending_tool_calls[state.next_tool_index]
-            tool_call_id = str(
-                call.get("id") or f"call_{state.agent_turn}_{state.next_tool_index}"
-            )
+            tool_call_id = str(call.get("id") or f"call_{state.agent_turn}_{state.next_tool_index}")
             invocation_ids = (f"{state.run_id}:{tool_call_id}",)
             state = await self._execute_pending_tool(state)
         elif state.agent_turn >= self.max_turns:
@@ -1015,11 +1033,7 @@ class DurableAgentRuntime:
                 attributes={
                     "provider": self.llm_client.provider_name,
                     "model": self.llm_client.model_name,
-                    **(
-                        {"llm.route": llm_route}
-                        if llm_route
-                        else {}
-                    ),
+                    **({"llm.route": llm_route} if llm_route else {}),
                     "temperature": self.config.llm.temperature,
                     "retry_count": attempt - 1,
                 },
@@ -1032,11 +1046,7 @@ class DurableAgentRuntime:
                     "span_id": _span_id(llm_span),
                     "provider": self.llm_client.provider_name,
                     "model": self.llm_client.model_name,
-                    **(
-                        {"route": llm_route}
-                        if llm_route
-                        else {}
-                    ),
+                    **({"route": llm_route} if llm_route else {}),
                     "attempt": attempt,
                 },
             )
@@ -1457,6 +1467,7 @@ class DurableAgentRuntime:
             store=self.store,
             cwd=self.cwd,
             attempt=attempt,
+            provenance_service=self.provenance_service,
         )
         state.completion_verification = result.to_dict()
         attributes: dict[str, object] = {
@@ -1746,13 +1757,18 @@ class DurableAgentRuntime:
 
         retry_safety = self._tool_retry_safety(tool)
 
-        if existing and existing.status in {
-            ToolExecutionStatus.FAILED,
-            ToolExecutionStatus.UNKNOWN,
-        } and (
-            existing.retry_state
-            in {ToolRetryState.RETRY_SUPPRESSED, ToolRetryState.RETRY_EXHAUSTED}
-            or existing.attempt >= self.retry_policy.max_attempts
+        if (
+            existing
+            and existing.status
+            in {
+                ToolExecutionStatus.FAILED,
+                ToolExecutionStatus.UNKNOWN,
+            }
+            and (
+                existing.retry_state
+                in {ToolRetryState.RETRY_SUPPRESSED, ToolRetryState.RETRY_EXHAUSTED}
+                or existing.attempt >= self.retry_policy.max_attempts
+            )
         ):
             tool_span = await self._start_tool_span(
                 invocation_id,
@@ -1781,9 +1797,7 @@ class DurableAgentRuntime:
                         "failure_category": existing.last_failure_category,
                         "error_code": existing.last_error_code,
                         "retry_exhausted": existing.retry_exhausted,
-                        "unsafe_retry_suppressed": (
-                            existing.retry_suppressed_reason == "unsafe"
-                        ),
+                        "unsafe_retry_suppressed": (existing.retry_suppressed_reason == "unsafe"),
                     },
                 ),
                 reused=True,
@@ -2020,6 +2034,7 @@ class DurableAgentRuntime:
                 preauthorized_invocation_id=invocation_id,
                 execution_backend=self.execution_backend,
                 artifact_service=self.artifact_service,
+                provenance_service=self.provenance_service,
             )
             try:
                 remaining = await self.budget_manager.ensure_wall_time(state)
@@ -2047,9 +2062,7 @@ class DurableAgentRuntime:
             except asyncio.CancelledError:
                 unsafe_outcome = retry_safety == RetrySafety.UNSAFE
                 record.status = (
-                    ToolExecutionStatus.UNKNOWN
-                    if unsafe_outcome
-                    else ToolExecutionStatus.FAILED
+                    ToolExecutionStatus.UNKNOWN if unsafe_outcome else ToolExecutionStatus.FAILED
                 )
                 record.is_error = True
                 record.error = "tool execution cancelled"
@@ -2099,6 +2112,18 @@ class DurableAgentRuntime:
                 record.retry_suppressed_reason = None
                 record.next_retry_at = None
                 await self._save_tool_execution(record)
+                claim_id = result.metadata.get("claim_id")
+                if isinstance(claim_id, str) and claim_id:
+                    await self._emit(
+                        "claim.recorded",
+                        {
+                            "run_id": state.run_id,
+                            "invocation_id": invocation_id,
+                            "claim_id": claim_id,
+                            "evidence_count": result.metadata.get("evidence_count", 0),
+                            "citation_marker": result.metadata.get("citation_marker"),
+                        },
+                    )
                 for artifact_id in record.artifact_ids:
                     artifact = (
                         self.artifact_service.get(artifact_id)
@@ -2132,9 +2157,7 @@ class DurableAgentRuntime:
                         "retry_count": max(0, record.attempt - 1),
                         "dependency.retry_attempt": record.attempt,
                         "dependency.retry_count": max(0, record.attempt - 1),
-                        "dependency.backoff_ms": round(
-                            record.retry_backoff_seconds * 1000, 3
-                        ),
+                        "dependency.backoff_ms": round(record.retry_backoff_seconds * 1000, 3),
                         **result.metadata,
                     },
                 )
@@ -2225,9 +2248,7 @@ class DurableAgentRuntime:
                         "attempt": record.attempt,
                         "retry_count": max(0, record.attempt - 1),
                         "error": result.content,
-                        "dependency.backoff_ms": round(
-                            record.retry_backoff_seconds * 1000, 3
-                        ),
+                        "dependency.backoff_ms": round(record.retry_backoff_seconds * 1000, 3),
                         **result.metadata,
                     },
                 )

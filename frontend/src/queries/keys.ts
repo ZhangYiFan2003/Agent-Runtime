@@ -8,4 +8,6 @@ export const queryKeys = {
   trace: (runId: string) => ["runs", runId, "trace"] as const,
   metrics: (runId: string) => ["runs", runId, "metrics"] as const,
   artifacts: (runId: string) => ["runs", runId, "artifacts"] as const,
+  claims: (runId: string) => ["runs", runId, "claims"] as const,
+  claimProvenance: (claimId: string) => ["claims", claimId, "provenance"] as const,
 };

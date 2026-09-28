@@ -9,6 +9,7 @@ from axiom.plan import ExecutionPlan, TaskStatus
 from axiom.runtime.models import RunStatus, ToolExecutionRecord, ToolExecutionStatus
 
 if TYPE_CHECKING:
+    from axiom.provenance import ProvenanceService
     from axiom.runtime.checkpoints import RuntimeStore
     from axiom.runtime.models import Checkpoint
 
@@ -139,9 +140,7 @@ class CompletionVerificationResult:
 
     @property
     def failed_check_ids(self) -> tuple[str, ...]:
-        return tuple(
-            item.check_id for item in self.checks if item.required and not item.passed
-        )
+        return tuple(item.check_id for item in self.checks if item.required and not item.passed)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -180,6 +179,7 @@ class CompletionVerifier:
         cwd: str,
         attempt: int,
         candidate_status: RunStatus = RunStatus.COMPLETED,
+        provenance_service: ProvenanceService | None = None,
     ) -> CompletionVerificationResult:
         if not contract.checks:
             return CompletionVerificationResult(
@@ -191,9 +191,7 @@ class CompletionVerifier:
                 check.type in {"required_tools", "forbidden_tools", "successful_tool"}
                 for check in contract.checks
             )
-            records = (
-                await store.list_tool_executions(state.run_id) if needs_tool_evidence else []
-            )
+            records = await store.list_tool_executions(state.run_id) if needs_tool_evidence else []
             collected: list[CompletionCheckResult] = []
             for check in contract.checks:
                 collected.append(
@@ -204,6 +202,7 @@ class CompletionVerifier:
                         store=store,
                         cwd=cwd,
                         candidate_status=candidate_status,
+                        provenance_service=provenance_service,
                     )
                 )
             results = tuple(collected)
@@ -233,6 +232,7 @@ class CompletionVerifier:
         store: RuntimeStore,
         cwd: str,
         candidate_status: RunStatus,
+        provenance_service: ProvenanceService | None,
     ) -> CompletionCheckResult:
         config = check.config
         if check.type == "run_status":
@@ -251,9 +251,7 @@ class CompletionVerifier:
             missing = sorted(required - used)
             passed = not missing
             reason = (
-                "required tools were used"
-                if passed
-                else f"missing tools: {', '.join(missing)}"
+                "required tools were used" if passed else f"missing tools: {', '.join(missing)}"
             )
         elif check.type == "forbidden_tools":
             forbidden = set(_strings(config.get("tools")))
@@ -312,12 +310,32 @@ class CompletionVerifier:
             missing = [path for path in paths if not _workspace_artifact_exists(cwd, path)]
             passed = not missing
             reason = (
-                "required artifacts exist"
-                if passed
-                else f"missing artifacts: {', '.join(missing)}"
+                "required artifacts exist" if passed else f"missing artifacts: {', '.join(missing)}"
             )
         elif check.type == "plan_tasks_completed":
             passed, reason = await _check_plan_tasks(state, store, _strings(config.get("task_ids")))
+        elif check.type == "claims_have_evidence":
+            if provenance_service is None:
+                passed, reason = False, "provenance is not enabled for this Runtime"
+            else:
+                min_claims = int(config.get("min_claims", 1))
+                min_evidence = int(config.get("min_evidence_per_claim", 1))
+                if min_claims <= 0 or min_evidence <= 0:
+                    raise ValueError("claim evidence minimums must be positive")
+                passed, reason = await provenance_service.claims_have_evidence(
+                    state.run_id,
+                    min_claims=min_claims,
+                    min_evidence_per_claim=min_evidence,
+                )
+        elif check.type == "claim_citations_resolve":
+            if provenance_service is None:
+                passed, reason = False, "provenance is not enabled for this Runtime"
+            else:
+                passed, reason = await provenance_service.citations_resolve(
+                    state.run_id,
+                    _candidate_output(state),
+                    require_at_least_one=bool(config.get("require_at_least_one", False)),
+                )
         else:
             raise ValueError(f"unknown completion check: {check.type}")
         return CompletionCheckResult(

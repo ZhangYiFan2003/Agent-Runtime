@@ -29,6 +29,7 @@ from axiom.config import AxiomConfig
 from axiom.llm import create_llm_client
 from axiom.memory import MemoryService, SummaryPolicy
 from axiom.policy import redact_secrets
+from axiom.provenance import ProvenanceService, ProvenanceStore, SQLiteProvenanceStore
 from axiom.runtime.capacity import AdmissionRejectedError
 from axiom.runtime.checkpoints import (
     CheckpointConflictError,
@@ -104,6 +105,8 @@ class RuntimeApiServer:
         control_operation_store: ControlOperationStore | None = None,
         artifact_metadata_store: ArtifactMetadataStore | None = None,
         artifact_service: ArtifactService | None = None,
+        provenance_store: ProvenanceStore | None = None,
+        provenance_service: ProvenanceService | None = None,
         durable_storage=None,
         observability_store: ObservabilityStore | None = None,
         retry_policy: RetryPolicy | None = None,
@@ -145,6 +148,11 @@ class RuntimeApiServer:
                 "artifacts",
                 artifact_metadata_store or SQLiteArtifactMetadataStore(runtime_db),
             )
+            provenance_repository = (
+                provenance_store
+                or getattr(self._durable_storage, "provenance", None)
+                or SQLiteProvenanceStore(runtime_db)
+            )
         else:
             if config.storage.backend.strip().lower() == "postgres" and not all(injected):
                 raise ValueError(
@@ -163,6 +171,7 @@ class RuntimeApiServer:
             }
             self.storage_backend = backends.pop() if len(backends) == 1 else "custom"
             artifact_metadata = artifact_metadata_store or SQLiteArtifactMetadataStore(runtime_db)
+            provenance_repository = provenance_store or SQLiteProvenanceStore(runtime_db)
         self.artifact_service = artifact_service or build_artifact_service(
             config=config.artifacts,
             metadata=artifact_metadata,
@@ -172,6 +181,21 @@ class RuntimeApiServer:
             self.data_dir / "runtime.db"
         )
         self.observability = ObservabilityService(self.observability_store)
+        provenance_config = config.provenance
+        self.provenance = provenance_service or ProvenanceService(
+            store=provenance_repository,
+            runtime_store=self.checkpoint_store,
+            workspace=self.cwd,
+            artifact_service=self.artifact_service,
+            observability_store=self.observability_store,
+            sensitive_path_patterns=tuple(config.policy.sensitive_path_patterns),
+            max_claim_chars=provenance_config.max_claim_chars,
+            max_summary_chars=provenance_config.max_summary_chars,
+            max_metadata_bytes=provenance_config.max_metadata_bytes,
+            max_code_lines=provenance_config.max_code_lines,
+            max_excerpt_chars=provenance_config.max_excerpt_chars,
+            max_evidence_per_claim=provenance_config.max_evidence_per_claim,
+        )
         self.retry_policy = retry_policy or RetryPolicy.from_config(config.dependency)
         self.active_run_supervisor = active_run_supervisor or ActiveRunSupervisor()
         self.shutdown_timeout = max(0.0, shutdown_timeout)
@@ -354,9 +378,7 @@ class RuntimeApiServer:
             heartbeat_interval_seconds=self.config.worker.heartbeat_interval_seconds,
             poll_interval_seconds=self.config.worker.poll_interval_seconds,
             max_active_runs=self.config.capacity.max_active_runs,
-            max_active_runs_per_principal=(
-                self.config.capacity.max_active_runs_per_principal
-            ),
+            max_active_runs_per_principal=(self.config.capacity.max_active_runs_per_principal),
             max_run_delivery_attempts=self.config.worker.max_run_delivery_attempts,
             worker_id=worker_id,
             event_sink=self._ownership_event_sink(),
@@ -425,11 +447,7 @@ class RuntimeApiServer:
                         else {}
                     ),
                     **({"capacity": capacity} if capacity is not None else {}),
-                    **(
-                        {"distributed_runtime": distributed}
-                        if distributed is not None
-                        else {}
-                    ),
+                    **({"distributed_runtime": distributed} if distributed is not None else {}),
                 },
             )
             return
@@ -454,8 +472,7 @@ class RuntimeApiServer:
                 submission_key = _idempotency_key(request, body)
                 idempotent_submission = submission_key is not None
                 if idempotent_submission and not (
-                    self.storage_backend == "postgres"
-                    and self.config.worker.distributed_enabled
+                    self.storage_backend == "postgres" and self.config.worker.distributed_enabled
                 ):
                     raise ApiError(
                         "submission_idempotency_requires_postgres",
@@ -571,9 +588,7 @@ class RuntimeApiServer:
                         ],
                     },
                 )
-            elif method == "GET" and path.startswith("/v1/runs/") and path.endswith(
-                "/artifacts"
-            ):
+            elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/artifacts"):
                 run_id = path.split("/")[3]
                 state = asyncio.run(self.checkpoint_store.load(run_id))
                 if state is None:
@@ -588,6 +603,13 @@ class RuntimeApiServer:
                     200,
                     {"run_id": run_id, "artifacts": [item.public_dict() for item in artifacts]},
                 )
+            elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/claims"):
+                run_id = path.split("/")[3]
+                state = asyncio.run(self.checkpoint_store.load(run_id))
+                if state is None:
+                    raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
+                claims = asyncio.run(self.provenance.list_run_claims(run_id))
+                _send_json(request, 200, {"run_id": run_id, "claims": claims})
             elif method == "GET" and path.startswith("/v1/runs/") and path.endswith("/interrupts"):
                 run_id = path.split("/")[3]
                 state = asyncio.run(self.checkpoint_store.load(run_id))
@@ -605,8 +627,8 @@ class RuntimeApiServer:
                 if state is None:
                     raise ApiError("run_not_found", "run not found", 404, run_id=run_id)
                 _send_json(request, 200, asyncio.run(self._run_view(state)))
-            elif method == "GET" and path.startswith("/v1/artifacts/") and path.endswith(
-                "/content"
+            elif (
+                method == "GET" and path.startswith("/v1/artifacts/") and path.endswith("/content")
             ):
                 artifact_id = path.split("/")[3]
                 self._send_artifact_content(request, artifact_id)
@@ -620,6 +642,20 @@ class RuntimeApiServer:
                 if artifact is None:
                     raise ApiError("artifact_not_found", "artifact not found", 404)
                 _send_json(request, 200, artifact.public_dict())
+            elif (
+                method == "GET" and path.startswith("/v1/claims/") and path.endswith("/provenance")
+            ):
+                claim_id = path.split("/")[3]
+                provenance = asyncio.run(self.provenance.provenance(claim_id))
+                if provenance is None:
+                    raise ApiError("claim_not_found", "claim not found", 404)
+                _send_json(request, 200, provenance)
+            elif method == "GET" and path.startswith("/v1/claims/"):
+                claim_id = path.split("/")[3]
+                claim = asyncio.run(self.provenance.get_claim(claim_id))
+                if claim is None:
+                    raise ApiError("claim_not_found", "claim not found", 404)
+                _send_json(request, 200, asyncio.run(self.provenance.claim_summary(claim)))
             elif method == "POST" and path.startswith("/v1/runs/") and path.endswith("/resume"):
                 run_id = path.split("/")[3]
                 result = self._execute_control_operation(
@@ -720,9 +756,7 @@ class RuntimeApiServer:
         artifact_id: str,
     ) -> None:
         artifact = (
-            self.artifact_service.get(artifact_id)
-            if self.artifact_service is not None
-            else None
+            self.artifact_service.get(artifact_id) if self.artifact_service is not None else None
         )
         if artifact is None or self.artifact_service is None:
             raise ApiError("artifact_not_found", "artifact not found", 404)
@@ -730,12 +764,15 @@ class RuntimeApiServer:
             chunks = self.artifact_service.iter_content(artifact_id)
         except ArtifactNotFoundError as exc:
             raise ApiError("artifact_content_not_found", str(exc), 404) from exc
-        filename = "".join(
-            character
-            if character.isascii() and (character.isalnum() or character in "._-")
-            else "_"
-            for character in artifact.name
-        ) or "artifact"
+        filename = (
+            "".join(
+                character
+                if character.isascii() and (character.isalnum() or character in "._-")
+                else "_"
+                for character in artifact.name
+            )
+            or "artifact"
+        )
         request.send_response(200)
         request.send_header("content-type", artifact.media_type)
         request.send_header("content-length", str(artifact.size_bytes))
@@ -1121,9 +1158,7 @@ class RuntimeApiServer:
                     else None
                 )
                 if self.config.worker.distributed_enabled:
-                    result = asyncio.run(
-                        self._queue_distributed_resume(state, decision=decision)
-                    )
+                    result = asyncio.run(self._queue_distributed_resume(state, decision=decision))
                 else:
                     result = asyncio.run(self._resume_run(run_id, decision=decision))
             self.control_operations.complete(record.operation_id, result)
@@ -1510,6 +1545,7 @@ class RuntimeApiServer:
             active_run_supervisor=self.active_run_supervisor,
             ownership=ownership,
             artifact_service=self.artifact_service,
+            provenance_service=self.provenance if self.config.provenance.enabled else None,
         )
 
     def _runtime_event_sink(self, thread_id: str):

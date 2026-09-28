@@ -77,6 +77,11 @@ Authenticated read endpoints are:
 Content is streamed in bounded chunks through the Runtime API with a safe attachment filename. The
 browser never receives object-store credentials or a public MinIO URL.
 
+An Artifact can also be referenced by a durable Claim Evidence record. The Evidence stores the
+logical Artifact ID, Blob digest, and bounded producer metadata—not the bytes. Read-time provenance
+integrity confirms that the Artifact and Blob metadata still resolve. See
+[`provenance.md`](provenance.md).
+
 ## Retention and limitations
 
 Artifact retention currently follows deployment storage lifetime. Back up both PostgreSQL metadata
@@ -84,4 +89,5 @@ and MinIO `artifact_data`; restoring only one side can create missing or unrefer
 
 This release has no automatic orphan GC, per-Run retention policy, delete API, Range downloads,
 presigned URLs, public upload UI, preview framework, or distributed computation single-flight.
-Automatic orphan/blob GC is deferred.
+Automatic orphan/blob GC is deferred; a future collector must treat Artifact IDs referenced by
+Claim Evidence as retention roots or explicitly preserve their missing-source history.

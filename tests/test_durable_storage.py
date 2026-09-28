@@ -13,6 +13,7 @@ import pytest
 
 from axiom.artifacts import ArtifactBlob, ArtifactRecord, ArtifactReuseEntry
 from axiom.config import AxiomConfig, StorageConfig, config_to_public_dict, load_config
+from axiom.provenance import ClaimEvidenceLink, ClaimRecord, EvidenceRecord, EvidenceSourceType
 from axiom.runtime.checkpoints import BudgetLedgerConflictError, CheckpointConflictError
 from axiom.runtime.control_plane import ApiError, ControlOperationName
 from axiom.runtime.durable import DurableAgentRuntime
@@ -107,6 +108,38 @@ def test_artifact_metadata_store_contract(durable_storage):
     assert durable_storage.artifacts.get_reuse_entry("reuse-key") == reuse
 
 
+def test_provenance_store_contract(durable_storage):
+    claim = ClaimRecord(
+        claim_id="clm-contract",
+        invocation_id="run-contract:claim",
+        run_id="run-contract",
+        thread_id="thread-contract",
+        turn_id="turn-contract",
+        text="contract claim",
+    )
+    evidence = EvidenceRecord(
+        evidence_id="evd-contract",
+        run_id=claim.run_id,
+        thread_id=claim.thread_id,
+        turn_id=claim.turn_id,
+        source_type=EvidenceSourceType.CODE_LOCATION,
+        source_id="src/example.py:1-1",
+        source_run_id=claim.run_id,
+        summary="src/example.py:1-1",
+        locator={"path": "src/example.py", "start_line": 1, "end_line": 1},
+        source_digest="a" * 64,
+    )
+    link = ClaimEvidenceLink(claim.claim_id, evidence.evidence_id)
+
+    stored = durable_storage.provenance.create_bundle(claim, [evidence], [link])
+
+    assert stored == claim
+    assert durable_storage.provenance.get_claim(claim.claim_id) == claim
+    assert durable_storage.provenance.get_claim_by_invocation(claim.invocation_id) == claim
+    assert durable_storage.provenance.list_run_claims(claim.run_id) == [claim]
+    assert durable_storage.provenance.list_claim_evidence(claim.claim_id) == [(link, evidence)]
+
+
 def test_storage_configuration_reads_environment_without_changing_defaults(tmp_path):
     config = load_config(
         project_root=tmp_path,
@@ -121,9 +154,7 @@ def test_storage_configuration_reads_environment_without_changing_defaults(tmp_p
     assert config.storage.pool_max_size == 7
 
 
-def test_postgres_connection_failure_is_visible_and_never_falls_back(
-    tmp_path, monkeypatch
-):
+def test_postgres_connection_failure_is_visible_and_never_falls_back(tmp_path, monkeypatch):
     from axiom.runtime import postgres
 
     class FailingPoolModule:
@@ -137,9 +168,7 @@ def test_postgres_connection_failure_is_visible_and_never_falls_back(
         lambda _name: FailingPoolModule,
     )
 
-    with pytest.raises(
-        postgres.PostgresUnavailableError, match="durable store is unavailable"
-    ):
+    with pytest.raises(postgres.PostgresUnavailableError, match="durable store is unavailable"):
         create_durable_storage(
             StorageConfig(
                 backend="postgres",
@@ -167,6 +196,7 @@ def test_backend_identity_is_reported(durable_storage):
     assert durable_storage.runtime.backend == durable_storage.backend
     assert durable_storage.events.backend == durable_storage.backend
     assert durable_storage.controls.backend == durable_storage.backend
+    assert durable_storage.provenance.backend == durable_storage.backend
 
 
 def test_ephemeral_runtime_contracts_add_no_durable_tables(durable_storage):
@@ -261,9 +291,7 @@ def test_succeeded_tool_execution_round_trips_reuse_evidence(durable_storage):
     )
     asyncio.run(durable_storage.runtime.save_tool_execution(record))
 
-    restored = asyncio.run(
-        durable_storage.runtime.load_tool_execution(record.invocation_id)
-    )
+    restored = asyncio.run(durable_storage.runtime.load_tool_execution(record.invocation_id))
     assert restored is not None
     assert restored.status == ToolExecutionStatus.SUCCEEDED
     assert restored.result == "durable result"
@@ -282,9 +310,7 @@ def test_unknown_retry_suppression_round_trips(durable_storage):
     record.last_error_code = "dependency_timeout"
     asyncio.run(durable_storage.runtime.save_tool_execution(record))
 
-    restored = asyncio.run(
-        durable_storage.runtime.load_tool_execution(record.invocation_id)
-    )
+    restored = asyncio.run(durable_storage.runtime.load_tool_execution(record.invocation_id))
     assert restored is not None
     assert restored.status == ToolExecutionStatus.UNKNOWN
     assert restored.retry_state == ToolRetryState.RETRY_SUPPRESSED
@@ -305,9 +331,7 @@ def test_retry_pending_deadline_round_trips_as_utc_instant(durable_storage):
     record.retry_backoff_seconds = 1.75
     asyncio.run(durable_storage.runtime.save_tool_execution(record))
 
-    restored = asyncio.run(
-        durable_storage.runtime.load_tool_execution(record.invocation_id)
-    )
+    restored = asyncio.run(durable_storage.runtime.load_tool_execution(record.invocation_id))
     assert restored is not None and restored.next_retry_at is not None
     assert datetime.fromisoformat(restored.next_retry_at) == deadline
     assert restored.retry_backoff_seconds == 1.75
@@ -360,9 +384,7 @@ def test_event_ids_order_replay_and_run_filter_contract(durable_storage):
         thread_id, "run.started", {"run_id": "other-run", "value": 3}
     )
 
-    replay = durable_storage.events.list_events(
-        thread_id, after_id=first_id, run_id="run-events"
-    )
+    replay = durable_storage.events.list_events(thread_id, after_id=first_id, run_id="run-events")
     assert second_id > first_id
     assert [event.id for event in replay] == [second_id]
     assert replay[0].payload["value"] == 2
@@ -485,6 +507,38 @@ def test_postgres_concurrent_artifact_blob_upsert_is_safe(postgres_storage):
 
 
 @pytest.mark.postgres
+def test_postgres_concurrent_child_claims_are_queryable(postgres_storage):
+    def create(index: int) -> ClaimRecord:
+        claim = ClaimRecord(
+            claim_id=f"clm-child-{index}",
+            invocation_id=f"child-{index}:claim",
+            run_id="run-parent",
+            thread_id="thread-claims",
+            turn_id="turn-claims",
+            text=f"child claim {index}",
+        )
+        evidence = EvidenceRecord(
+            evidence_id=f"evd-child-{index}",
+            run_id=claim.run_id,
+            thread_id=claim.thread_id,
+            turn_id=claim.turn_id,
+            source_type=EvidenceSourceType.CODE_LOCATION,
+            source_id=f"src/child_{index}.py:1-1",
+            source_run_id=f"run-child-{index}",
+            summary=f"child {index}",
+            locator={"path": f"src/child_{index}.py", "start_line": 1, "end_line": 1},
+        )
+        link = ClaimEvidenceLink(claim.claim_id, evidence.evidence_id)
+        return postgres_storage.provenance.create_bundle(claim, [evidence], [link])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(create, range(2)))
+
+    assert {claim.claim_id for claim in claims} == {"clm-child-0", "clm-child-1"}
+    assert len(postgres_storage.provenance.list_run_claims("run-parent")) == 2
+
+
+@pytest.mark.postgres
 def test_postgres_concurrent_tool_insert_keeps_one_durable_row(postgres_storage):
     durable_storage = postgres_storage
     first = _tool_record(invocation_id="invocation-concurrent")
@@ -515,9 +569,7 @@ def test_postgres_rejects_future_schema_version(postgres_storage):
 
     pool = durable_storage._close
     with pool.connection() as conn:
-        conn.execute(
-            "update axiom_schema_versions set version = 999 where component = 'runtime'"
-        )
+        conn.execute("update axiom_schema_versions set version = 999 where component = 'runtime'")
     with pytest.raises(PostgresSchemaError, match="unsupported PostgreSQL runtime schema"):
         initialize_postgres_schema(pool)
 

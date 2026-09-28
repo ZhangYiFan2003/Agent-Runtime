@@ -42,6 +42,10 @@ the Artifact metadata authority; MinIO stores immutable SHA-256 Blob bytes in `a
 MinIO publishes no host port. Web downloads Artifact content through the authenticated Runtime API
 and never receives object-store credentials.
 
+Claim/Evidence provenance metadata is stored in PostgreSQL with the other distributed Runtime
+truth. Provenance does not add a service, network, or credential boundary; Compose explicitly
+enables the `record_claim` Tool and its short prompt guidance for Workers.
+
 Workers reach sandboxd only on the private `sandbox-control` network. Only sandboxd mounts the
 Docker socket. Runtime API, Web, PostgreSQL, Workers, and dynamically created Sandbox containers do
 not receive Docker daemon access. Sandbox containers join no Compose network.
@@ -187,6 +191,9 @@ MinIO is internal trusted storage. Artifact credentials remain in MinIO initiali
 and Worker processes only. Sandbox containers retain `network=none` and receive neither MinIO
 credentials nor the `artifact-storage` network. Artifact retention follows the deployment volumes;
 automatic orphan GC and per-Run retention are not implemented.
+
+Claim provenance stores source IDs, bounded locators, and digests only. It adds no credentials to
+Web, providerd, sandboxd, or Sandbox containers, and it does not grant Sandbox network access.
 
 HTTP is suitable only for localhost or a trusted private network. For Internet-facing access,
 terminate TLS in a separately managed reverse proxy or load balancer and restrict access there.
