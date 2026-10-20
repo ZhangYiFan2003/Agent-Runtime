@@ -275,11 +275,59 @@ def test_sqlite_run_page_reads_two_bounded_queries_without_checkpoint_decoding(
     assert "parent_run_id in (" in reads[1]
 
 
+@pytest.mark.postgres
+@pytest.mark.parametrize("history_size", [20, 120])
+def test_postgres_run_page_reads_two_queries_without_checkpoint_decoding(
+    postgres_storage, monkeypatch, history_size,
+):
+    from axiom.runtime.postgres import PostgresRuntimeStore, _insert_initial_run
+
+    pool = postgres_storage.runtime.pool
+    with pool.connection() as conn:
+        for index in range(history_size):
+            state = Checkpoint.create(thread_id="thread", input="x" * 1000,
+                                      run_id=f"run_{index:03}")
+            state.status = RunStatus.COMPLETED
+            _insert_initial_run(conn, state, updated_at=state.updated_at, runnable=False)
+        conn.execute(
+            "insert into checkpoints(run_id, sequence, schema_version, thread_id, turn_id, "
+            "status, state_json, created_at) select run_id, 1 + extra, schema_version, "
+            "thread_id, turn_id, status, state_json, created_at from checkpoints "
+            "cross join (values (1), (2)) more(extra) where sequence = 1"
+        )
+    reads = []
+
+    class ObservedConnection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def execute(self, statement, parameters=()):
+            reads.append((statement, parameters))
+            return self.conn.execute(statement, parameters)
+
+    class ObservedPool:
+        @contextmanager
+        def connection(self):
+            with pool.connection() as conn:
+                yield ObservedConnection(conn)
+
+    def forbid_decode(*args, **kwargs):
+        raise AssertionError("Run list must not deserialize recovery authority")
+
+    monkeypatch.setattr(Checkpoint, "from_dict", forbid_decode)
+    rows = asyncio.run(PostgresRuntimeStore(ObservedPool()).list_run_summaries(limit=5))
+    assert len(rows) == 6 and len(reads) == 2
+    assert reads[0][1] == (6,)
+    assert "from checkpoints" not in reads[0][0].lower()
+    assert "parent_run_id in (" in reads[1][0]
+
+
 def test_postgres_event_id_allocation_waits_for_same_thread_commit(postgres_storage):
     from axiom.runtime.postgres import PostgresEventRepository
 
     storage = postgres_storage
     thread_id = storage.events.create_thread()
+    other_thread = storage.events.create_thread()
     initial, watermark = storage.events.page_events(thread_id, latest=True)
     assert watermark == initial[-1].id
     allocated = threading.Event()
@@ -311,7 +359,7 @@ def test_postgres_event_id_allocation_waits_for_same_thread_commit(postgres_stor
 
     first = PostgresEventRepository(PausedPool(True))
     second = PostgresEventRepository(PausedPool(False))
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         first_write = executor.submit(first.append_event, thread_id, "first", {})
         try:
             assert allocated.wait(10)
@@ -321,6 +369,13 @@ def test_postgres_event_id_allocation_waits_for_same_thread_commit(postgres_stor
             # has allocated a lower ID but has not committed yet.
             visible, _ = storage.events.page_events(thread_id, after_id=watermark)
             assert visible == []
+            # A held Thread transaction must not lock the event stream globally.
+            independent = executor.submit(
+                storage.events.append_event, other_thread, "independent", {},
+            )
+            assert independent.result(10) > watermark
+            other_events, _ = storage.events.page_events(other_thread)
+            assert other_events[-1].type == "independent"
         finally:
             release_commit.set()
         first_id, second_id = first_write.result(10), second_write.result(10)
@@ -419,14 +474,15 @@ def test_capacity_rejection_does_not_reserve_submission_identity(durable_storage
     assert created and accepted.thread_id == rejected_thread
 
 
-@pytest.mark.parametrize("same_key", [False, True], ids=["different-keys", "same-key"])
+@pytest.mark.parametrize("case", ["different-keys", "same-key", "conflicting-payload"])
 def test_submission_race_uses_independent_database_connections(
-    durable_storage, same_key, monkeypatch,
+    durable_storage, case, monkeypatch,
 ):
     from axiom.runtime.checkpoints import SQLiteCheckpointStore
     from axiom.runtime.postgres import PostgresRuntimeStore
 
     thread_id = durable_storage.events.create_thread()
+    before = _submission_counts(durable_storage)
     barrier = threading.Barrier(2)
     if durable_storage.backend == "sqlite":
         stores = [SQLiteCheckpointStore(durable_storage.runtime.db_path) for _ in range(2)]
@@ -450,11 +506,12 @@ def test_submission_race_uses_independent_database_connections(
         stores = [PostgresRuntimeStore(GatedPool()) for _ in range(2)]
 
     def submit(index):
+        text = f"message {index}" if case == "conflicting-payload" else "hello"
         try:
             return asyncio.run(stores[index].admit_submission(
-                Checkpoint.create(thread_id=thread_id, input="hello"),
-                idempotency_key="same" if same_key else f"key-{index}",
-                request_fingerprint="hello",
+                Checkpoint.create(thread_id=thread_id, input=text),
+                idempotency_key=f"key-{index}" if case == "different-keys" else "same",
+                request_fingerprint=text,
             ))
         except ApiError as exc:
             return exc
@@ -463,17 +520,24 @@ def test_submission_race_uses_independent_database_connections(
         results = list(executor.map(submit, range(2)))
     accepted = [result for result in results if isinstance(result, tuple)]
     assert sum(created for _, created in accepted) == 1
-    if same_key:
+    if case == "same-key":
         assert len(accepted) == 2
         assert accepted[0][0].run_id == accepted[1][0].run_id
     else:
         errors = [result for result in results if isinstance(result, ApiError)]
-        assert len(errors) == 1 and errors[0].code == "THREAD_BUSY"
-        assert errors[0].details["active_run_id"] == accepted[0][0].run_id
+        expected = "THREAD_BUSY" if case == "different-keys" else "IDEMPOTENCY_KEY_CONFLICT"
+        assert len(errors) == 1 and errors[0].code == expected
+        if case == "different-keys":
+            assert errors[0].details["active_run_id"] == accepted[0][0].run_id
     assert len(asyncio.run(durable_storage.runtime.list(thread_id))) == 1
     events = durable_storage.events.list_events(thread_id)
     assert [event.type for event in events].count("user.message") == 1
     assert [event.type for event in events].count("turn.started") == 1
+    increments = {"checkpoints": 1, "submission_idempotency": 1, "events": 3,
+                  "traffic_rate_buckets": 0, "runs": 1}
+    assert _submission_counts(durable_storage) == {
+        table: count + increments[table] for table, count in before.items()
+    }
 
 
 @pytest.mark.parametrize("status", [RunStatus.RUNNING, RunStatus.INTERRUPTED,
@@ -687,6 +751,52 @@ def test_schema_upgrade_preserves_existing_conflicting_roots(durable_storage):
 
 
 @pytest.mark.postgres
+def test_postgres_v8_read_indexes_upgrade_preserves_history_and_replay(postgres_storage):
+    from axiom.runtime.postgres import POSTGRES_SCHEMA_VERSION, initialize_postgres_schema
+
+    storage = postgres_storage
+    thread_id = storage.events.create_thread()
+    root = _completed_submission(storage, thread_id, 0)
+    child = Checkpoint.create(thread_id=thread_id, input="child", parent_run_id=root.run_id)
+    child.status = RunStatus.COMPLETED
+    asyncio.run(storage.runtime.save(child))
+    pending, _ = _submission(storage, storage.events.create_thread(), key="pending")
+    before = _submission_counts(storage)
+    history = [state.to_dict() for state in asyncio.run(storage.runtime.list(thread_id))]
+    events = storage.events.list_events(thread_id)
+    indexes = {"idx_runs_created", "idx_runs_parent", "idx_events_messages",
+               "idx_events_message_identity"}
+    with storage.runtime.pool.connection() as conn:
+        for index in sorted(indexes):
+            conn.execute(f"drop index {index}")
+        conn.execute("update axiom_schema_versions set version = 8 where component = 'runtime'")
+
+    initialize_postgres_schema(storage.runtime.pool)
+    initialize_postgres_schema(storage.runtime.pool)
+
+    with storage.runtime.pool.connection() as conn:
+        assert conn.execute(
+            "select version from axiom_schema_versions where component = 'runtime'"
+        ).fetchone()[0] == POSTGRES_SCHEMA_VERSION
+        actual = {row[0] for row in conn.execute(
+            "select indexname from pg_indexes where schemaname = current_schema()"
+        ).fetchall()}
+    assert indexes <= actual
+    assert _submission_counts(storage) == before
+    assert [state.to_dict() for state in asyncio.run(storage.runtime.list(thread_id))] == history
+    assert storage.events.list_events(thread_id) == events
+    messages, _ = storage.events.page_messages(thread_id)
+    assert [event.payload["text"] for event in messages] == ["question 0", "answer 0"]
+    replay, created = _submission(storage, thread_id, key="page-0", text="question 0")
+    assert not created and replay.run_id == root.run_id and replay.status == RunStatus.COMPLETED
+    replay, created = _submission(storage, pending.thread_id, key="pending")
+    assert not created and replay.run_id == pending.run_id
+    summary = asyncio.run(storage.runtime.list_run_summaries(search=root.run_id))
+    assert len(summary) == 1 and summary[0]["children_count"] == 1
+    assert _submission_counts(storage) == before
+
+
+@pytest.mark.postgres
 def test_delivery_requeue_cannot_reactivate_old_root_over_new_submission(postgres_storage):
     store = postgres_storage.runtime
     thread_id = postgres_storage.events.create_thread()
@@ -762,6 +872,51 @@ def test_provenance_store_contract(durable_storage):
     assert durable_storage.provenance.get_claim_by_invocation(claim.invocation_id) == claim
     assert durable_storage.provenance.list_run_claims(claim.run_id) == [claim]
     assert durable_storage.provenance.list_claim_evidence(claim.claim_id) == [(link, evidence)]
+
+
+@pytest.mark.postgres
+def test_postgres_metadata_round_trips_in_non_utc_session(postgres_storage):
+    from axiom.artifacts.metadata import PostgresArtifactMetadataStore
+    from axiom.provenance.store import PostgresProvenanceStore
+
+    class NonUtcPool:
+        @contextmanager
+        def connection(self):
+            with postgres_storage.runtime.pool.connection() as conn:
+                conn.execute("set local time zone 'Pacific/Honolulu'")
+                yield conn
+
+    artifacts = PostgresArtifactMetadataStore(NonUtcPool())
+    blob = ArtifactBlob("c" * 64, "blobs/non-utc", 4, "s3")
+    assert artifacts.upsert_blob(blob) == blob
+    assert artifacts.upsert_blob(blob) == blob
+    assert artifacts.get_blob(blob.sha256) == blob
+    artifact = ArtifactRecord(
+        artifact_id="art-non-utc", blob_sha256=blob.sha256, run_id="run-non-utc",
+        thread_id="thread-non-utc", invocation_id="inv-non-utc", tool_name="publish_artifact",
+        name="result.txt", media_type="text/plain", size_bytes=4,
+    )
+    assert artifacts.create_artifact(artifact) == artifact
+    assert artifacts.get_artifact(artifact.artifact_id) == artifact
+    reuse = ArtifactReuseEntry("non-utc", artifact.artifact_id, "test", "v1")
+    artifacts.put_reuse_entry(reuse)
+    assert artifacts.get_reuse_entry(reuse.reuse_key) == reuse
+
+    provenance = PostgresProvenanceStore(NonUtcPool())
+    claim = ClaimRecord(
+        claim_id="claim-non-utc", invocation_id="claim-inv-non-utc", run_id=artifact.run_id,
+        thread_id=artifact.thread_id, turn_id="turn-non-utc", text="round trip",
+    )
+    evidence = EvidenceRecord(
+        evidence_id="evidence-non-utc", run_id=claim.run_id, thread_id=claim.thread_id,
+        turn_id=claim.turn_id, source_type=EvidenceSourceType.CODE_LOCATION,
+        source_id="src/example.py:1", source_run_id=claim.run_id, summary="example",
+        locator={"path": "src/example.py", "start_line": 1, "end_line": 1},
+    )
+    link = ClaimEvidenceLink(claim.claim_id, evidence.evidence_id)
+    provenance.create_bundle(claim, [evidence], [link])
+    assert provenance.get_claim(claim.claim_id) == claim
+    assert provenance.list_claim_evidence(claim.claim_id) == [(link, evidence)]
 
 
 def test_storage_configuration_reads_environment_without_changing_defaults(tmp_path):

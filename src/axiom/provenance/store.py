@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -404,7 +405,7 @@ def _object(value: Any) -> dict[str, Any]:
 
 
 def _timestamp(value: Any) -> str:
-    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+    return value.astimezone(UTC).isoformat() if isinstance(value, datetime) else str(value)
 
 
 def _claim_values(claim: ClaimRecord) -> tuple[object, ...]:

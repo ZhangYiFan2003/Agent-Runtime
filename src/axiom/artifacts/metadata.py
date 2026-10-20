@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -479,5 +480,4 @@ def _reuse_from_row(row: Any) -> ArtifactReuseEntry:
 
 
 def _timestamp(value: Any) -> str:
-    isoformat = getattr(value, "isoformat", None)
-    return str(isoformat()) if callable(isoformat) else str(value)
+    return value.astimezone(UTC).isoformat() if isinstance(value, datetime) else str(value)

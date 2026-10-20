@@ -110,7 +110,7 @@ def postgres_storage(tmp_path) -> Iterator[DurableStorage]:
 
 
 async def _runnable(storage: DurableStorage, run_id: str = "run-owned") -> Checkpoint:
-    state = Checkpoint.create(thread_id="thread-owned", run_id=run_id, input="work")
+    state = Checkpoint.create(thread_id=f"thread-{run_id}", run_id=run_id, input="work")
     await storage.runtime.save(state)
     await storage.runtime.mark_runnable(run_id)
     return state
@@ -152,7 +152,7 @@ async def _exhaust(storage: DurableStorage, run_id: str, *, attempts: int = 1):
 async def _admit(
     storage: DurableStorage, run_id: str, *, limit: int
 ) -> Checkpoint:
-    state = Checkpoint.create(thread_id="thread-capacity", run_id=run_id, input="work")
+    state = Checkpoint.create(thread_id=f"thread-capacity-{run_id}", run_id=run_id, input="work")
     await storage.runtime.admit_run(state, limit)
     return state
 
