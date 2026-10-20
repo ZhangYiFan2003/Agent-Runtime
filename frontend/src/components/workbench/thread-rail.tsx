@@ -17,7 +17,6 @@ export function ThreadRail({
   threads,
   selectedThreadId,
   creating,
-  createError,
   onCreate,
   onSelect,
   onRemove,
@@ -26,7 +25,6 @@ export function ThreadRail({
   threads: ThreadRegistryEntry[];
   selectedThreadId: string | null;
   creating: boolean;
-  createError: string | null;
   onCreate: () => void;
   onSelect: (threadId: string) => void;
   onRemove: (threadId: string) => void;
@@ -52,12 +50,6 @@ export function ThreadRail({
           {creating ? "Creating…" : "New"}
         </Button>
       </div>
-
-      {createError !== null && (
-        <div role="alert" className="shrink-0 border-b border-border/60 px-3 py-1.5 text-xs text-danger">
-          {createError}
-        </div>
-      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {threads.length === 0 ? (

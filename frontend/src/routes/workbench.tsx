@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "@tanstack/react-router";
 import { Menu, X } from "lucide-react";
 import { useWorkbench } from "../queries/use-workbench";
 import { SUBMISSION_LOST_MESSAGE } from "../queries/workbench-session";
@@ -40,7 +41,6 @@ function ConnectedWorkbench() {
       threads={wb.threads}
       selectedThreadId={wb.threadId}
       creating={wb.creatingThread}
-      createError={wb.createError}
       onCreate={() => void wb.createAndSelectThread()}
       onSelect={(id) => {
         wb.selectThread(id);
@@ -68,6 +68,15 @@ function ConnectedWorkbench() {
 
   const notices = (
     <>
+      {wb.createError !== null && (
+        <div role="alert" className="border-t border-border bg-danger/5 px-4 py-2 text-xs text-danger md:px-6">
+          <p>Could not create a thread: {wb.createError}</p>
+          <p className="mt-1 text-fg-2">
+            Check the Runtime address and API key in{" "}
+            <Link to="/settings" className="text-info underline">Settings</Link>.
+          </p>
+        </div>
+      )}
       {wb.submission.phase === "lost" && (
         <div
           role="status"
