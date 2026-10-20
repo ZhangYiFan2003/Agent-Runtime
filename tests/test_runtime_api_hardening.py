@@ -304,7 +304,7 @@ def test_admission_rejection_is_global_overload_not_run_failure(tmp_path, monkey
     server, _ = _server(tmp_path)
     thread_id = _thread(server)
 
-    async def reject(_thread_id: str, _message: str):
+    async def reject(_thread_id: str, _message: str, *, idempotency_key=None):
         raise AdmissionRejectedError(queued_runs=2, max_queued_runs=2)
 
     monkeypatch.setattr(server, "_run_turn", reject)
@@ -950,14 +950,14 @@ def test_sse_keepalive_is_transport_only_and_polling_is_bounded(tmp_path):
         "GET", f"/v1/threads/{thread_id}/events?run_id={state.run_id}&follow=true"
     )
     calls = 0
-    original = server.repository.list_events
+    original = server.repository.page_events
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    server.repository.list_events = counted
+    server.repository.page_events = counted
     follower = threading.Thread(target=server._handle, args=(request,))
     follower.start()
     _wait_until(lambda: b": keepalive\n\n" in request.wfile.getvalue())
@@ -965,8 +965,8 @@ def test_sse_keepalive_is_transport_only_and_polling_is_bounded(tmp_path):
     _save(server, state)
     follower.join(timeout=2)
 
-    assert len(original(thread_id)) == before
-    assert calls < 20
+    assert len(server.repository.list_events(thread_id)) == before
+    assert 0 < calls < 20
 
 
 def test_sse_client_disconnect_stops_follower(tmp_path):

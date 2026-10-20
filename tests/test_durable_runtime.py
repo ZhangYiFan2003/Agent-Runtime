@@ -553,7 +553,11 @@ def test_http_run_resume_after_runtime_restart(tmp_path):
     assert get_run.status == 200
     assert get_run.json()["status"] == RunStatus.WAITING_APPROVAL
     assert resume.status == 200
-    assert resume.json() == {"thread_id": thread_id, "text": "finished"}
+    assert resume.json()["thread_id"] == thread_id
+    assert resume.json()["text"] == "finished"
+    assert resume.json()["run_id"] == started["run_id"]
+    assert resume.json()["turn_id"] == started["turn_id"]
+    assert resume.json()["status"] == "COMPLETED"
     assert executions == 1
     event_types = [event.type for event in second.repository.list_events(thread_id)]
     assert {"run.interrupted", "run.resumed", "run.completed"} <= set(event_types)

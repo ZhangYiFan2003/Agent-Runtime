@@ -42,6 +42,17 @@ class EventRepository(Protocol):
         run_id: str | None = None,
     ) -> list[RuntimeEvent]: ...
 
+    def page_events(
+        self, thread_id: str, *, after_id: int | None = None,
+        before_id: int | None = None, run_id: str | None = None,
+        limit: int = 200, latest: bool = False,
+    ) -> tuple[list[RuntimeEvent], int]: ...
+
+    def page_messages(
+        self, thread_id: str, *, before_id: int | None = None,
+        after_id: int | None = None, limit: int = 50,
+    ) -> tuple[list[RuntimeEvent], int]: ...
+
     def database_ok(self) -> bool: ...
 
 
@@ -142,6 +153,62 @@ class ThreadEventRepository:
             for row in rows
         ]
 
+    def page_events(
+        self, thread_id: str, *, after_id: int | None = None,
+        before_id: int | None = None, run_id: str | None = None,
+        limit: int = 200, latest: bool = False,
+    ) -> tuple[list[RuntimeEvent], int]:
+        clauses = ["e.thread_id = ?"]
+        params: list[object] = [thread_id]
+        if after_id is not None:
+            clauses.append("e.id > ?")
+            params.append(after_id)
+        if before_id is not None:
+            clauses.append("e.id < ?")
+            params.append(before_id)
+        if run_id is not None:
+            clauses.append("e.run_id = ?")
+            params.append(run_id)
+        return self._event_page(clauses, params, limit, latest or before_id is not None)
+
+    def page_messages(
+        self, thread_id: str, *, before_id: int | None = None,
+        after_id: int | None = None, limit: int = 50,
+    ) -> tuple[list[RuntimeEvent], int]:
+        # Filter identities and roles before LIMIT. Raw events remain available to
+        # debugging and model-history callers through the complete list method.
+        clauses = ["e.thread_id = ?", _SQLITE_MESSAGE_FILTER]
+        params: list[object] = [thread_id]
+        if before_id is not None:
+            clauses.append("e.id < ?")
+            params.append(before_id)
+        if after_id is not None:
+            clauses.append("e.id > ?")
+            params.append(after_id)
+        return self._event_page(clauses, params, limit, after_id is None)
+
+    def _event_page(
+        self, clauses: list[str], params: list[object], limit: int, descending: bool,
+    ) -> tuple[list[RuntimeEvent], int]:
+        order = "desc" if descending else "asc"
+        with self._connect() as conn:
+            rows = conn.execute(
+                "select e.id, e.thread_id, e.type, e.payload, e.created_at, "
+                "e.turn_id, e.run_id, e.parent_run_id, e.parent_step_id, e.assignment_id "
+                "from events e where " + " and ".join(clauses)
+                + f" order by e.id {order} limit ?", (*params, limit + 1),
+            ).fetchall()
+        if descending:
+            rows.reverse()
+        events = [RuntimeEvent(
+            id=int(row[0]), thread_id=str(row[1]), type=str(row[2]),
+            payload=_decode_payload(row[3]), created_at=str(row[4]),
+            turn_id=_optional_text(row[5]), run_id=_optional_text(row[6]),
+            parent_run_id=_optional_text(row[7]), parent_step_id=_optional_text(row[8]),
+            assignment_id=_optional_text(row[9]),
+        ) for row in rows]
+        return events, events[-1].id if events else 0
+
     def database_ok(self) -> bool:
         try:
             with self._connect() as conn:
@@ -183,6 +250,15 @@ class ThreadEventRepository:
             conn.execute(
                 "create index if not exists idx_events_run_id on events(thread_id, run_id, id)"
             )
+            conn.execute(
+                "create index if not exists idx_events_messages on events(thread_id, id) "
+                "where type in ('user.message', 'assistant.message')"
+            )
+            conn.execute(
+                "create index if not exists idx_events_message_identity "
+                "on events(thread_id, run_id, turn_id, type, id) "
+                "where type in ('user.message', 'assistant.message')"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -190,6 +266,51 @@ class ThreadEventRepository:
         conn.execute("pragma busy_timeout = 30000")
         conn.execute("pragma foreign_keys = on")
         return conn
+
+
+_SQLITE_MESSAGE_FILTER = """
+e.type in ('user.message', 'assistant.message')
+and e.run_id is not null and e.run_id <> ''
+and e.turn_id is not null and e.turn_id <> ''
+and e.parent_run_id is null
+and json_extract(e.payload, '$.parent_run_id') is null
+and (json_extract(e.payload, '$.thread_id') is null
+     or json_extract(e.payload, '$.thread_id') = e.thread_id)
+and (json_extract(e.payload, '$.run_id') is null
+     or json_extract(e.payload, '$.run_id') = e.run_id)
+and (json_extract(e.payload, '$.turn_id') is null
+     or json_extract(e.payload, '$.turn_id') = e.turn_id)
+and json_type(e.payload, '$.text') = 'text'
+and json_extract(e.payload, '$.text') <> ''
+and exists (
+    select 1 from checkpoints c where c.run_id = e.run_id
+    and c.sequence = (select max(sequence) from checkpoints where run_id = c.run_id)
+    and c.thread_id = e.thread_id and c.turn_id = e.turn_id
+    and json_extract(c.state_json, '$.parent_run_id') is null
+    and (e.type = 'user.message' or c.status = 'COMPLETED')
+)
+and not exists (
+    select 1 from events duplicate where duplicate.thread_id = e.thread_id
+    and duplicate.run_id = e.run_id and duplicate.turn_id = e.turn_id
+    and duplicate.type = e.type
+    and (json_extract(duplicate.payload, '$.text') is not json_extract(e.payload, '$.text')
+         or duplicate.id < e.id)
+)
+and (e.type = 'user.message' or exists (
+    select 1 from events u where u.thread_id = e.thread_id and u.run_id = e.run_id
+    and u.turn_id = e.turn_id and u.type = 'user.message' and u.id < e.id
+    and u.parent_run_id is null
+    and json_extract(u.payload, '$.parent_run_id') is null
+    and json_type(u.payload, '$.text') = 'text'
+    and json_extract(u.payload, '$.text') <> ''
+    and not exists (
+        select 1 from events ambiguous where ambiguous.thread_id = u.thread_id
+        and ambiguous.run_id = u.run_id and ambiguous.turn_id = u.turn_id
+        and ambiguous.type = 'user.message'
+        and json_extract(ambiguous.payload, '$.text') is not json_extract(u.payload, '$.text')
+    )
+))
+"""
 
 
 def _ensure_sqlite_column(

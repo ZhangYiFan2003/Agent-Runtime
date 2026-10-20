@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { ApprovalDecision } from "../api/run-controls";
 import type { InterruptSummary } from "../api/adapters/run";
+import { subscribeConnection, useConnection } from "../lib/connection";
 import {
   createRunControlsEngine,
   type RunControlsFeedback,
@@ -35,12 +36,14 @@ export interface UseRunControlsOptions {
 
 export function useRunControls(runId: string, options: UseRunControlsOptions = {}): RunControls {
   const queryClient = useQueryClient();
+  const connection = useConnection();
   const parentRunId = options.parentRunId ?? null;
   // One engine per (runId, parentRunId) — pending state is scoped to the page.
   const engine = useMemo(
-    () => createRunControlsEngine({ runId, parentRunId, queryClient }),
-    [runId, parentRunId, queryClient],
+    () => createRunControlsEngine({ runId, parentRunId, queryClient, connection }),
+    [runId, parentRunId, queryClient, connection],
   );
+  useEffect(() => subscribeConnection(() => engine.dispose()), [engine]);
   const snapshot = useSyncExternalStore(
     useCallback((listener) => engine.subscribe(listener), [engine]),
     () => engine.snapshot(),

@@ -10,7 +10,7 @@ import {
 import { executeControlMutation, mintIdempotencyKey } from "../api/idempotency";
 import { controlErrorMessage } from "../lib/control-errors";
 import type { InterruptSummary } from "../api/adapters/run";
-import { getConnection } from "../lib/connection";
+import { getConnectionSnapshot, type ConnectionSnapshot } from "../lib/connection";
 import { queryKeys } from "./keys";
 
 /**
@@ -52,6 +52,7 @@ export interface RunControlsSnapshot {
 }
 
 export interface RunControlsEngine {
+  dispose(): void;
   snapshot(): RunControlsSnapshot;
   subscribe(listener: () => void): () => void;
   dismissFeedback(): void;
@@ -80,17 +81,18 @@ export const CONTROL_SUCCESS_MESSAGES: Record<string, string> = {
 export async function invalidateRunFamily(
   queryClient: QueryClient,
   runId: string,
-  options: { parentRunId?: string | null } = {},
+  options: { parentRunId?: string | null; connection?: ConnectionSnapshot } = {},
 ): Promise<void> {
+  const keysFor = queryKeys.forConnection(options.connection ?? getConnectionSnapshot());
   const keys: Array<readonly unknown[]> = [
-    queryKeys.run(runId),
-    queryKeys.children(runId),
-    queryKeys.trace(runId),
-    queryKeys.metrics(runId),
+    keysFor.run(runId),
+    keysFor.children(runId),
+    keysFor.trace(runId),
+    keysFor.metrics(runId),
   ];
   const parentRunId = options.parentRunId;
   if (typeof parentRunId === "string" && parentRunId !== "" && parentRunId !== runId) {
-    keys.push(queryKeys.run(parentRunId), queryKeys.children(parentRunId));
+    keys.push(keysFor.run(parentRunId), keysFor.children(parentRunId));
   }
   await Promise.all(keys.map((key) => queryClient.invalidateQueries({ queryKey: key })));
 }
@@ -109,6 +111,7 @@ export interface RunControlsEngineOptions {
   /** This run's parent, when it is a child run — its aggregates also refresh. */
   parentRunId?: string | null;
   queryClient: QueryClient;
+  connection?: ConnectionSnapshot;
   deps?: RunControlsEngineDeps;
 }
 
@@ -128,6 +131,11 @@ function emptyPending(): RunControlsPending {
 
 export function createRunControlsEngine(options: RunControlsEngineOptions): RunControlsEngine {
   const { runId, queryClient } = options;
+  const connection = options.connection ?? getConnectionSnapshot();
+  const config = connection.config;
+  const controller = new AbortController();
+  const isCurrent = () => !controller.signal.aborted &&
+    getConnectionSnapshot().generation === connection.generation;
   const parentRunId = options.parentRunId ?? null;
   const deps = options.deps ?? {};
   const fetchImpl = deps.fetchImpl;
@@ -184,7 +192,7 @@ export function createRunControlsEngine(options: RunControlsEngineOptions): RunC
     target: (idempotencyKey: string) => Promise<unknown>,
     family?: { runId: string; parentRunId?: string | null },
   ): Promise<boolean> {
-    if (runId === "" || inFlight.has(kind)) return false;
+    if (runId === "" || inFlight.has(kind) || !isCurrent()) return false;
     const familyRunId = family?.runId ?? runId;
     const familyParent = family?.parentRunId ?? parentRunId;
     inFlight.add(kind);
@@ -195,15 +203,20 @@ export function createRunControlsEngine(options: RunControlsEngineOptions): RunC
     // transport-failure retries by executeControlMutation.
     const idempotencyKey = mintKey();
     try {
-      await executeControlMutation(() => target(idempotencyKey), { sleep });
-      await invalidateRunFamily(queryClient, familyRunId, { parentRunId: familyParent });
+      await executeControlMutation(() => {
+        if (!isCurrent()) throw new DOMException("Connection changed", "AbortError");
+        return target(idempotencyKey);
+      }, { sleep });
+      if (!isCurrent()) return false;
+      await invalidateRunFamily(queryClient, familyRunId, { parentRunId: familyParent, connection });
       feedback = { tone: "success", message: successMessage };
       return true;
     } catch (error) {
+      if (!isCurrent()) return false;
       const mapped = controlErrorMessage(toApiError(error));
       if (mapped.kind === "conflict") {
         // State changed under us: note the conflict and silently refetch.
-        void invalidateRunFamily(queryClient, familyRunId, { parentRunId: familyParent });
+        void invalidateRunFamily(queryClient, familyRunId, { parentRunId: familyParent, connection });
       }
       feedback = { tone: "error", message: mapped.message };
       return false;
@@ -215,6 +228,7 @@ export function createRunControlsEngine(options: RunControlsEngineOptions): RunC
   }
 
   const controls: RunControlsEngine = {
+    dispose: () => controller.abort(),
     snapshot,
     subscribe(listener) {
       listeners.add(listener);
@@ -227,19 +241,19 @@ export function createRunControlsEngine(options: RunControlsEngineOptions): RunC
     },
     resume: () =>
       perform("resume", CONTROL_SUCCESS_MESSAGES.resume, (key) =>
-        resumeRun(getConnection(), runId, {}, { idempotencyKey: key, fetchImpl }),
+        resumeRun(config, runId, {}, { idempotencyKey: key, fetchImpl, signal: controller.signal }),
       ),
     cancel: () =>
       perform("cancel", CONTROL_SUCCESS_MESSAGES.cancel, (key) =>
-        cancelRun(getConnection(), runId, { idempotencyKey: key, fetchImpl }),
+        cancelRun(config, runId, { idempotencyKey: key, fetchImpl, signal: controller.signal }),
       ),
     interrupt: (reason?: string) =>
       perform("interrupt", CONTROL_SUCCESS_MESSAGES.interrupt, (key) =>
-        interruptRun(getConnection(), runId, { reason }, { idempotencyKey: key, fetchImpl }),
+        interruptRun(config, runId, { reason }, { idempotencyKey: key, fetchImpl, signal: controller.signal }),
       ),
     requeue: () =>
       perform("requeue", CONTROL_SUCCESS_MESSAGES.requeue, (key) =>
-        requeueRun(getConnection(), runId, { idempotencyKey: key, fetchImpl }),
+        requeueRun(config, runId, { idempotencyKey: key, fetchImpl, signal: controller.signal }),
       ),
     resolveApproval(interrupt: InterruptSummary, decision: ApprovalDecision) {
       const key = `${interrupt.runId}:${interrupt.invocationId}` as const;
@@ -256,10 +270,10 @@ export function createRunControlsEngine(options: RunControlsEngineOptions): RunC
         CONTROL_SUCCESS_MESSAGES[decision],
         (idempotencyKey) =>
           resumeRun(
-            getConnection(),
+            config,
             interrupt.runId,
             { decision, invocationId: interrupt.invocationId },
-            { idempotencyKey, fetchImpl },
+            { idempotencyKey, fetchImpl, signal: controller.signal },
           ),
         family,
       );

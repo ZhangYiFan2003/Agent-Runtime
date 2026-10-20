@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./client";
-import { createThread, submitTurn } from "./threads";
+import { createThread, parseTurnResult, submitTurn } from "./threads";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -32,21 +32,22 @@ describe("submitTurn", () => {
         run_id: "run_9",
         status: "WAITING_APPROVAL",
         interrupt: { invocation_id: "run_9:call_0", tool_name: "shell" },
-        text: null,
       }),
-      jsonResponse(200, { thread_id: "thread_1", text: "Done. The answer is 4." }),
+      jsonResponse(200, {
+        thread_id: "thread_1", run_id: "run_10", turn_id: "turn_10", status: "COMPLETED",
+        text: "Done. The answer is 4.",
+      }),
     ];
     const fetchImpl: typeof fetch = async (input, init) => {
       expect(String(input)).toBe("/v1/threads/thread_1/turns");
       expect(JSON.parse(String(init?.body))).toEqual({ message: "deploy it" });
-      // Idempotency-Key must NOT be sent on turn submissions.
-      expect(new Headers(init?.headers).has("Idempotency-Key")).toBe(false);
+      expect(new Headers(init?.headers).get("Idempotency-Key")).toBe("submission-test");
       const next = responses.shift();
       if (next === undefined) throw new Error("unexpected extra call");
       return next;
     };
 
-    const waiting = await submitTurn(BASE, "thread_1", "deploy it", { fetchImpl });
+    const waiting = await submitTurn(BASE, "thread_1", "deploy it", { fetchImpl, idempotencyKey: "submission-test" });
     expect(waiting).toEqual({
       threadId: "thread_1",
       turnId: "turn_9",
@@ -56,13 +57,12 @@ describe("submitTurn", () => {
       queued: false,
     });
 
-    // A completed root turn carries only {thread_id, text} — no run_id, and
-    // callers must not fabricate a run from it.
-    const completed = await submitTurn(BASE, "thread_1", "deploy it", { fetchImpl });
+    const completed = await submitTurn(BASE, "thread_1", "deploy it", { fetchImpl, idempotencyKey: "submission-test" });
     expect(completed.threadId).toBe("thread_1");
     expect(completed.text).toBe("Done. The answer is 4.");
-    expect(completed.runId).toBeNull();
-    expect(completed.status).toBeNull();
+    expect(completed.runId).toBe("run_10");
+    expect(completed.turnId).toBe("turn_10");
+    expect(completed.status).toBe("COMPLETED");
     expect(completed.queued).toBe(false);
   });
 
@@ -74,6 +74,7 @@ describe("submitTurn", () => {
     };
     const transportError: unknown = await submitTurn(BASE, "thread_1", "hi", {
       fetchImpl: failing,
+      idempotencyKey: "submission-test",
     }).catch((e: unknown) => e);
     expect(calls).toBe(1);
     expect(transportError).toBeInstanceOf(ApiError);
@@ -88,6 +89,7 @@ describe("submitTurn", () => {
     };
     const httpError: unknown = await submitTurn(BASE, "thread_1", "hi", {
       fetchImpl: conflicted,
+      idempotencyKey: "submission-test",
     }).catch((e: unknown) => e);
     expect(httpCalls).toBe(1);
     expect(httpError).toBeInstanceOf(ApiError);
@@ -95,5 +97,21 @@ describe("submitTurn", () => {
       expect(httpError.status).toBe(409);
       expect(httpError.message).toBe("thread turn already running");
     }
+  });
+
+  const valid = { thread_id: "thread_1", run_id: "run_1", turn_id: "turn_1", status: "RUNNING" };
+  it.each([
+    {}, null, "ok", { ...valid, run_id: undefined }, { ...valid, run_id: "" },
+    { ...valid, turn_id: 1 }, { ...valid, thread_id: "another_thread" },
+    { ...valid, status: "queued" }, { ...valid, queued: "true" }, { ...valid, text: null },
+  ])("rejects invalid successful submission response %j", (body) => {
+    expect(() => parseTurnResult("thread_1", body)).toThrowError("Invalid submission response");
+  });
+
+  it("accepts a queued response with identities and ignores additional fields", () => {
+    expect(parseTurnResult("thread_1", { ...valid, queued: true, extra: "future" })).toEqual({
+      threadId: "thread_1", runId: "run_1", turnId: "turn_1", status: "RUNNING",
+      queued: true, text: null,
+    });
   });
 });

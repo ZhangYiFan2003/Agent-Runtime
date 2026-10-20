@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../api/client";
 import type { RuntimeEvent } from "../api/adapters/event";
-import { fetchRuntimeEvents } from "../sse/event-replay-client";
-import { getConnection } from "../lib/connection";
+import { EventProtocolError, fetchRuntimeEvents } from "../sse/event-replay-client";
+import { useConnection } from "../lib/connection";
 import { isTerminalRunStatus } from "../lib/run-detail-view";
 import type { ReplayStatus } from "../lib/events-view";
 
@@ -19,13 +19,23 @@ import type { ReplayStatus } from "../lib/events-view";
 
 export const MAX_KEPT_EVENTS = 1500;
 export const DEDUPE_WINDOW = 2000;
-/** Polls performed after the run reaches a terminal status before stopping. */
-export const TERMINAL_DRAIN_POLLS = 2;
+/** Preview storage is independent of the bounded debug event window. */
+export const MAX_PREVIEW_CHARS = 65_536;
+
+export interface StreamPreview {
+  runId: string;
+  turnId: string;
+  eventId: number;
+  timestamp: string;
+  text: string;
+  incomplete: boolean;
+}
 
 export interface RuntimeEventsState {
   events: RuntimeEvent[];
   status: ReplayStatus;
   error: string | null;
+  preview: StreamPreview | null;
 }
 
 /** Poll cadence: brisk catch-up during the terminal drain, ~1.5 s otherwise. */
@@ -72,6 +82,7 @@ export interface ReplaySessionOptions {
   fetchImpl?: typeof fetch;
   /** Injectable backoff for tests (defaults to `nextBackoffMs`). */
   backoff?: (attempt: number) => number;
+  latest?: boolean;
 }
 
 export interface ReplaySession {
@@ -83,8 +94,8 @@ export interface ReplaySession {
  * events with bounded-history + bounded-dedupe semantics (dropping old UI
  * entries never moves the cursor back), reconnects with backoff on network
  * failures, stops permanently on auth errors / thread 404, and performs a
- * bounded terminal drain (exactly `TERMINAL_DRAIN_POLLS` polls after the run
- * becomes terminal) so late events are still accepted. `stop()` aborts any
+ * terminal drain through the watermark observed by a round begun after the
+ * Run became terminal. `stop()` aborts any
  * in-flight fetch and the pending sleep.
  */
 export function startReplaySession(options: ReplaySessionOptions): ReplaySession {
@@ -95,11 +106,13 @@ export function startReplaySession(options: ReplaySessionOptions): ReplaySession
   let kept: RuntimeEvent[] = [];
   let cursor: number | null = null;
   let failures = 0;
-  let drainRemaining: number | null = null;
   let status: ReplayStatus = "connecting";
+  let preview: StreamPreview | null = null;
+  let observedStart: string | null = null;
+  let initial = true;
 
   const emit = (error: string | null = null) => {
-    options.onUpdate({ events: [...kept], status, error });
+    if (!cancelled) options.onUpdate({ events: [...kept], status, error, preview });
   };
   emit();
 
@@ -108,19 +121,37 @@ export function startReplaySession(options: ReplaySessionOptions): ReplaySession
       const round = new AbortController();
       controller = round;
       try {
-        const batch = await fetchRuntimeEvents(
+        const terminalAtStart = isTerminalRunStatus(options.getRunStatus() ?? "");
+        const page = await fetchRuntimeEvents(
           options.getConfig(),
-          { threadId: options.threadId, runId: options.runId, afterId: cursor },
+          { threadId: options.threadId, runId: options.runId, afterId: cursor, latest: initial && options.latest },
           { signal: round.signal, fetchImpl: options.fetchImpl },
         );
+        if (cancelled) break;
         failures = 0;
 
-        for (const event of batch) {
+        for (const event of page.events) {
           if (seen.has(event.eventId)) continue;
           seen.add(event.eventId);
           kept.push(event);
           cursor = cursor === null ? event.eventId : Math.max(cursor, event.eventId);
+          const currentPreview = preview as StreamPreview | null;
+          if (event.parentRunId === null && event.runId !== null) {
+            if (event.eventType === "run.started" || event.eventType === "turn.started") {
+              observedStart = event.runId;
+              if (currentPreview?.runId !== event.runId) preview = null;
+            }
+            if ((event.eventType === "text_delta" || event.eventType === "assistant.delta") && event.turnId !== null && typeof event.payload.text === "string") {
+              const previous: StreamPreview | null = currentPreview?.runId === event.runId && currentPreview.turnId === event.turnId ? currentPreview : null;
+              const incomplete: boolean = previous?.incomplete ?? (!!options.latest && observedStart !== event.runId);
+              const text: string = (previous?.text ?? "") + event.payload.text;
+              preview = { runId: event.runId, turnId: event.turnId, eventId: event.eventId, timestamp: event.timestamp,
+                incomplete: incomplete || text.length > MAX_PREVIEW_CHARS, text: incomplete || text.length > MAX_PREVIEW_CHARS ? "" : text };
+            }
+          }
         }
+        cursor = page.afterId;
+        initial = false;
         if (kept.length > MAX_KEPT_EVENTS) kept = kept.slice(kept.length - MAX_KEPT_EVENTS);
         if (seen.size > DEDUPE_WINDOW) {
           // The bounded UI history already covers this window.
@@ -128,22 +159,21 @@ export function startReplaySession(options: ReplaySessionOptions): ReplaySession
           for (const event of kept) seen.add(event.eventId);
         }
 
-        if (drainRemaining === null && isTerminalRunStatus(options.getRunStatus() ?? "")) {
-          drainRemaining = TERMINAL_DRAIN_POLLS;
-        }
-        if (drainRemaining !== null) {
-          drainRemaining -= 1;
-          if (drainRemaining <= 0) {
-            status = "stopped";
-            emit();
-            break;
-          }
+        if (terminalAtStart && !page.hasMore && page.afterId >= page.watermark) {
+          status = "stopped";
+          emit();
+          break;
         }
         status = "following";
         emit();
-        await sleep(pollIntervalMs(options.getRunStatus()), round.signal);
+        if (!page.hasMore) await sleep(pollIntervalMs(options.getRunStatus()), round.signal);
       } catch (error) {
         if (cancelled || isAbortError(error)) break;
+        if (error instanceof EventProtocolError) {
+          status = "stopped";
+          emit(error.message);
+          break;
+        }
         if (error instanceof ApiError) {
           if (error.status === 401 || error.status === 403) {
             status = "auth-error";
@@ -181,16 +211,22 @@ export function useRuntimeEvents({
   threadId,
   runId,
   runStatus,
+  latest = false,
 }: {
   threadId: string | null;
   runId: string;
   runStatus: string | undefined;
+  latest?: boolean;
 }): RuntimeEventsState {
-  const [state, setState] = useState<RuntimeEventsState>({
+  const connection = useConnection();
+  const key = JSON.stringify([connection.scope, connection.generation, threadId, runId, latest]);
+  const empty: RuntimeEventsState = {
     events: [],
     status: "stopped",
     error: null,
-  });
+    preview: null,
+  };
+  const [scopedState, setScopedState] = useState({ key, state: empty });
   // The loop reads the latest run status without restarting on each change;
   // the terminal drain depends on observing the transition inside the loop.
   const statusRef = useRef(runStatus);
@@ -200,20 +236,21 @@ export function useRuntimeEvents({
 
   useEffect(() => {
     if (idle) {
-      setState({ events: [], status: "stopped", error: null });
+      setScopedState({ key, state: empty });
       return;
     }
     const session = startReplaySession({
       threadId: threadId as string,
       runId,
-      getConfig: getConnection,
+      getConfig: () => connection.config,
       getRunStatus: () => statusRef.current,
-      onUpdate: setState,
+      onUpdate: (state) => setScopedState({ key, state }),
+      latest,
     });
     return () => session.stop();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- runStatus is read
     // via statusRef; only its defined-ness (idle) is a lifecycle dependency.
-  }, [idle, threadId, runId]);
+  }, [idle, threadId, runId, connection.scope, connection.generation, latest]);
 
-  return state;
+  return scopedState.key === key ? scopedState.state : { ...empty, status: idle ? "stopped" : "connecting" };
 }

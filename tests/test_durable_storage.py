@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -12,8 +13,15 @@ from uuid import uuid4
 import pytest
 
 from axiom.artifacts import ArtifactBlob, ArtifactRecord, ArtifactReuseEntry
-from axiom.config import AxiomConfig, StorageConfig, config_to_public_dict, load_config
+from axiom.config import (
+    AxiomConfig,
+    StorageConfig,
+    TrafficGovernanceConfig,
+    config_to_public_dict,
+    load_config,
+)
 from axiom.provenance import ClaimEvidenceLink, ClaimRecord, EvidenceRecord, EvidenceSourceType
+from axiom.runtime.capacity import AdmissionRejectedError
 from axiom.runtime.checkpoints import BudgetLedgerConflictError, CheckpointConflictError
 from axiom.runtime.control_plane import ApiError, ControlOperationName
 from axiom.runtime.durable import DurableAgentRuntime
@@ -21,6 +29,7 @@ from axiom.runtime.models import (
     BudgetLedgerRecord,
     Checkpoint,
     Interrupt,
+    RunError,
     RunStatus,
     ToolExecutionRecord,
     ToolExecutionStatus,
@@ -28,6 +37,24 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.storage import DurableStorage, create_durable_storage
 from axiom.tools import ToolRegistry
+
+
+def _submission(storage, thread_id, *, key="request", text="hello", **kwargs):
+    return asyncio.run(storage.runtime.admit_submission(
+        Checkpoint.create(thread_id=thread_id, input=text),
+        idempotency_key=key, request_fingerprint=text, **kwargs,
+    ))
+
+
+def _submission_counts(storage):
+    store = storage.runtime
+    connection = store._connect() if storage.backend == "sqlite" else store.pool.connection()
+    with connection as conn:
+        tables = ["checkpoints", "submission_idempotency", "events", "traffic_rate_buckets"]
+        if storage.backend == "postgres":
+            tables.append("runs")
+        return {table: conn.execute(f"select count(*) from {table}").fetchone()[0]
+                for table in tables}
 
 
 @contextmanager
@@ -73,12 +100,609 @@ def postgres_storage(tmp_path) -> Iterator[DurableStorage]:
         yield storage
 
 
+def _completed_submission(storage, thread_id, index):
+    state, _ = _submission(storage, thread_id, key=f"page-{index}", text=f"question {index}")
+    state.status = RunStatus.COMPLETED
+    state.output_text = f"answer {index}"
+    asyncio.run(storage.runtime.save(state))
+    return state
+
+
+def test_message_pages_ignore_log_window_and_preserve_both_boundaries(durable_storage):
+    storage = durable_storage
+    thread_id = storage.events.create_thread()
+    states = [_completed_submission(storage, thread_id, index) for index in range(4)]
+    # All timestamps can tie; the event sequence is the stable ordering authority.
+    connection = (storage.runtime._connect() if storage.backend == "sqlite"
+                  else storage.runtime.pool.connection())
+    with connection as conn:
+        if storage.backend == "sqlite":
+            conn.executemany(
+                "insert into events(thread_id,type,payload,created_at) values (?, ?, ?, ?)",
+                [(thread_id, "tool.delta", "{}", "2026-10-19T00:00:00+00:00")] * 1601,
+            )
+        else:
+            conn.execute("select id from threads where id = %s for update", (thread_id,))
+            with conn.cursor() as cursor:
+                cursor.executemany(
+                    "insert into events(thread_id,type,payload,created_at) "
+                    "values (%s, %s, %s::jsonb, %s)",
+                    [(thread_id, "tool.delta", "{}", "2026-10-19T00:00:00+00:00")] * 1601,
+                )
+    latest, watermark = storage.events.page_messages(thread_id, limit=3)
+    assert [event.payload["text"] for event in latest] == [
+        "question 2", "answer 2", "question 3", "answer 3",
+    ]  # LIMIT + 1, newest page has the lookahead at its beginning.
+    displayed = latest[-3:]
+    older, _ = storage.events.page_messages(thread_id, before_id=displayed[0].id, limit=3)
+    assert [event.payload["text"] for event in older[-3:]] == [
+        "question 1", "answer 1", "question 2",
+    ]
+    assert watermark == displayed[-1].id
+    _completed_submission(storage, thread_id, 4)
+    new, _ = storage.events.page_messages(thread_id, after_id=watermark, limit=3)
+    assert [event.payload["text"] for event in new] == ["question 4", "answer 4"]
+    # An older-page request cannot change the independent incremental cursor.
+    assert all(event.id > watermark for event in new)
+    assert {event.run_id for event in latest} == {state.run_id for state in states[-2:]}
+    logs, _ = storage.events.page_events(thread_id, latest=True, limit=3)
+    assert len(logs) == 4  # Final submission events; not a full history read.
+    assert len(storage.events.list_events(thread_id)) > 1600
+
+
+def test_message_page_excludes_children_and_ambiguous_records(durable_storage):
+    storage = durable_storage
+    thread_id = storage.events.create_thread()
+    root = _completed_submission(storage, thread_id, 0)
+    child = Checkpoint.create(thread_id=thread_id, input="child", parent_run_id=root.run_id)
+    child.status = RunStatus.COMPLETED
+    asyncio.run(storage.runtime.save(child))
+    for role in ("user", "assistant"):
+        storage.events.append_event(thread_id, f"{role}.message", {
+            "run_id": child.run_id, "turn_id": child.turn_id, "text": "hidden child",
+        })
+    storage.events.append_event(thread_id, "user.message", {"text": "unassociated legacy"})
+    duplicate = {
+        "thread_id": thread_id, "run_id": root.run_id, "turn_id": root.turn_id,
+        "text": "question 0",
+    }
+    storage.events.append_event(thread_id, "user.message", duplicate)
+    messages, _ = storage.events.page_messages(thread_id)
+    assert [message.payload["text"] for message in messages] == ["question 0", "answer 0"]
+    storage.events.append_event(thread_id, "user.message", {**duplicate, "text": "conflict"})
+    messages, _ = storage.events.page_messages(thread_id)
+    assert messages == []
+    assert any(event.payload.get("text") == "conflict"
+               for event in storage.events.list_events(thread_id))
+
+
+def test_event_pages_have_exclusive_boundaries_and_run_scope(durable_storage):
+    storage = durable_storage
+    thread_id = storage.events.create_thread()
+    states = [_completed_submission(storage, thread_id, index) for index in range(3)]
+    ids = []
+    after = 0
+    while True:
+        page, _ = storage.events.page_events(thread_id, after_id=after, limit=2)
+        visible = page[:2]
+        ids.extend(event.id for event in visible)
+        if len(page) <= 2:
+            break
+        after = visible[-1].id
+    assert ids == [event.id for event in storage.events.list_events(thread_id)]
+    scoped, _ = storage.events.page_events(thread_id, run_id=states[1].run_id, limit=2)
+    assert len(scoped) == 3 and {event.run_id for event in scoped} == {states[1].run_id}
+    empty, watermark = storage.events.page_events(thread_id, after_id=ids[-1], limit=2)
+    assert empty == [] and watermark == 0
+
+
+@pytest.mark.parametrize("sort", ["newest", "oldest", "status", "duration"])
+def test_run_summary_pages_sort_and_filter_globally(durable_storage, sort):
+    storage = durable_storage
+    states = []
+    for index in range(9):
+        state = Checkpoint.create(
+            thread_id=storage.events.create_thread(), input="large recovery authority",
+            run_id=f"run_page_{index:02}",
+            execution_strategy="react" if index % 2 else "plan_execute",
+        )
+        state.created_at = f"2026-10-19T00:00:{index // 3:02}+00:00"
+        state.status = [RunStatus.RUNNING, RunStatus.FAILED, RunStatus.COMPLETED][index % 3]
+        asyncio.run(storage.runtime.save(state))
+        states.append(state)
+    child = Checkpoint.create(thread_id=states[0].thread_id, input="child",
+                              parent_run_id=states[0].run_id, run_id="child_page")
+    asyncio.run(storage.runtime.save(child))
+    expected = asyncio.run(storage.runtime.list_run_summaries(limit=100, sort=sort))
+    assert len(expected) == 10
+    actual = []
+    position = None
+    while True:
+        page = asyncio.run(storage.runtime.list_run_summaries(
+            limit=2, position=position, sort=sort,
+        ))
+        actual.extend(page[:2])
+        if len(page) <= 2:
+            break
+        last = page[1]
+        position = (last["_cursor_value"], last["created_at"], last["run_id"])
+    assert [item["run_id"] for item in actual] == [item["run_id"] for item in expected]
+    parent_summary = next(item for item in actual if item["run_id"] == states[0].run_id)
+    assert parent_summary["children_count"] == 1
+    filtered = asyncio.run(storage.runtime.list_run_summaries(
+        limit=2, search="RUN_PAGE_", status="COMPLETED", strategy="plan_execute", sort=sort,
+    ))
+    assert {item["run_id"] for item in filtered} == {"run_page_02", "run_page_08"}
+    assert asyncio.run(storage.runtime.thread_run_head(states[0].thread_id)) == {
+        "run_id": states[0].run_id, "status": "RUNNING",
+    }
+
+
+@pytest.mark.parametrize("history_size", [20, 120])
+def test_sqlite_run_page_reads_two_bounded_queries_without_checkpoint_decoding(
+    tmp_path, monkeypatch, history_size,
+):
+    from axiom.runtime.checkpoints import SQLiteCheckpointStore
+
+    store = SQLiteCheckpointStore(tmp_path / "bounded.db")
+    # Use actual historical checkpoints without admission's unrelated capacity work.
+    with store._connect() as conn:
+        for index in range(history_size):
+            state = Checkpoint.create(thread_id="thread", input="x" * 1000,
+                                      run_id=f"run_{index:03}")
+            state.status = RunStatus.COMPLETED
+            for sequence in range(1, 4):
+                store._write_checkpoint(conn, state, sequence=sequence,
+                                        updated_at=state.updated_at)
+    statements = []
+    connect = store._connect
+
+    def trace_connect():
+        conn = connect()
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    def forbid_decode(*args, **kwargs):
+        raise AssertionError("Run list must not deserialize recovery authority")
+
+    monkeypatch.setattr(store, "_connect", trace_connect)
+    monkeypatch.setattr(Checkpoint, "from_dict", forbid_decode)
+    rows = asyncio.run(store.list_run_summaries(limit=5))
+    reads = [sql for sql in statements if sql.lstrip().lower().startswith("with")]
+    assert len(rows) == 6 and len(reads) == 2
+    assert "limit 6" in reads[0].lower()
+    assert "state_json from" not in reads[0].lower()
+    assert "parent_run_id in (" in reads[1]
+
+
+def test_postgres_event_id_allocation_waits_for_same_thread_commit(postgres_storage):
+    from axiom.runtime.postgres import PostgresEventRepository
+
+    storage = postgres_storage
+    thread_id = storage.events.create_thread()
+    initial, watermark = storage.events.page_events(thread_id, latest=True)
+    assert watermark == initial[-1].id
+    allocated = threading.Event()
+    release_commit = threading.Event()
+    second_attempted = threading.Event()
+
+    class PausedConnection:
+        def __init__(self, conn, first):
+            self.conn = conn
+            self.first = first
+
+        def execute(self, statement, parameters=()):
+            if not self.first and "select id from threads" in statement.lower():
+                second_attempted.set()
+            result = self.conn.execute(statement, parameters)
+            if self.first and "insert into events" in statement.lower():
+                allocated.set()
+                assert release_commit.wait(10)
+            return result
+
+    class PausedPool:
+        def __init__(self, first):
+            self.first = first
+
+        @contextmanager
+        def connection(self):
+            with storage.runtime.pool.connection() as conn:
+                yield PausedConnection(conn, self.first)
+
+    first = PostgresEventRepository(PausedPool(True))
+    second = PostgresEventRepository(PausedPool(False))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_write = executor.submit(first.append_event, thread_id, "first", {})
+        try:
+            assert allocated.wait(10)
+            second_write = executor.submit(second.append_event, thread_id, "second", {})
+            assert second_attempted.wait(10)
+            # The second transaction cannot publish a higher cursor while the first
+            # has allocated a lower ID but has not committed yet.
+            visible, _ = storage.events.page_events(thread_id, after_id=watermark)
+            assert visible == []
+        finally:
+            release_commit.set()
+        first_id, second_id = first_write.result(10), second_write.result(10)
+    visible, _ = storage.events.page_events(thread_id, after_id=watermark)
+    assert [event.id for event in visible] == [first_id, second_id]
+    assert first_id < second_id
+
+
 def test_storage_configuration_defaults_to_sqlite_and_redacts_dsn(tmp_path):
     config = load_config(project_root=tmp_path, env={})
     assert config.storage.backend == "sqlite"
 
     config.storage.postgres_dsn = "postgresql://user:secret@example.invalid/db"
     assert config_to_public_dict(config)["storage"]["postgres_dsn"] == "***"
+
+
+@pytest.mark.parametrize("key", [None, "request"])
+def test_submission_atomically_persists_identity_and_events(durable_storage, key):
+    thread_id = durable_storage.events.create_thread()
+    state, created = _submission(durable_storage, thread_id, key=key)
+    assert created and state.sequence == 1
+    assert [message.content for message in state.messages] == ["hello"]
+    stored = asyncio.run(durable_storage.runtime.load(state.run_id))
+    assert stored.turn_id == state.turn_id
+    events = [event for event in durable_storage.events.list_events(thread_id)
+              if event.type in {"turn.started", "user.message"}]
+    assert [event.type for event in events] == ["turn.started", "user.message"]
+    assert {(event.thread_id, event.run_id, event.turn_id) for event in events} == {
+        (thread_id, state.run_id, state.turn_id)
+    }
+    assert all(event.payload["run_id"] == state.run_id for event in events)
+    admitted_events = [event for event in durable_storage.events.list_events(thread_id)
+                       if event.type == "run.admitted"]
+    assert len(admitted_events) == 1
+    assert admitted_events[0].run_id == state.run_id
+    assert admitted_events[0].turn_id == state.turn_id
+    assert admitted_events[0].payload["status"] == RunStatus.RUNNING.value
+    assert events[0].payload["message_chars"] == len("hello")
+
+
+@pytest.mark.parametrize("crash_event", ["user.message", "run.admitted"])
+def test_submission_failure_rolls_back_run_mapping_events_and_rate(
+    durable_storage, monkeypatch, crash_event,
+):
+    from axiom.runtime import postgres
+
+    store = durable_storage.runtime
+    thread_id = durable_storage.events.create_thread()
+    before = _submission_counts(durable_storage)
+    if durable_storage.backend == "sqlite":
+        target, attribute = store, "_append_event"
+    else:
+        target, attribute = postgres, "_append_submission_event"
+    original = getattr(target, attribute)
+
+    def fail_after_event(conn, state, event_type, payload):
+        event_id = original(conn, state, event_type, payload)
+        if event_type == crash_event:
+            raise RuntimeError("injected submission crash")
+        return event_id
+
+    monkeypatch.setattr(target, attribute, fail_after_event)
+    candidate = Checkpoint.create(thread_id=thread_id, input="hello")
+    original_candidate = deepcopy(candidate.to_dict())
+    with pytest.raises(RuntimeError, match="injected submission crash"):
+        asyncio.run(store.admit_submission(
+            candidate, idempotency_key="request", request_fingerprint="hello",
+            traffic=TrafficGovernanceConfig(global_submission_rate=1, global_submission_burst=1),
+        ))
+    assert candidate.to_dict() == original_candidate
+    assert _submission_counts(durable_storage) == before
+    assert asyncio.run(store.list(thread_id)) == []
+    assert asyncio.run(store.lookup_submission(thread_id, "request", "hello")) is None
+
+
+@pytest.mark.parametrize("principal_limit", [False, True], ids=["global", "principal"])
+def test_capacity_rejection_does_not_reserve_submission_identity(durable_storage, principal_limit):
+    first_thread = durable_storage.events.create_thread()
+    _submission(durable_storage, first_thread)
+    rejected_thread = durable_storage.events.create_thread()
+    before = _submission_counts(durable_storage)
+    limit = {"max_queued_runs_per_principal": 1} if principal_limit else {"max_queued_runs": 1}
+    with pytest.raises((AdmissionRejectedError, ApiError)) as rejected:
+        _submission(durable_storage, rejected_thread, **limit)
+    if principal_limit:
+        assert rejected.value.code == "PRINCIPAL_QUEUE_QUOTA_EXCEEDED"
+    else:
+        assert isinstance(rejected.value, AdmissionRejectedError)
+    assert _submission_counts(durable_storage) == before
+    assert asyncio.run(durable_storage.runtime.list(rejected_thread)) == []
+    assert asyncio.run(durable_storage.runtime.lookup_submission(
+        rejected_thread, "request", "hello"
+    )) is None
+    # An explicitly rejected key remains available when capacity is relaxed.
+    accepted, created = _submission(durable_storage, rejected_thread)
+    assert created and accepted.thread_id == rejected_thread
+
+
+@pytest.mark.parametrize("same_key", [False, True], ids=["different-keys", "same-key"])
+def test_submission_race_uses_independent_database_connections(
+    durable_storage, same_key, monkeypatch,
+):
+    from axiom.runtime.checkpoints import SQLiteCheckpointStore
+    from axiom.runtime.postgres import PostgresRuntimeStore
+
+    thread_id = durable_storage.events.create_thread()
+    barrier = threading.Barrier(2)
+    if durable_storage.backend == "sqlite":
+        stores = [SQLiteCheckpointStore(durable_storage.runtime.db_path) for _ in range(2)]
+        for store in stores:
+            original = store._connect
+
+            def connect(original=original):
+                conn = original()
+                barrier.wait(timeout=10)
+                return conn
+
+            monkeypatch.setattr(store, "_connect", connect)
+    else:
+        class GatedPool:
+            @contextmanager
+            def connection(self):
+                with durable_storage.runtime.pool.connection() as conn:
+                    barrier.wait(timeout=10)
+                    yield conn
+
+        stores = [PostgresRuntimeStore(GatedPool()) for _ in range(2)]
+
+    def submit(index):
+        try:
+            return asyncio.run(stores[index].admit_submission(
+                Checkpoint.create(thread_id=thread_id, input="hello"),
+                idempotency_key="same" if same_key else f"key-{index}",
+                request_fingerprint="hello",
+            ))
+        except ApiError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(submit, range(2)))
+    accepted = [result for result in results if isinstance(result, tuple)]
+    assert sum(created for _, created in accepted) == 1
+    if same_key:
+        assert len(accepted) == 2
+        assert accepted[0][0].run_id == accepted[1][0].run_id
+    else:
+        errors = [result for result in results if isinstance(result, ApiError)]
+        assert len(errors) == 1 and errors[0].code == "THREAD_BUSY"
+        assert errors[0].details["active_run_id"] == accepted[0][0].run_id
+    assert len(asyncio.run(durable_storage.runtime.list(thread_id))) == 1
+    events = durable_storage.events.list_events(thread_id)
+    assert [event.type for event in events].count("user.message") == 1
+    assert [event.type for event in events].count("turn.started") == 1
+
+
+@pytest.mark.parametrize("status", [RunStatus.RUNNING, RunStatus.INTERRUPTED,
+                                   RunStatus.WAITING_APPROVAL, RunStatus.WAITING_CHILD])
+def test_occupied_thread_rejects_new_key_without_writing(durable_storage, status):
+    thread_id = durable_storage.events.create_thread()
+    state, _ = _submission(durable_storage, thread_id)
+    state.status = status
+    asyncio.run(durable_storage.runtime.save(state))
+    before = _submission_counts(durable_storage)
+    with pytest.raises(ApiError) as error:
+        _submission(durable_storage, thread_id, key="new", max_queued_runs=1)
+    assert error.value.code == "THREAD_BUSY"
+    assert error.value.details["active_run_id"] == state.run_id
+    assert _submission_counts(durable_storage) == before
+    replay, created = _submission(durable_storage, thread_id, max_queued_runs=1)
+    assert replay.run_id == state.run_id and not created
+    assert replay.status == status
+
+
+def test_submission_replay_precedes_capacity_and_rate_and_conflict_is_precise(durable_storage):
+    store = durable_storage.runtime
+    thread_id = durable_storage.events.create_thread()
+    traffic = TrafficGovernanceConfig(global_submission_rate=0.001, global_submission_burst=1)
+    state, _ = _submission(durable_storage, thread_id, traffic=traffic)
+    before = _submission_counts(durable_storage)
+    replay, created = _submission(durable_storage, thread_id, traffic=traffic, max_queued_runs=1)
+    assert not created and replay.run_id == state.run_id
+    with pytest.raises(ApiError) as conflict:
+        _submission(durable_storage, thread_id, text="different", traffic=traffic)
+    assert conflict.value.code == "IDEMPOTENCY_KEY_CONFLICT"
+    assert _submission_counts(durable_storage) == before
+    other_thread = durable_storage.events.create_thread()
+    with pytest.raises(ApiError) as limited:
+        _submission(durable_storage, other_thread, traffic=traffic)
+    assert limited.value.code == "RATE_LIMITED"
+    assert asyncio.run(store.list(other_thread)) == []
+    state.status = RunStatus.COMPLETED
+    state.output_text = "answer"
+    asyncio.run(store.save(state))
+    _submission(durable_storage, other_thread)
+    replay, created = _submission(durable_storage, thread_id, traffic=traffic, max_queued_runs=1)
+    assert not created and replay.run_id == state.run_id and replay.status == RunStatus.COMPLETED
+
+
+def test_completion_projection_repairs_crash_gap_and_history_is_authoritative(
+    durable_storage, monkeypatch,
+):
+    from axiom.runtime import postgres
+
+    store = durable_storage.runtime
+    thread_id = durable_storage.events.create_thread()
+    state, _ = _submission(durable_storage, thread_id)
+    state.status = RunStatus.COMPLETED
+    state.output_text = "persisted answer"
+    target, attribute = ((store, "_project_completed_in_transaction")
+                         if durable_storage.backend == "sqlite"
+                         else (postgres, "_project_completed_in_transaction"))
+    with monkeypatch.context() as crash_gap:
+        crash_gap.setattr(target, attribute, lambda *_args: (None, False))
+        asyncio.run(store.save(state))
+    child = Checkpoint.create(thread_id=thread_id, input="child input", parent_run_id=state.run_id)
+    child.status = RunStatus.COMPLETED
+    child.output_text = "child output"
+    asyncio.run(store.save(child))
+    assert not any(event.type == "assistant.message"
+                   for event in durable_storage.events.list_events(thread_id))
+    next_state, _ = _submission(durable_storage, thread_id, key="next", text="next input")
+    assert [(message.role, message.content) for message in next_state.messages] == [
+        ("user", "hello"), ("assistant", "persisted answer"), ("user", "next input")
+    ]
+    event_id, created = asyncio.run(store.project_completed_turn(state))
+    assert event_id is not None and not created
+    assert asyncio.run(store.project_completed_turn(state)) == (event_id, False)
+    projected = [event for event in durable_storage.events.list_events(thread_id)
+                 if event.type in {"assistant.message", "turn.completed"}]
+    assert [event.type for event in projected] == ["assistant.message", "turn.completed"]
+    assert {(event.run_id, event.turn_id) for event in projected} == {(state.run_id, state.turn_id)}
+
+
+def test_terminal_save_projects_messages_in_its_transaction(durable_storage, monkeypatch):
+    from axiom.runtime import postgres
+
+    store = durable_storage.runtime
+    thread_id = durable_storage.events.create_thread()
+    state, _ = _submission(durable_storage, thread_id)
+    target, attribute = ((store, "_append_event") if durable_storage.backend == "sqlite"
+                         else (postgres, "_append_submission_event"))
+    original = getattr(target, attribute)
+
+    def fail(conn, state, event_type, payload):
+        event_id = original(conn, state, event_type, payload)
+        if event_type == "turn.completed":
+            raise RuntimeError("terminal projection crash")
+        return event_id
+
+    state.status = RunStatus.COMPLETED
+    state.output_text = "answer"
+    before = _submission_counts(durable_storage)
+    with monkeypatch.context() as crash:
+        crash.setattr(target, attribute, fail)
+        with pytest.raises(RuntimeError, match="terminal projection crash"):
+            asyncio.run(store.save(state))
+    assert asyncio.run(store.load(state.run_id)).status == RunStatus.RUNNING
+    assert _submission_counts(durable_storage) == before
+    asyncio.run(store.save(state))
+    assert asyncio.run(store.project_completed_turn(state))[0] is not None
+
+
+@pytest.mark.parametrize("existing_type", ["assistant.message", "turn.completed"])
+def test_projection_repairs_either_half_without_duplicate_events(durable_storage, monkeypatch,
+                                                               existing_type):
+    from axiom.runtime import postgres
+
+    store = durable_storage.runtime
+    thread_id = durable_storage.events.create_thread()
+    state, _ = _submission(durable_storage, thread_id)
+    state.status = RunStatus.COMPLETED
+    state.output_text = "durable answer"
+    target, attribute = ((store, "_project_completed_in_transaction")
+                         if durable_storage.backend == "sqlite"
+                         else (postgres, "_project_completed_in_transaction"))
+    with monkeypatch.context() as gap:
+        gap.setattr(target, attribute, lambda *_args: (None, False))
+        asyncio.run(store.save(state))
+    durable_storage.events.append_event(thread_id, existing_type, {
+        "thread_id": thread_id, "run_id": state.run_id, "turn_id": state.turn_id,
+        "text": state.output_text, "status": state.status.value,
+    })
+    event_id, created = asyncio.run(store.project_completed_turn(state))
+    assert event_id is not None
+    assert created is (existing_type == "turn.completed")
+    assert asyncio.run(store.project_completed_turn(state)) == (event_id, False)
+    events = durable_storage.events.list_events(thread_id)
+    assert sum(event.type == "assistant.message" for event in events) == 1
+    assert sum(event.type == "turn.completed" for event in events) == 1
+
+
+def test_child_runs_do_not_take_another_thread_slot(durable_storage):
+    store = durable_storage.runtime
+    thread_id = durable_storage.events.create_thread()
+    parent, _ = _submission(durable_storage, thread_id)
+    parent.status = RunStatus.WAITING_CHILD
+    asyncio.run(store.save(parent))
+    children = [Checkpoint.create(thread_id=thread_id, input=f"child {index}",
+                                  parent_run_id=parent.run_id) for index in range(2)]
+    for child in children:
+        asyncio.run(store.save(child))
+    assert len(asyncio.run(store.list(thread_id))) == 3
+    other_thread = durable_storage.events.create_thread()
+    accepted, created = _submission(durable_storage, other_thread)
+    assert created and accepted.thread_id == other_thread
+
+
+def test_old_root_reactivation_cannot_overlap_new_root(durable_storage):
+    store = durable_storage.runtime
+    thread_id = durable_storage.events.create_thread()
+    old, _ = _submission(durable_storage, thread_id)
+    old.status = RunStatus.FAILED
+    asyncio.run(store.save(old))
+    active, _ = _submission(durable_storage, thread_id, key="new")
+    before = _submission_counts(durable_storage)
+    old.status = RunStatus.RUNNING
+    with pytest.raises(ApiError) as conflict:
+        asyncio.run(store.save(old))
+    assert conflict.value.code == "THREAD_BUSY"
+    assert conflict.value.details["active_run_id"] == active.run_id
+    assert _submission_counts(durable_storage) == before
+
+
+def test_schema_upgrade_preserves_existing_conflicting_roots(durable_storage):
+    from axiom.runtime.checkpoints import SQLiteCheckpointStore
+    from axiom.runtime.postgres import _insert_initial_run, initialize_postgres_schema
+
+    store = durable_storage.runtime
+    thread_id = durable_storage.events.create_thread()
+    legacy_roots = [Checkpoint.create(thread_id=thread_id, input=f"legacy {index}")
+                    for index in range(2)]
+    connection = (
+        store._connect() if durable_storage.backend == "sqlite" else store.pool.connection()
+    )
+    with connection as conn:
+        if durable_storage.backend == "sqlite":
+            # Simulate the pre-admission SQLite schema while retaining its Run history.
+            conn.execute("drop table submission_idempotency")
+            conn.execute("drop table traffic_rate_buckets")
+        for state in legacy_roots:
+            if durable_storage.backend == "sqlite":
+                store._write_checkpoint(
+                    conn, state, sequence=1, updated_at=state.updated_at
+                )
+            else:
+                _insert_initial_run(conn, state, updated_at=state.updated_at, runnable=True)
+    before = [state.to_dict() for state in asyncio.run(store.list(thread_id))]
+    if durable_storage.backend == "sqlite":
+        SQLiteCheckpointStore(store.db_path)
+    else:
+        initialize_postgres_schema(store.pool)
+    assert [state.to_dict() for state in asyncio.run(store.list(thread_id))] == before
+    with pytest.raises(ApiError) as conflict:
+        _submission(durable_storage, thread_id)
+    assert conflict.value.code == "THREAD_BUSY"
+    assert [state.to_dict() for state in asyncio.run(store.list(thread_id))] == before
+    if durable_storage.backend == "postgres":
+        # Neither claim entry point can run conflicting historical roots together.
+        for claim in (lambda: store.claim_run(legacy_roots[0].run_id, "worker", 30),
+                      lambda: store.claim_next("worker", 30)):
+            with pytest.raises(ApiError) as blocked:
+                asyncio.run(claim())
+            assert blocked.value.code == "THREAD_BUSY"
+
+
+@pytest.mark.postgres
+def test_delivery_requeue_cannot_reactivate_old_root_over_new_submission(postgres_storage):
+    store = postgres_storage.runtime
+    thread_id = postgres_storage.events.create_thread()
+    old = Checkpoint.create(thread_id=thread_id, input="old")
+    old.status = RunStatus.FAILED
+    old.error = RunError(type="RUN_DELIVERY_EXHAUSTED", message="delivery exhausted")
+    old.failure_queued_at = datetime.now(UTC).isoformat()
+    asyncio.run(store.save(old))
+    active, _ = _submission(postgres_storage, thread_id)
+    before = _submission_counts(postgres_storage)
+    with pytest.raises(ApiError) as blocked:
+        asyncio.run(store.requeue_delivery_exhausted(old.run_id))
+    assert blocked.value.code == "THREAD_BUSY"
+    assert blocked.value.details["active_run_id"] == active.run_id
+    assert _submission_counts(postgres_storage) == before
+    assert asyncio.run(store.load(old.run_id)).status == RunStatus.FAILED
 
 
 def test_artifact_metadata_store_contract(durable_storage):

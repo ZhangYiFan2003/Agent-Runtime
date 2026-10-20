@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Eye, EyeOff, PlugZap, Trash2 } from "lucide-react";
 import { testConnection, type ConnectionTestResult } from "../api/health";
-import { clearConnection, getConnection, saveConnection } from "../lib/connection";
+import type { HealthView } from "../api/adapters/health";
+import { clearConnection, getConnection, getConnectionSnapshot, saveConnection } from "../lib/connection";
 import { useDocumentTitle } from "../lib/use-document-title";
 import { queryKeys } from "../queries/keys";
 import { Button } from "../components/ui/button";
@@ -12,14 +13,14 @@ import { Label } from "../components/ui/label";
 import { Separator } from "../components/ui/separator";
 import { StatusDot } from "../components/ui/status-dot";
 
-function HealthDetails({ health }: { health: ConnectionTestResult & { ok: true } }) {
+function HealthDetails({ health }: { health: HealthView }) {
   const rows: Array<[string, string]> = [
-    ["storage", health.health.storageBackend],
-    ["workers", String(health.health.workers)],
-    ["database", health.health.database],
+    ["storage", health.storageBackend],
+    ["API-local task threads", String(health.workers)],
+    ["database", health.database],
   ];
-  if (health.health.capacity) {
-    const { activeRuns, queuedRuns, maxActiveRuns, maxQueuedRuns } = health.health.capacity;
+  if (health.capacity) {
+    const { activeRuns, queuedRuns, maxActiveRuns, maxQueuedRuns } = health.capacity;
     if (activeRuns !== null || queuedRuns !== null) {
       rows.push([
         "capacity",
@@ -55,26 +56,43 @@ export function SettingsPage() {
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<ConnectionTestResult | null>(null);
+  const testGeneration = useRef(0);
+
+  function discardConnectionCache() {
+    const queryKey = queryKeys.connection(getConnectionSnapshot());
+    void queryClient.cancelQueries({ queryKey });
+    queryClient.removeQueries({ queryKey });
+  }
 
   async function handleTest() {
+    const generation = ++testGeneration.current;
+    const connectionGeneration = getConnectionSnapshot().generation;
     setTesting(true);
     setResult(null);
-    const outcome = await testConnection({ baseUrl: baseUrl.trim(), apiKey: apiKey.trim() });
+    const submitted = { baseUrl: baseUrl.trim(), apiKey: apiKey.trim() };
+    const outcome = await testConnection(submitted);
+    if (generation !== testGeneration.current) return;
+    if (connectionGeneration !== getConnectionSnapshot().generation) {
+      setTesting(false);
+      return;
+    }
     setResult(outcome);
     if (outcome.ok) {
-      // Persist only on a verified connection; then refresh the shell status.
-      saveConnection({ baseUrl: baseUrl.trim(), apiKey: apiKey.trim() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.health });
+      // Clear the old generation even when the URL remains the same.
+      discardConnectionCache();
+      saveConnection(submitted);
     }
     setTesting(false);
   }
 
   function handleClear() {
+    testGeneration.current += 1;
+    setTesting(false);
+    discardConnectionCache();
     clearConnection();
     setBaseUrl("");
     setApiKey("");
     setResult(null);
-    void queryClient.invalidateQueries({ queryKey: queryKeys.health });
   }
 
   return (
@@ -101,14 +119,14 @@ export function SettingsPage() {
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="api-key">API Key</Label>
+          <Label htmlFor="api-key">Runtime API Key</Label>
           <div className="relative">
             <Input
               id="api-key"
               type={showKey ? "text" : "password"}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder="sk-…"
+              placeholder="Runtime API key"
               autoComplete="off"
               spellCheck={false}
               className="pr-9 font-mono text-xs"
@@ -123,8 +141,8 @@ export function SettingsPage() {
             </button>
           </div>
           <p className="text-[11px] text-fg-2">
-            Kept in memory / sessionStorage only — never written to .env, the bundle, or this
-            repository.
+            Authenticates this Runtime; your model provider uses a separate key.
+            Kept in memory / sessionStorage only.
           </p>
         </div>
 
@@ -144,14 +162,19 @@ export function SettingsPage() {
         {result?.ok && (
           <div className="rounded-md border border-border bg-bg-1 p-3">
             <div className="flex items-center gap-2 text-13 font-medium text-fg-0">
-              <StatusDot tone="accent" />
-              Connected
-              <span className="font-mono text-xs font-normal text-fg-2">
-                /health → {result.health.status}
-              </span>
+              <StatusDot tone={!result.health || result.health.database === "error" ? "warn" : "accent"} />
+              {result.health?.database === "error"
+                ? "Credentials verified · database error"
+                : "Credentials verified"}
             </div>
             <div className="mt-3">
-              <HealthDetails health={result} />
+              {result.health ? (
+                <HealthDetails health={result.health} />
+              ) : (
+                <p className="text-xs text-fg-2">
+                  Health information unavailable: {result.healthError.message}
+                </p>
+              )}
             </div>
           </div>
         )}
@@ -160,8 +183,8 @@ export function SettingsPage() {
           <ErrorState
             title={
               result.error.status > 0
-                ? `Disconnected · HTTP ${result.error.status}`
-                : "Disconnected"
+                ? `Credential verification failed · HTTP ${result.error.status}`
+                : "Credential verification failed"
             }
             message={
               result.error.code

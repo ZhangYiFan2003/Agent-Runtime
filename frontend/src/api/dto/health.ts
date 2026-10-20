@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+/** Required identity response from the protected `GET /v1/auth/check`. */
+export const authCheckSchema = z
+  .object({ authenticated: z.literal(true) })
+  .catchall(z.unknown());
+
 /**
  * DTO for `GET /health` (unauthenticated).
  * Mirrors the backend response exactly (snake_case). Unknown fields are

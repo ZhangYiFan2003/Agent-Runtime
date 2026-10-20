@@ -4,6 +4,10 @@ This harness exercises the real Docker Compose deployment through its Web/Nginx 
 uses the real Runtime API, PostgreSQL queue and ownership implementation, Worker replicas,
 providerd, sandboxd, per-Run Sandboxes, MinIO, and persisted SSE replay. The only fake component is
 a deterministic local OpenAI-compatible provider; no external provider or credential is used.
+The fake provider is on the internal `provider-control` network. Its success proves the gateway
+and execution path, not external provider DNS/TLS connectivity or a successful real model call.
+providerd inherits the dedicated `provider-egress` bridge from the base deployment; the fake
+provider and every other service remain off that egress network.
 
 This is machine-specific evidence, not a CI threshold or universal SLO. The deterministic
 crash-window correctness matrix in [`../recovery/`](../recovery/) remains authoritative for
@@ -59,6 +63,46 @@ service before continuing. A final Artifact and Claim sample checks post-fault c
 Run a subset with `--scenarios worker-loss runtime-api-restart`. Use `--leave-running` only when a
 manual diagnostic or the separate recovery matrix needs the isolated stack afterward; clean it
 with the same project and overlay files, never with a global Docker command.
+
+## External connectivity check
+
+Retain a bounded isolated stack, then check external DNS/TLS/HTTP separately from fake model
+inference:
+
+```powershell
+uv run python -m benchmarks.deployment.run_load --profiles smoke --project axiom-stage15-egress --build --leave-running
+```
+
+Run the following Python from the repository root with the existing controller, then clean up
+only this reserved project with `controller.cleanup()`:
+
+```python
+from benchmarks.deployment.common import ComposeController
+
+controller = ComposeController("axiom-stage15-egress")  # the retained stack's project name
+try:
+    controller.run(["config", "--quiet"])
+    print(controller.exec("providerd", ["python", "-c", """
+import http.client
+import socket
+host = 'api.deepseek.com'
+socket.getaddrinfo(host, 443)
+print('DNS: ok')
+connection = http.client.HTTPSConnection(host, timeout=10)
+connection.connect()
+print('TLS: ok')
+connection.request('GET', '/')
+print('HTTP status:', connection.getresponse().status)
+connection.close()
+"""]))
+finally:
+    controller.cleanup()
+```
+
+This sends no provider credentials and creates no model completion. A 401/403 response is
+connectivity evidence, not model success. Use the configured provider's host when different.
+See [`deploy/README.md`](../../deploy/README.md#reliability-validation) for the distinction between
+configuration, container connectivity, and real model verification.
 
 ## Interpreting `/health`
 

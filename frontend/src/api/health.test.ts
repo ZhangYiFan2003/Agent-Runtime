@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { testConnection } from "./health";
+import { describe, expect, it, vi } from "vitest";
+import { fetchHealth, testConnection } from "./health";
 
 const HEALTH_BODY = {
   status: "ok",
@@ -22,11 +22,22 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe("testConnection", () => {
-  it("returns the adapted health view on success", async () => {
-    const fetchImpl: typeof fetch = async () => jsonResponse(200, HEALTH_BODY);
-    const result = await testConnection({ baseUrl: "", apiKey: "" }, fetchImpl);
+  it("verifies credentials before returning the adapted health view", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input) =>
+      jsonResponse(200, String(input).endsWith("/v1/auth/check")
+        ? { authenticated: true, extra: "compatible" }
+        : HEALTH_BODY),
+    );
+    const result = await testConnection({ baseUrl: "http://runtime", apiKey: "runtime-test" }, fetchImpl);
     expect(result.ok).toBe(true);
-    if (result.ok) {
+    expect(fetchImpl.mock.calls.map(([url]) => url)).toEqual([
+      "http://runtime/v1/auth/check",
+      "http://runtime/health",
+    ]);
+    expect(fetchImpl.mock.calls[0]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer runtime-test",
+    });
+    if (result.ok && result.health) {
       expect(result.health.status).toBe("ok");
       expect(result.health.storageBackend).toBe("sqlite");
       expect(result.health.workers).toBe(4);
@@ -39,14 +50,80 @@ describe("testConnection", () => {
     }
   });
 
-  it("surfaces HTTP failures with status and normalized message", async () => {
-    const fetchImpl: typeof fetch = async () => jsonResponse(401, { error: "unauthorized" });
-    const result = await testConnection({ baseUrl: "", apiKey: "wrong" }, fetchImpl);
+  it.each([
+    { apiKey: "wrong", status: 401 },
+    { apiKey: "", status: 401 },
+    { apiKey: "forbidden", status: 403 },
+  ])("rejects auth $status for '$apiKey' even while public health returns 200", async ({ apiKey, status }) => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input) =>
+      String(input).endsWith("/health")
+        ? jsonResponse(200, HEALTH_BODY)
+        : jsonResponse(status, { error: "unauthorized" }),
+    );
+    const config = { baseUrl: "", apiKey };
+    expect(await fetchHealth(config, fetchImpl)).toMatchObject({ status: "ok" });
+    fetchImpl.mockClear();
+    const result = await testConnection(config, fetchImpl);
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.error.status).toBe(401);
+      expect(result.error.status).toBe(status);
       expect(result.error.message).toBe("unauthorized");
     }
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe("/v1/auth/check");
+    if (!apiKey) {
+      expect(fetchImpl.mock.calls[0]?.[1]?.headers).not.toHaveProperty("Authorization");
+    }
+  });
+
+  it("reports an unsupported auth endpoint without falling back to public health", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input) =>
+      String(input).endsWith("/health")
+        ? jsonResponse(200, HEALTH_BODY)
+        : jsonResponse(404, { error: "not found" }),
+    );
+    const result = await testConnection({ baseUrl: "", apiKey: "runtime-test" }, fetchImpl);
+    expect(result).toMatchObject({
+      ok: false,
+      error: { status: 404, code: "AUTH_CHECK_UNSUPPORTED" },
+    });
+    if (!result.ok) expect(result.error.message).toContain("does not support");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([{}, { authenticated: false }, { authenticated: "true" }, { authenticated: 1 }, null, [], "ok"])(
+    "rejects malformed successful auth response %j",
+    async (body) => {
+      const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse(200, body));
+      const result = await testConnection({ baseUrl: "", apiKey: "runtime-test" }, fetchImpl);
+      expect(result).toMatchObject({
+        ok: false,
+        error: { code: "INVALID_AUTH_RESPONSE" },
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("keeps verified credentials separate from a reported database error", async () => {
+    const fetchImpl: typeof fetch = async (input) =>
+      jsonResponse(200, String(input).endsWith("/v1/auth/check")
+        ? { authenticated: true }
+        : { ...HEALTH_BODY, workers: 0, database: "error" });
+    const result = await testConnection({ baseUrl: "", apiKey: "runtime-test" }, fetchImpl);
+    expect(result).toMatchObject({ ok: true, health: { database: "error", workers: 0 } });
+  });
+
+  it("retains authentication success when public health is unavailable", async () => {
+    const fetchImpl: typeof fetch = async (input) =>
+      String(input).endsWith("/v1/auth/check")
+        ? jsonResponse(200, { authenticated: true })
+        : jsonResponse(503, { error: "database unavailable" });
+    const result = await testConnection({ baseUrl: "", apiKey: "runtime-test" }, fetchImpl);
+    expect(result).toEqual({
+      ok: true,
+      health: null,
+      healthError: { status: 503, code: undefined, message: "database unavailable" },
+    });
   });
 
   it("surfaces structured control errors with code", async () => {

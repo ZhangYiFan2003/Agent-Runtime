@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import sqlite3
 
@@ -9,6 +9,7 @@ from axiom.memory import (
     MemoryService,
     MemoryStore,
 )
+from axiom.runtime.events import RuntimeEvent
 
 
 def test_memory_manager_persists_and_isolates_scopes(tmp_path):
@@ -67,9 +68,7 @@ def test_memory_store_migrates_legacy_rows_idempotently(tmp_path):
 
     records = store.list_records(kind=MemoryKind.FACT, scope_id="project-a")
     assert store.schema_version() == "2"
-    assert [(record.id, record.content) for record in records] == [
-        ("legacy_1", "legacy decision")
-    ]
+    assert [(record.id, record.content) for record in records] == [("legacy_1", "legacy decision")]
 
 
 def test_memory_service_typed_records_scope_isolation_and_supersession(tmp_path):
@@ -111,20 +110,40 @@ def test_memory_service_typed_records_scope_isolation_and_supersession(tmp_path)
 
 def test_memory_context_budget_is_deterministic_and_evicts_old_conversation(tmp_path):
     service = MemoryService(tmp_path / "memory.db", project_scope="project-a", user_scope="user-a")
-    service.save_summary("thread-a", "short latest summary", source_event_start_id=1)
-    service.save_conversation("thread-a", role="user", content="old question " * 20, event_id=2)
-    service.save_conversation("thread-a", role="assistant", content="old answer " * 20, event_id=3)
+    service.save_summary(
+        "thread-a", "short latest summary", source_event_start_id=2, source_event_end_id=3
+    )
+    service.save_conversation(
+        "thread-a",
+        role="user",
+        content="old question " * 20,
+        event_id=2,
+        turn_id="turn-old",
+        metadata={"run_id": "run-old"},
+    )
+    service.save_conversation(
+        "thread-a",
+        role="assistant",
+        content="old answer " * 20,
+        event_id=3,
+        turn_id="turn-old",
+        metadata={"run_id": "run-old"},
+    )
     service.save_conversation(
         "thread-a",
         role="user",
         content="recent cancellation question",
         event_id=4,
+        turn_id="turn-recent",
+        metadata={"run_id": "run-recent"},
     )
     service.save_conversation(
         "thread-a",
         role="assistant",
         content="recent cancellation answer",
         event_id=5,
+        turn_id="turn-recent",
+        metadata={"run_id": "run-recent"},
     )
     service.save_fact("cancellation uses Runtime API", key="runtime_cancel", confidence=0.9)
     service.save_tool_result(
@@ -173,11 +192,14 @@ def test_memory_clear_keeps_thread_conversation_source_records(tmp_path):
 
     assert manager.clear() == 1
 
-    assert service.list_records(
-        kind=MemoryKind.FACT,
-        scope_type=MemoryScopeType.PROJECT,
-        scope_id="project-a",
-    ) == []
+    assert (
+        service.list_records(
+            kind=MemoryKind.FACT,
+            scope_type=MemoryScopeType.PROJECT,
+            scope_id="project-a",
+        )
+        == []
+    )
     assert service.list_records(
         kind=MemoryKind.CONVERSATION,
         scope_type=MemoryScopeType.THREAD,
@@ -190,28 +212,85 @@ def test_memory_clear_keeps_thread_conversation_source_records(tmp_path):
     )
 
 
-def test_memory_history_recovery_requires_complete_ordered_pairs(tmp_path):
+def _runtime_event(
+    event_id: int,
+    event_type: str,
+    text: str = "",
+    *,
+    run_id: str | None = "run-a",
+    turn_id: str | None = "turn-a",
+    parent_run_id: str | None = None,
+    payload: dict[str, object] | None = None,
+) -> RuntimeEvent:
+    return RuntimeEvent(
+        id=event_id,
+        thread_id="thread-a",
+        type=event_type,
+        payload={"text": text, **(payload or {})},
+        created_at="",
+        run_id=run_id,
+        turn_id=turn_id,
+        parent_run_id=parent_run_id,
+    )
+
+
+def test_memory_history_uses_completed_root_identity_despite_interleaving_and_duplicates(tmp_path):
     service = MemoryService(tmp_path / "memory.db", project_scope="project-a")
-
-    class Event:
-        def __init__(self, event_id, event_type, payload):
-            self.id = event_id
-            self.type = event_type
-            self.payload = payload
-
     events = [
-        Event(1, "assistant.message", {"text": "orphan assistant"}),
-        Event(2, "user.message", {"text": "superseded user"}),
-        Event(3, "user.message", {"text": "real user"}),
-        Event(4, "assistant.message", {"text": "real answer"}),
-        Event(5, "user.message", {"text": "failed user"}),
+        _runtime_event(1, "user.message", "first question"),
+        _runtime_event(2, "user.message", "second question", run_id="run-b", turn_id="turn-b"),
+        _runtime_event(3, "assistant.message", "second answer", run_id="run-b", turn_id="turn-b"),
+        _runtime_event(4, "text_delta", "first "),
+        _runtime_event(5, "text_delta", "answer"),
+        _runtime_event(
+            6, "assistant.message", "child output", run_id="child", parent_run_id="run-a"
+        ),
+        _runtime_event(7, "turn.completed", run_id="child", parent_run_id="run-a"),
+        _runtime_event(8, "assistant.message", "first answer"),
+        _runtime_event(9, "turn.completed"),
+        _runtime_event(10, "assistant.message", "first answer"),
+        _runtime_event(11, "turn.completed"),
+        _runtime_event(12, "turn.completed", run_id="run-b", turn_id="turn-b"),
+        _runtime_event(13, "user.message", "pending user", run_id="pending", turn_id="pending"),
+        _runtime_event(
+            14, "assistant.message", "partial answer", run_id="pending", turn_id="pending"
+        ),
+    ]
+    events.append(events[7])
+
+    history = service.history_from_runtime_events(reversed(events))
+
+    assert [(message.role, message.content) for message in history] == [
+        ("user", "first question"),
+        ("assistant", "first answer"),
+        ("user", "second question"),
+        ("assistant", "second answer"),
+    ]
+
+
+def test_memory_history_only_accepts_unambiguous_identified_legacy_messages(tmp_path):
+    service = MemoryService(tmp_path / "memory.db", project_scope="project-a")
+    identity = {"run_id": "legacy", "turn_id": "legacy-turn", "thread_id": "thread-a"}
+    events = [
+        _runtime_event(1, "user.message", "unidentified question", run_id=None, turn_id=None),
+        _runtime_event(2, "assistant.message", "unidentified answer", run_id=None, turn_id=None),
+        _runtime_event(
+            3, "user.message", "known question", run_id=None, turn_id=None, payload=identity
+        ),
+        _runtime_event(
+            4, "assistant.message", "known answer", run_id=None, turn_id=None, payload=identity
+        ),
+        _runtime_event(5, "run.completed", run_id=None, turn_id=None, payload=identity),
+        _runtime_event(6, "user.message", "conflicting question"),
+        _runtime_event(7, "assistant.message", "wrong identity", payload={"run_id": "other-run"}),
+        _runtime_event(8, "turn.completed"),
     ]
 
     history = service.history_from_runtime_events(events)
 
     assert [(message.role, message.content) for message in history] == [
-        ("user", "real user"),
-        ("assistant", "real answer"),
+        ("user", "known question"),
+        ("assistant", "known answer"),
     ]
 
 

@@ -1,3 +1,5 @@
+import { useSyncExternalStore } from "react";
+
 /**
  * Runtime connection configuration.
  *
@@ -46,14 +48,51 @@ function loadPersisted(): ConnectionConfig {
   }
 }
 
+/** The Step-2 pending-submission identity: address only, never credentials. */
+export function normalizeRuntimeBaseUrl(baseUrl: string): string {
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://same-origin";
+  const url = new URL(baseUrl.trim() || origin, origin);
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+}
+
+export interface ConnectionSnapshot {
+  config: ConnectionConfig;
+  scope: string;
+  /** Local, non-persisted identity for credential replacement and clear. */
+  generation: number;
+}
+
 let current: ConnectionConfig = loadPersisted();
+let snapshot: ConnectionSnapshot = {
+  config: current, scope: normalizeRuntimeBaseUrl(current.baseUrl), generation: 0,
+};
+const listeners = new Set<() => void>();
+
+export function getConnectionSnapshot(): ConnectionSnapshot { return snapshot; }
+export function subscribeConnection(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+export function useConnection(): ConnectionSnapshot {
+  return useSyncExternalStore(subscribeConnection, getConnectionSnapshot, getConnectionSnapshot);
+}
+
+function replace(config: ConnectionConfig): void {
+  const scope = normalizeRuntimeBaseUrl(config.baseUrl);
+  current = { ...config };
+  snapshot = {
+    config: current, scope,
+    generation: snapshot.generation + 1,
+  };
+  for (const listener of listeners) listener();
+}
 
 export function getConnection(): ConnectionConfig {
   return current;
 }
 
 export function saveConnection(config: ConnectionConfig): void {
-  current = { ...config };
+  replace(config);
   const store = storage();
   if (!store) return;
   try {
@@ -64,7 +103,7 @@ export function saveConnection(config: ConnectionConfig): void {
 }
 
 export function clearConnection(): void {
-  current = { ...DEFAULTS };
+  replace(DEFAULTS);
   const store = storage();
   if (!store) return;
   try {

@@ -1,3 +1,5 @@
+import { normalizeRuntimeBaseUrl } from "./connection";
+
 /**
  * Local recent-thread registry (localStorage).
  *
@@ -113,11 +115,19 @@ export interface ThreadRegistry {
 export function createThreadRegistry(
   storage: StorageLike | null,
   now: () => number = Date.now,
+  scope: string = normalizeRuntimeBaseUrl(""),
 ): ThreadRegistry {
+  const key = `${STORAGE_KEY}:${encodeURIComponent(scope)}`;
+  // Unscoped records have no trustworthy Runtime owner. Discard once rather
+  // than silently adopting them into the first Runtime opened after upgrade.
+  try {
+    storage?.removeItem(STORAGE_KEY);
+    storage?.removeItem(LAST_THREAD_KEY);
+  } catch { /* unavailable storage */ }
   const read = (): ThreadRegistryEntry[] => {
     if (storage === null) return [];
     try {
-      const raw = storage.getItem(STORAGE_KEY);
+      const raw = storage.getItem(key);
       if (raw === null) return [];
       const parsed: unknown = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
@@ -129,7 +139,7 @@ export function createThreadRegistry(
   const write = (entries: ThreadRegistryEntry[]): ThreadRegistryEntry[] => {
     if (storage !== null) {
       try {
-        storage.setItem(STORAGE_KEY, JSON.stringify(entries));
+        storage.setItem(key, JSON.stringify(entries));
       } catch {
         /* quota / privacy mode — in-memory result still returned */
       }
@@ -145,17 +155,24 @@ export function createThreadRegistry(
   };
 }
 
-/** App-wide registry on window.localStorage. */
-export const threadRegistry = createThreadRegistry(defaultStorage());
+const registries = new Map<string, ThreadRegistry>();
+export function getThreadRegistry(scope: string): ThreadRegistry {
+  let registry = registries.get(scope);
+  if (!registry) {
+    registry = createThreadRegistry(defaultStorage(), Date.now, scope);
+    registries.set(scope, registry);
+  }
+  return registry;
+}
 
 /* ------------------------------------------------------------------ */
 /* Last-selected thread (returning from Run Detail restores it)        */
 /* ------------------------------------------------------------------ */
 
-export function loadLastThreadId(storage: StorageLike | null = defaultStorage()): string | null {
+export function loadLastThreadId(scope: string, storage: StorageLike | null = defaultStorage()): string | null {
   if (storage === null) return null;
   try {
-    const value = storage.getItem(LAST_THREAD_KEY);
+    const value = storage.getItem(`${LAST_THREAD_KEY}:${encodeURIComponent(scope)}`);
     return typeof value === "string" && value !== "" ? value : null;
   } catch {
     return null;
@@ -163,13 +180,15 @@ export function loadLastThreadId(storage: StorageLike | null = defaultStorage())
 }
 
 export function saveLastThreadId(
+  scope: string,
   threadId: string | null,
   storage: StorageLike | null = defaultStorage(),
 ): void {
   if (storage === null) return;
   try {
-    if (threadId === null) storage.removeItem(LAST_THREAD_KEY);
-    else storage.setItem(LAST_THREAD_KEY, threadId);
+    const key = `${LAST_THREAD_KEY}:${encodeURIComponent(scope)}`;
+    if (threadId === null) storage.removeItem(key);
+    else storage.setItem(key, threadId);
   } catch {
     /* ignore */
   }

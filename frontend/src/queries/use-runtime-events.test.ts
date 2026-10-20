@@ -34,10 +34,12 @@ function sseBody(
     .join("");
 }
 
-function sseResponse(entries: Parameters<typeof sseBody>[0], status = 200): Response {
+function sseResponse(entries: Parameters<typeof sseBody>[0], meta: { afterId?: number; watermark?: number; hasMore?: boolean } = {}): Response {
+  const last = entries.at(-1)?.id ?? meta.afterId ?? 0;
   return new Response(sseBody(entries), {
-    status,
-    headers: { "Content-Type": "text/event-stream" },
+    status: 200,
+    headers: { "Content-Type": "text/event-stream", "X-Axiom-Events-After-Id": String(last),
+      "X-Axiom-Events-Watermark": String(meta.watermark ?? last), "X-Axiom-Events-Has-More": String(meta.hasMore ?? false) },
   });
 }
 
@@ -73,7 +75,13 @@ function makeRig(overrides: { runStatus?: string } = {}) {
       const fetchImpl: typeof fetch = async (input) => {
         const url = String(input);
         urls.push(url);
-        return impl(url, urls.length - 1);
+        const response = await impl(url, urls.length - 1);
+        if (response.ok && response.headers.get("X-Axiom-Events-After-Id") === "0") {
+          const inputCursor = new URL(url, "http://runtime").searchParams.get("after_id") ?? "0";
+          response.headers.set("X-Axiom-Events-After-Id", inputCursor);
+          response.headers.set("X-Axiom-Events-Watermark", inputCursor);
+        }
+        return response;
       };
       return fetchImpl;
     },
@@ -104,7 +112,7 @@ describe("pollIntervalMs / nextBackoffMs", () => {
 });
 
 describe("startReplaySession", () => {
-  it("replays from the start, then polls with an exclusive cursor and dedupes", async () => {
+  it("replays from the start, then polls with an exclusive cursor", async () => {
     const rig = makeRig();
     const fetchImpl = rig.trackFetch((url, index) => {
       if (index === 0) {
@@ -114,12 +122,11 @@ describe("startReplaySession", () => {
         return sseResponse([
           { id: 1, type: "run.started" },
           { id: 3, type: "llm.started" },
-          { id: 3, type: "llm.started" },
           { id: 5, type: "llm.completed", extra: { total_tokens: 10 } },
         ]);
       }
       expect(url).toContain("after_id=5"); // exclusive — never cursor+1
-      return sseResponse([{ id: 3, type: "llm.started" }, { id: 7, type: "tool.started" }]);
+      return sseResponse([{ id: 7, type: "tool.started" }]);
     });
 
     const session = startReplaySession(rig.options(fetchImpl));
@@ -205,7 +212,7 @@ describe("startReplaySession", () => {
     expect(rig.states).toHaveLength(1); // loop ended, no further updates
   });
 
-  it("terminal drain: at most 2 polls after terminal, then stopped", async () => {
+  it("stops once a round begun after terminal reaches its observed watermark", async () => {
     const rig = makeRig({ runStatus: "RUNNING" });
     const fetchImpl = rig.trackFetch(() => sseResponse([]));
     const session = startReplaySession(rig.options(fetchImpl));
@@ -214,16 +221,12 @@ describe("startReplaySession", () => {
     expect(rig.urls).toHaveLength(1);
 
     rig.runStatus = "COMPLETED";
-    await vi.advanceTimersByTimeAsync(1500); // drain poll 1 (detects terminal)
+    await vi.advanceTimersByTimeAsync(1500);
     expect(rig.urls).toHaveLength(2);
-    expect(rig.last().status).toBe("following");
-
-    await vi.advanceTimersByTimeAsync(500); // drain poll 2 → stop
-    expect(rig.urls).toHaveLength(3);
     expect(rig.last().status).toBe("stopped");
 
     await vi.advanceTimersByTimeAsync(10_000); // never polls again
-    expect(rig.urls).toHaveLength(3);
+    expect(rig.urls).toHaveLength(2);
     session.stop();
   });
 
@@ -231,16 +234,67 @@ describe("startReplaySession", () => {
     const rig = makeRig({ runStatus: "COMPLETED" });
     const fetchImpl = rig.trackFetch((_url, index) =>
       index === 0
-        ? sseResponse([{ id: 1, type: "run.started" }])
+        ? sseResponse([{ id: 1, type: "run.started" }], { hasMore: true, watermark: 2 })
         : sseResponse([{ id: 2, type: "run.completed" }]),
     );
     const session = startReplaySession(rig.options(fetchImpl));
     await vi.advanceTimersByTimeAsync(0);
-    expect(rig.last().events.map((e) => e.eventId)).toEqual([1]);
-
-    await vi.advanceTimersByTimeAsync(500); // drain poll 2
     expect(rig.last().events.map((e) => e.eventId)).toEqual([1, 2]);
     expect(rig.last().status).toBe("stopped");
+    session.stop();
+  });
+
+  it("drains more than two bounded pages before stopping at the terminal watermark", async () => {
+    const rig = makeRig({ runStatus: "COMPLETED" });
+    const fetchImpl = rig.trackFetch((_url, index) => sseResponse(
+      [{ id: index + 1, type: index === 3 ? "run.completed" : "step.started" }],
+      { watermark: 4, hasMore: index < 3 },
+    ));
+    const session = startReplaySession(rig.options(fetchImpl));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rig.urls).toHaveLength(4);
+    expect(rig.last().events.at(-1)?.eventType).toBe("run.completed");
+    expect(rig.last().status).toBe("stopped");
+    session.stop();
+  });
+
+  it("does not publish a late old response after stop even if fetch ignores abort", async () => {
+    const rig = makeRig();
+    let resolve: (value: Response) => void = () => {};
+    const session = startReplaySession(rig.options(async () => new Promise<Response>((done) => { resolve = done; })));
+    session.stop();
+    resolve(sseResponse([{ id: 1, type: "run.started" }]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rig.states).toHaveLength(1);
+    expect(rig.last().events).toEqual([]);
+  });
+
+  it("preserves streaming prefixes outside the trimmed debug window", async () => {
+    const rig = makeRig();
+    const entries = [
+      { id: 1, type: "run.started" }, { id: 2, type: "text_delta", extra: { text: "prefix " } },
+      ...Array.from({ length: 1600 }, (_, index) => ({ id: index + 3, type: "step.started" })),
+      { id: 1603, type: "text_delta", extra: { text: "suffix" } },
+    ];
+    const fetchImpl = rig.trackFetch((_url, index) => sseResponse(entries.slice(index * 200, (index + 1) * 200),
+      { hasMore: (index + 1) * 200 < entries.length, watermark: entries.length }));
+    const session = startReplaySession(rig.options(fetchImpl));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rig.last().events).toHaveLength(1500);
+    expect(rig.last().events[0].eventId).toBeGreaterThan(2);
+    expect(rig.last().preview).toMatchObject({ text: "prefix suffix", incomplete: false });
+    session.stop();
+  });
+
+  it("labels incomplete initial-tail previews rather than inventing a prefix", async () => {
+    const rig = makeRig();
+    const fetchImpl = rig.trackFetch((url) => {
+      expect(url).toContain("latest=1");
+      return sseResponse([{ id: 50, type: "text_delta", extra: { text: "suffix only" } }]);
+    });
+    const session = startReplaySession({ ...rig.options(fetchImpl), latest: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rig.last().preview).toMatchObject({ text: "", incomplete: true });
     session.stop();
   });
 
@@ -250,9 +304,11 @@ describe("startReplaySession", () => {
       id: i + 1,
       type: "step.started",
     }));
-    const fetchImpl = rig.trackFetch((_url, index) =>
-      index === 0 ? sseResponse(overflow) : sseResponse([{ id: MAX_KEPT_EVENTS + 101, type: "run.completed" }]),
-    );
+    const fetchImpl = rig.trackFetch((_url, index) => {
+      const page = overflow.slice(index * 200, (index + 1) * 200);
+      if (page.length > 0) return sseResponse(page, { hasMore: (index + 1) * 200 < overflow.length, watermark: overflow.length });
+      return sseResponse([{ id: MAX_KEPT_EVENTS + 101, type: "run.completed" }]);
+    });
     const session = startReplaySession(rig.options(fetchImpl));
     await vi.advanceTimersByTimeAsync(0);
     expect(rig.last().events).toHaveLength(MAX_KEPT_EVENTS);
@@ -260,23 +316,29 @@ describe("startReplaySession", () => {
 
     await vi.advanceTimersByTimeAsync(1500);
     // Cursor kept advancing even though old UI entries were dropped.
-    expect(rig.urls[1]).toContain(`after_id=${MAX_KEPT_EVENTS + 100}`);
+    expect(rig.urls[8]).toContain(`after_id=${MAX_KEPT_EVENTS + 100}`);
     expect(rig.last().events).toHaveLength(MAX_KEPT_EVENTS);
     expect(rig.last().events.at(-1)?.eventId).toBe(MAX_KEPT_EVENTS + 101);
     session.stop();
   });
 
-  it("skips malformed frames without dropping the rest of the batch", async () => {
+  it("stops on malformed protocol without advancing or retrying the page", async () => {
     const rig = makeRig();
     const body =
       sseBody([{ id: 1, type: "llm.started" }]) +
       "id: 2\nevent: bad\ndata: {not json\n\n" +
       sseBody([{ id: 2, type: "tool.started" }]);
-    const fetchImpl = rig.trackFetch(() => new Response(body, { status: 200 }));
+    const fetchImpl = rig.trackFetch(() => new Response(body, { status: 200, headers: {
+      "Content-Type": "text/event-stream",
+      "X-Axiom-Events-After-Id": "2", "X-Axiom-Events-Watermark": "2", "X-Axiom-Events-Has-More": "false",
+    } }));
     const session = startReplaySession(rig.options(fetchImpl));
     await vi.advanceTimersByTimeAsync(0);
-    expect(rig.last().events.map((e) => e.eventId)).toEqual([1, 2]);
-    expect(rig.last().status).toBe("following");
+    expect(rig.last().events).toEqual([]);
+    expect(rig.last().status).toBe("stopped");
+    expect(rig.last().error).toMatch(/JSON/);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(rig.urls).toHaveLength(1);
     session.stop();
   });
 });

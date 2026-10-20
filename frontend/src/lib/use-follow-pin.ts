@@ -8,6 +8,7 @@ export interface FollowPin {
   showJump: boolean;
   handleScroll: () => void;
   jumpToLatest: () => void;
+  pauseFollowing: () => void;
 }
 
 /**
@@ -44,5 +45,10 @@ export function useFollowPin(changeKey: unknown): FollowPin {
     setShowJump(false);
   };
 
-  return { scrollRef, showJump, handleScroll, jumpToLatest };
+  const pauseFollowing = () => {
+    pinnedRef.current = false;
+    setShowJump(true);
+  };
+
+  return { scrollRef, showJump, handleScroll, jumpToLatest, pauseFollowing };
 }

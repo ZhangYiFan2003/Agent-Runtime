@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
+import pytest
+
 from axiom.runtime.api import RuntimeRequestContext, RuntimeTurnContext
 from axiom.runtime.checkpoints import (
     SQLiteCheckpointStore,
     advance_run_state,
     load_run_state,
 )
+from axiom.runtime.control_plane import ApiError
 from axiom.runtime.events import ThreadEventRepository
-from axiom.runtime.models import Checkpoint, RunState
+from axiom.runtime.models import Checkpoint, RunState, RunStatus
 
 
 def test_checkpoint_is_backward_compatible_name_for_run_state():
@@ -22,11 +25,17 @@ def test_checkpoint_is_backward_compatible_name_for_run_state():
     assert restored.to_dict() == state.to_dict()
 
 
-def test_thread_can_contain_multiple_root_runs(tmp_path):
+def test_thread_can_contain_successive_root_runs(tmp_path):
     store = SQLiteCheckpointStore(tmp_path / "runtime.db")
     first = RunState.create(thread_id="thread", run_id="run-1", input="first")
     second = RunState.create(thread_id="thread", run_id="run-2", input="second")
 
+    asyncio.run(advance_run_state(store, first))
+    with pytest.raises(ApiError) as busy:
+        asyncio.run(advance_run_state(store, second))
+    assert busy.value.code == "THREAD_BUSY"
+    assert busy.value.details["active_run_id"] == first.run_id
+    first.status = RunStatus.COMPLETED
     asyncio.run(advance_run_state(store, first))
     asyncio.run(advance_run_state(store, second))
 

@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /**
- * DTOs for Run projections: `GET /v1/runs`, `GET /v1/runs/{id}`,
+ * DTOs for Run detail projections: `GET /v1/runs/{id}`,
  * `GET /v1/runs/{id}/children`.
  *
  * Status / strategy / run_kind are deliberately typed as plain strings:
@@ -59,10 +59,6 @@ export const runViewSchema = z
   })
   .catchall(z.unknown());
 
-export const runListSchema = z.object({
-  runs: z.array(runViewSchema),
-});
-
 export const childRunSchema = z
   .object({
     child_run_id: z.string(),
@@ -87,6 +83,5 @@ export const childrenResponseSchema = z.object({
 export type InterruptSummaryDto = z.infer<typeof interruptSummarySchema>;
 export type RunErrorDto = z.infer<typeof runErrorSchema>;
 export type RunViewDto = z.infer<typeof runViewSchema>;
-export type RunListDto = z.infer<typeof runListSchema>;
 export type ChildRunDto = z.infer<typeof childRunSchema>;
 export type ChildrenResponseDto = z.infer<typeof childrenResponseSchema>;

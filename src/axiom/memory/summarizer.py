@@ -4,7 +4,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from axiom.memory.context import estimate_tokens
+from axiom.memory.context import completed_conversation_records, estimate_tokens
+from axiom.memory.models import MemoryRecord
 from axiom.types import Message
 
 DEFAULT_SUMMARY_THRESHOLD_MESSAGES = 6
@@ -120,27 +121,25 @@ class DeterministicConversationSummarizer:
 
 
 def segment_messages(
-    records,
+    records: list[MemoryRecord],
     *,
     max_estimated_tokens: int,
 ) -> list[ConversationSegment]:
     turns: list[tuple[list[Message], int, int, int]] = []
-    pending_user: tuple[Message, int, int] | None = None
-    for record in records:
-        role = str(record.metadata.get("role") or "")
-        event_id = record.source_event_start_id
-        if event_id is None:
-            continue
-        if role == "user":
-            pending_user = (Message(role="user", content=record.content), event_id, event_id)
-        elif role == "assistant" and pending_user is not None:
-            user_message, start_id, _end_id = pending_user
-            assistant_message = Message(role="assistant", content=record.content)
-            token_count = estimate_tokens(str(user_message.content)) + estimate_tokens(
-                str(assistant_message.content)
+    ordered = completed_conversation_records(records)
+    for index in range(0, len(ordered), 2):
+        user, assistant = ordered[index : index + 2]
+        user_message = Message(role="user", content=user.content)
+        assistant_message = Message(role="assistant", content=assistant.content)
+        token_count = estimate_tokens(user.content) + estimate_tokens(assistant.content)
+        turns.append(
+            (
+                [user_message, assistant_message],
+                user.source_event_start_id,
+                assistant.source_event_start_id,
+                token_count,
             )
-            turns.append(([user_message, assistant_message], start_id, event_id, token_count))
-            pending_user = None
+        )
 
     segments: list[ConversationSegment] = []
     current: list[Message] = []
@@ -162,7 +161,7 @@ def segment_messages(
         if current_start is None:
             current_start = start_id
         current.extend(messages)
-        current_end = end_id
+        current_end = end_id if current_end is None else max(current_end, end_id)
         current_tokens += turn_tokens
     if current:
         segments.append(

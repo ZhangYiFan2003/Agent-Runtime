@@ -241,6 +241,14 @@ flowchart TD
   - Defines the RuntimeStore and `load_run_state`/`advance_run_state` facade plus
     Memory/SQLite implementations. SQLite appends Run-state checkpoint sequences and uses
     optimistic sequence checks to reject stale workers.
+  - SQLite submission admission uses one `BEGIN IMMEDIATE` transaction for the initial
+    checkpoint, optional `(thread_id, idempotency_key)` mapping, identified `turn.started` /
+    `user.message` events, and submission-rate charge. Its additive startup migration creates
+    `submission_idempotency` and `traffic_rate_buckets` without rewriting existing checkpoints.
+  - UI reads use separate SQL-limited methods. Run summaries extract scalar fields from the
+    latest checkpoint per Run, order/filter before `LIMIT`, and batch child counts for the
+    selected page. SQLite adds expression indexes for creation order and parent lookup;
+    recovery and child-enumeration `list()` calls keep their complete-history semantics.
 - `src/axiom/runtime/steps.py`
   - Defines the in-memory `StepContext`, `StepResult`, the small `NextAction` vocabulary, and the
     deterministic `CompletionPolicy` that combines structured Runtime evidence into a final
@@ -248,6 +256,13 @@ flowchart TD
 - `src/axiom/runtime/events.py`
   - Defines the thread/event repository contract, event envelope, and backward-compatible
     SQLite event implementation with monotonic replay IDs.
+  - Message pages filter identified root user/assistant events before the SQL limit, using
+    the matching durable Run identity and excluding conflicting legacy records and Child
+    output. Exact duplicate messages collapse to their first event ID. Partial indexes cover
+    message sequence and message identity; no second messages table is maintained. Debug
+    event pages and persistent messages have independent cursors and bounded reads. Returned
+    event IDs establish the next read boundary; reading a separate maximum cannot skip a
+    message committed between snapshot and incremental reads.
 - `src/axiom/runtime/storage.py`
   - Selects one coherent durable backend bundle for Run/Checkpoint, ToolExecution, budget
     ledger, Event, and control-idempotency truth. SQLite remains the default.
@@ -262,10 +277,29 @@ flowchart TD
   - Uses `JSONB` for domain payloads, `TIMESTAMPTZ` for persistent deadlines/timestamps,
     identity-backed `BIGINT` Event IDs, and database uniqueness for `ToolExecution.invocation_id`.
     Event IDs are monotonic for replay but are intentionally not gapless.
-  - Transaction boundaries remain narrow: Run head CAS and its Checkpoint history row are atomic;
-    each ToolExecution mutation, budget-ledger CAS, Event append, and control transition is atomic
-    within its own repository call. Checkpoints and Events intentionally do not form one giant
-    event-sourcing transaction because recovery state and replay history have different roles.
+  - Root submission admission atomically commits the Run head, initial checkpoint, optional
+    submission key, user-turn events, and rate charge. Valid key replay returns its existing Run
+    before new-submission busy, capacity, or rate checks, without another execution or charge.
+    PostgreSQL schema version 9 adds indexes for Run creation order and identified message
+    paging, preserving existing submission/event columns and rows through startup migration.
+  - Coordination takes the short capacity lock, then the stable Thread row, then Run rows.
+    `RUNNING`, `INTERRUPTED`, `WAITING_APPROVAL`, and `WAITING_CHILD` roots occupy the Thread;
+    `COMPLETED`, `FAILED`, and `CANCELLED` release it. Child Runs do not take another root slot.
+    Admission, reactivation, requeue, and claims enforce this rule without holding a transaction
+    over model or tool execution. Historical conflicting active roots remain intact and reject
+    progress/new submissions with `THREAD_BUSY`; operators must explicitly cancel or finish
+    unwanted roots before continuing, rather than rebuilding the database.
+  - A completed root checkpoint and its identified final answer / completion events commit
+    together. A local idempotent projection also repairs either missing event from a persisted
+    `COMPLETED` root on completion/read or subsequent admission; it never invokes a model/tool.
+    The next submission snapshots completed root inputs/results within admission coordination,
+    excluding child and incomplete Runs. Ambiguous legacy events remain available through
+    raw event replay and do not get guessed into model history or persistent message pages.
+  - Other ToolExecution mutations, budget-ledger CAS, event appends, and control transitions
+    retain their own short repository transactions; derived memory is outside admission truth.
+    Direct Event appends lock the stable Thread row before allocating an ID, matching the
+    submission/completion transaction order. This prevents a higher ID from committing before
+    an earlier event in the same Thread; IDs in unrelated Threads need not commit in order.
   - Schema metadata rejects an incompatible future Runtime schema. The PostgreSQL driver is an
     optional dependency, and configured credentials are neither returned by public config nor
     copied into Trace/Event metadata.
@@ -1148,13 +1182,14 @@ records operational quarantine and is unrelated to Evaluation badcase datasets.
 
 ### 12.1.3 Submission idempotency and live event following
 
-Distributed root submission accepts an optional `Idempotency-Key`, scoped to the current Thread.
-PostgreSQL stores `(thread_id, key) -> request fingerprint -> run_id`. The fingerprint covers the
-Thread, task input, and execution strategy. Under the same capacity coordination transaction, the
-first request admits one root Run and binds the key; equal replays return that Run, while different
-content returns `IDEMPOTENCY_KEY_CONFLICT`. Queue rejection or transaction rollback binds nothing,
-so a later retry may succeed. This is separate from explicit duplicate Run IDs, Tool idempotency,
-and control-operation idempotency. The mapping has no automatic TTL in v1.
+Root submission on SQLite and PostgreSQL accepts an optional `Idempotency-Key`, scoped to the
+current Thread. Both store `(thread_id, key) -> request fingerprint -> run_id`. The fingerprint
+covers Thread, task input, and execution strategy. One admission transaction creates the root
+Run, key mapping, and identified submission events with a consistent completed-root history.
+Equal replays return that Run before new-submission busy/capacity/rate checks; different content
+returns `IDEMPOTENCY_KEY_CONFLICT`. Rejection or rollback binds nothing. Local replay does not
+start another executor or resume a stopped Run. This remains separate from explicit duplicate
+Run IDs, Tool idempotency, and control-operation idempotency. The mapping has no automatic TTL.
 
 The Event repository remains the only event authority. Existing finite SSE replay is unchanged;
 run-filtered `follow=true` first reads durable events with `id > after_id` (or `Last-Event-ID`),
@@ -1193,8 +1228,8 @@ unavailable. A heartbeat renewal error cancels local execution rather than assum
 Distributed root submission governance is layered and intentionally separate. A PostgreSQL-backed
 token bucket limits new root-submission frequency and burst size; it is not an edge DDoS shield and
 does not apply to health, SSE, control operations, Worker polling, or internal Child Runs. An
-already-existing idempotency replay uses the request-frequency interpretation and therefore still
-passes through the HTTP submission limiter, while it never creates a second Run. Rate rejection is
+already-existing valid idempotency replay returns before admission rate checks and consumes no
+new-submission allowance. Rate rejection is
 `429 RATE_LIMITED` with a retry hint; global backlog admission remains `503`, and principal queue
 quota rejection is `429 PRINCIPAL_QUEUE_QUOTA_EXCEEDED`.
 

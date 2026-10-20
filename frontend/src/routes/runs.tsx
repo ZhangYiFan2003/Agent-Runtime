@@ -1,15 +1,13 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { ListTree, RefreshCw, SlidersHorizontal } from "lucide-react";
-import { useRuns } from "../queries/use-runs";
+import { flattenRunPages, useRuns } from "../queries/use-runs";
 import { ApiError } from "../api/client";
 import { useDocumentTitle } from "../lib/use-document-title";
 import {
   ALL_FILTER,
   deriveFilterOptions,
-  filterRuns,
   runsEmptyState,
-  sortRuns,
   type RunsFilter,
   type RunsSortKey,
 } from "../lib/runs-view";
@@ -52,22 +50,22 @@ function EmptyState({ title, hint }: { title: string; hint: string }) {
 export function RunsPage() {
   useDocumentTitle("Runs · Axiom");
   const navigate = useNavigate();
-  const runsQuery = useRuns();
   const [filter, setFilter] = useState<RunsFilter>({
     search: "",
     status: ALL_FILTER,
     strategy: ALL_FILTER,
   });
   const [sort, setSort] = useState<RunsSortKey>("newest");
+  const runsQuery = useRuns(filter, sort);
   const [filtersOpen, setFiltersOpen] = useState(false);
 
-  const allRuns = useMemo(() => runsQuery.data ?? [], [runsQuery.data]);
+  const allRuns = useMemo(() => flattenRunPages(runsQuery.data?.pages ?? []), [runsQuery.data]);
   const options = useMemo(() => deriveFilterOptions(allRuns), [allRuns]);
-  const visibleRuns = useMemo(
-    () => sortRuns(filterRuns(allRuns, filter), sort),
-    [allRuns, filter, sort],
-  );
-  const empty = runsEmptyState(allRuns.length, visibleRuns.length);
+  const visibleRuns = allRuns;
+  const filtered = filter.search.trim() !== "" || filter.status !== ALL_FILTER || filter.strategy !== ALL_FILTER;
+  const empty = visibleRuns.length > 0 ? null : filtered
+    ? { title: "No runs match", hint: "Adjust or clear the current filters." }
+    : runsEmptyState(0, 0);
 
   const patchFilter = (patch: Partial<RunsFilter>) => setFilter((f) => ({ ...f, ...patch }));
   const openRun = (runId: string) =>
@@ -81,15 +79,14 @@ export function RunsPage() {
           <h1 className="text-sm font-semibold text-fg-0">Runs</h1>
           {runsQuery.isSuccess && (
             <span className="font-mono text-[11px] text-fg-2">
-              {visibleRuns.length}
-              {visibleRuns.length !== allRuns.length ? ` / ${allRuns.length}` : ""}
+              {visibleRuns.length} loaded
             </span>
           )}
         </div>
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => void runsQuery.refetch()}
+          onClick={() => void runsQuery.refresh()}
           disabled={runsQuery.isFetching}
           aria-label="Refresh runs"
         >
@@ -171,7 +168,7 @@ export function RunsPage() {
               }
               className="w-full max-w-md"
             />
-            <Button variant="default" size="sm" onClick={() => void runsQuery.refetch()}>
+            <Button variant="default" size="sm" onClick={() => void runsQuery.refresh()}>
               Retry
             </Button>
           </div>
@@ -179,7 +176,7 @@ export function RunsPage() {
 
         {runsQuery.isSuccess && empty && <EmptyState title={empty.title} hint={empty.hint} />}
 
-        {runsQuery.isSuccess && !empty && (
+        {runsQuery.data && !empty && (
           <>
             <div className="hidden md:block">
               <RunsTable runs={visibleRuns} onOpenRun={openRun} />
@@ -188,6 +185,17 @@ export function RunsPage() {
               <RunsMobileList runs={visibleRuns} onOpenRun={openRun} />
             </div>
           </>
+        )}
+        {runsQuery.hasNextPage && (
+          <div className="flex justify-center p-4">
+            <Button variant="default" size="sm" disabled={runsQuery.isFetching}
+              onClick={() => void runsQuery.fetchNextPage()}>
+              {runsQuery.isFetchingNextPage ? "Loading…" : "Load more runs"}
+            </Button>
+          </div>
+        )}
+        {runsQuery.isSuccess && !empty && !runsQuery.hasNextPage && (
+          <p className="p-4 text-center font-mono text-xs text-fg-2">All matching runs loaded</p>
         )}
       </div>
     </div>

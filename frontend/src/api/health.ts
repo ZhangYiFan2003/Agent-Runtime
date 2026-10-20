@@ -1,11 +1,15 @@
 import { apiGet, ApiError, type ApiClientOptions } from "./client";
-import { healthSchema, type HealthDto } from "./dto/health";
+import { authCheckSchema, healthSchema, type HealthDto } from "./dto/health";
 import { adaptHealth, type HealthView } from "./adapters/health";
 import type { ConnectionConfig } from "../lib/connection";
 
 /** Fetches and parses `GET /health`. Throws `ApiError`. */
-export async function fetchHealth(config: ConnectionConfig): Promise<HealthView> {
-  const raw: unknown = await apiGet("/health", toClientOptions(config));
+export async function fetchHealth(
+  config: ConnectionConfig,
+  fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
+): Promise<HealthView> {
+  const raw: unknown = await apiGet("/health", { ...toClientOptions(config), fetchImpl, signal });
   const dto: HealthDto = healthSchema.parse(raw);
   return adaptHealth(dto);
 }
@@ -14,36 +18,67 @@ function toClientOptions(config: ConnectionConfig): ApiClientOptions {
   return { baseUrl: config.baseUrl, apiKey: config.apiKey };
 }
 
+interface ConnectionTestError {
+  status: number;
+  code?: string;
+  message: string;
+}
+
 export type ConnectionTestResult =
-  | { ok: true; health: HealthView }
-  | { ok: false; error: { status: number; code?: string; message: string } };
+  | { ok: true; health: HealthView; healthError?: never }
+  | { ok: true; health: null; healthError: ConnectionTestError }
+  | { ok: false; error: ConnectionTestError };
+
+function connectionError(error: unknown): ConnectionTestError {
+  if (error instanceof ApiError) {
+    return { status: error.status, code: error.code, message: error.message };
+  }
+  return {
+    status: 0,
+    message: error instanceof Error ? error.message : "Unexpected error",
+  };
+}
 
 /**
- * Settings-page "Test Connection": hits `/health` with the given config and
- * returns a display-ready result. Never throws for HTTP/network failures;
- * the normalized error is part of the result.
+ * Verify credentials before fetching independent public dependency information.
+ * A health failure cannot invalidate credentials accepted by the protected probe.
  */
 export async function testConnection(
   config: ConnectionConfig,
   fetchImpl?: typeof fetch,
 ): Promise<ConnectionTestResult> {
   try {
-    const raw: unknown = await apiGet("/health", { ...toClientOptions(config), fetchImpl });
-    const health = adaptHealth(healthSchema.parse(raw));
-    return { ok: true, health };
-  } catch (error) {
-    if (error instanceof ApiError) {
+    const raw: unknown = await apiGet("/v1/auth/check", {
+      ...toClientOptions(config),
+      fetchImpl,
+    });
+    if (!authCheckSchema.safeParse(raw).success) {
       return {
         ok: false,
-        error: { status: error.status, code: error.code, message: error.message },
+        error: {
+          status: 0,
+          code: "INVALID_AUTH_RESPONSE",
+          message: "Invalid credential verification response: expected authenticated: true.",
+        },
       };
     }
-    return {
-      ok: false,
-      error: {
-        status: 0,
-        message: error instanceof Error ? error.message : "Unexpected error",
-      },
-    };
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return {
+        ok: false,
+        error: {
+          status: 404,
+          code: "AUTH_CHECK_UNSUPPORTED",
+          message: "This Runtime does not support credential verification (/v1/auth/check).",
+        },
+      };
+    }
+    return { ok: false, error: connectionError(error) };
+  }
+
+  try {
+    return { ok: true, health: await fetchHealth(config, fetchImpl) };
+  } catch (error) {
+    return { ok: true, health: null, healthError: connectionError(error) };
   }
 }

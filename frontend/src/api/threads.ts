@@ -1,20 +1,14 @@
 import { ApiError, apiPost } from "./client";
+import { z } from "zod";
 import type { ConnectionConfig } from "../lib/connection";
 
 /**
  * Threads + turns API.
  *
- * `POST /v1/threads/{id}/turns` is a LONG-BLOCKING request: the server holds
- * the response until the run reaches a terminal or waiting state. It is not
- * an async "returns run_id immediately" API, so the turn POST:
- *   - uses an effectively unbounded timeout (the 10 s client default would
- *     kill every real turn),
- *   - is never auto-retried (a retry could double-execute a turn),
- *   - never sends an Idempotency-Key (the body key requires distributed
- *     Postgres mode and 422s otherwise; run controls keep their own keys),
- *   - parses every known response shape defensively (200 completed text,
- *     202 waiting/interrupted/distributed-queued) with everything optional
- *     except the thread id.
+ * Local turns may block until completion; distributed turns return queued.
+ * Both modes share required submission identities and an Idempotency-Key.
+ * Requests are never retried automatically: explicit confirmation replays the
+ * same key and original message after an uncertain result.
  */
 
 /**
@@ -30,15 +24,26 @@ export interface ThreadRef {
 
 export interface TurnResult {
   threadId: string;
-  turnId: string | null;
-  runId: string | null;
-  /** e.g. WAITING_APPROVAL / WAITING_CHILD / INTERRUPTED / CANCELLED / queued. */
-  status: string | null;
+  turnId: string;
+  runId: string;
+  status: z.infer<typeof turnResultSchema>["status"];
   /** Final assistant text on a completed 200 response; null otherwise. */
   text: string | null;
   /** Distributed mode: the run was admitted to a queue, not executed inline. */
   queued: boolean;
 }
+
+const turnResultSchema = z.object({
+  thread_id: z.string().trim().min(1),
+  turn_id: z.string().trim().min(1),
+  run_id: z.string().trim().min(1),
+  status: z.enum([
+    "RUNNING", "INTERRUPTED", "WAITING_APPROVAL", "WAITING_CHILD",
+    "COMPLETED", "FAILED", "CANCELLED",
+  ]),
+  queued: z.boolean().optional(),
+  text: z.string().optional(),
+});
 
 interface RequestOptions {
   signal?: AbortSignal;
@@ -72,29 +77,26 @@ export async function createThread(
 }
 
 /**
- * Parse any turn-POST response shape into one tolerant view model. Exported
- * for tests. A 200 completed root turn carries only `{thread_id, text}`
- * (no run_id) — callers must not fabricate a run from it.
+ * Validate the network boundary once; a malformed success may already have
+ * been accepted, so callers retain its key for explicit confirmation.
  */
 export function parseTurnResult(requestedThreadId: string, body: unknown): TurnResult {
-  if (!isRecord(body)) {
-    return {
-      threadId: requestedThreadId,
-      turnId: null,
-      runId: null,
-      status: null,
-      text: null,
-      queued: false,
-    };
+  const parsed = turnResultSchema.safeParse(body);
+  if (!parsed.success || parsed.data.thread_id !== requestedThreadId) {
+    throw new ApiError({
+      status: 0,
+      code: "INVALID_TURN_RESPONSE",
+      message: "Invalid submission response: expected matching thread_id, run_id, turn_id and a known status.",
+    });
   }
-  const status = str(body.status);
+  const dto = parsed.data;
   return {
-    threadId: str(body.thread_id) ?? requestedThreadId,
-    turnId: str(body.turn_id),
-    runId: str(body.run_id),
-    status,
-    text: str(body.text),
-    queued: body.queued === true || status === "queued",
+    threadId: dto.thread_id,
+    turnId: dto.turn_id,
+    runId: dto.run_id,
+    status: dto.status,
+    text: dto.text ?? null,
+    queued: dto.queued ?? false,
   };
 }
 
@@ -108,7 +110,7 @@ export async function submitTurn(
   config: ConnectionConfig,
   threadId: string,
   message: string,
-  options: RequestOptions = {},
+  options: RequestOptions & { idempotencyKey: string },
 ): Promise<TurnResult> {
   const body = await apiPost<unknown>(
     `/v1/threads/${encodeURIComponent(threadId)}/turns`,
@@ -116,6 +118,7 @@ export async function submitTurn(
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
       body: { message },
+      headers: { "Idempotency-Key": options.idempotencyKey },
       timeoutMs: TURN_TIMEOUT_MS,
       signal: options.signal,
       fetchImpl: options.fetchImpl,

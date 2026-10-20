@@ -5,7 +5,9 @@ import {
   composerState,
   discoverActiveRunId,
   latestRunId,
+  promptAcknowledged,
   projectWorkbenchEvents,
+  responseAcknowledged,
 } from "./workbench-projection";
 
 let seq = 0;
@@ -97,8 +99,10 @@ describe("projectWorkbenchEvents", () => {
   });
 
   it("replaces the pending local echo when the real user.message event arrives (no duplicate)", () => {
-    const boundary = seq;
-    const pending = { prompt: "hello", boundaryEventId: boundary, responseText: null };
+    const pending = {
+      threadId: "thread_1", prompt: "hello", responseText: null,
+      runId: "run_1", turnId: "turn_1",
+    };
 
     // Before the event arrives: local pending echo is shown.
     const before = composeWorkbenchItems([], pending);
@@ -111,18 +115,17 @@ describe("projectWorkbenchEvents", () => {
     expect(after).toHaveLength(1);
     expect(after[0]).toMatchObject({ kind: "user", text: "hello", pending: false });
 
-    // An event at/below the boundary (an older identical message) must NOT ack.
-    const oldEvents = [makeEvent("user.message", { text: "hello" }, { eventId: boundary })];
+    // An identical older message belongs to a different Run and must not ack.
+    const oldEvents = [makeEvent("user.message", { text: "hello" }, { runId: "run_old" })];
     const stale = composeWorkbenchItems(oldEvents, pending);
     expect(stale).toHaveLength(2);
   });
 
   it("does not duplicate assistant text present in both the POST response and the event", () => {
-    const boundary = seq;
     const events = [makeEvent("assistant.message", { text: "All done." })];
     const items = composeWorkbenchItems(events, {
+      threadId: "thread_1", runId: "run_1", turnId: "turn_1",
       prompt: null,
-      boundaryEventId: boundary,
       responseText: "All done.",
     });
     expect(items.filter((item) => item.kind === "assistant")).toHaveLength(1);
@@ -130,20 +133,72 @@ describe("projectWorkbenchEvents", () => {
 
     // Without the event (e.g. still in flight), the response text is the fallback.
     const fallback = composeWorkbenchItems([], {
+      threadId: "thread_1", runId: "run_1", turnId: "turn_1",
       prompt: null,
-      boundaryEventId: boundary,
       responseText: "All done.",
     });
     expect(fallback).toHaveLength(1);
     expect(fallback[0]).toMatchObject({ kind: "assistant", text: "All done.", fromResponse: true });
 
     const linkedFallback = composeWorkbenchItems([], {
+      threadId: "thread_1", runId: "run_confirmed", turnId: "turn_confirmed",
       prompt: null,
-      boundaryEventId: boundary,
       responseText: "Supported [claim:clm_abc]",
-      responseRunId: "run_confirmed",
     });
     expect(linkedFallback[0]).toMatchObject({ kind: "assistant", runId: "run_confirmed" });
+  });
+
+  it("deduplicates final messages by identity while preserving equal text from another turn and raw legacy messages", () => {
+    const events = [
+      makeEvent("user.message", { text: "repeat" }),
+      makeEvent("user.message", { text: "repeat" }),
+      makeEvent("assistant.message", { text: "answer" }),
+      makeEvent("assistant.message", { text: "answer" }),
+      makeEvent("user.message", { text: "repeat" }, { runId: "run_2", turnId: "turn_2" }),
+      makeEvent("assistant.message", { text: "answer" }, { runId: "run_2", turnId: "turn_2" }),
+      makeEvent("user.message", { text: "unlinked legacy record" }, { runId: null, turnId: null }),
+      makeEvent("assistant.message", { text: "unlinked legacy answer" }, { runId: null, turnId: null }),
+      makeEvent("assistant.message", { text: "child output" }, { runId: "child", parentRunId: "run_2" }),
+    ];
+    const items = projectWorkbenchEvents(events);
+    expect(items.filter((item) => item.kind === "user")).toHaveLength(3);
+    expect(items.filter((item) => item.kind === "assistant")).toHaveLength(3);
+    expect(items.at(-1)).toMatchObject({ kind: "other", eventType: "child.assistant.message", summary: "child output" });
+  });
+
+  it("acknowledges only root messages with matching Thread, Run and Turn, independently of text or event position", () => {
+    const wrongIdentities = [
+      makeEvent("user.message", { text: "same text" }, { threadId: "other_thread" }),
+      makeEvent("user.message", { text: "same text" }, { runId: "other_run" }),
+      makeEvent("user.message", { text: "same text" }, { turnId: "other_turn" }),
+      makeEvent("user.message", { text: "same text" }, { parentRunId: "root" }),
+      makeEvent("assistant.message", { text: "same text" }, { runId: "other_run" }),
+      makeEvent("assistant.message", { text: "same text" }, { turnId: "other_turn" }),
+      makeEvent("assistant.message", { text: "same text" }, { threadId: "other_thread" }),
+      makeEvent("assistant.message", { text: "same text" }, { parentRunId: "root" }),
+    ];
+    expect(promptAcknowledged(wrongIdentities, "thread_1", "run_1", "turn_1")).toBe(false);
+    expect(responseAcknowledged(wrongIdentities, "thread_1", "run_1", "turn_1")).toBe(false);
+    const matched = [
+      ...wrongIdentities,
+      makeEvent("user.message", { text: "normalized prompt" }, { eventId: 1 }),
+      makeEvent("assistant.message", { text: "server answer" }, { eventId: 2 }),
+    ];
+    expect(promptAcknowledged(matched, "thread_1", "run_1", "turn_1")).toBe(true);
+    expect(responseAcknowledged(matched, "thread_1", "run_1", "turn_1")).toBe(true);
+    expect(promptAcknowledged(matched, "thread_1", null, null)).toBe(false);
+  });
+
+  it("pairs reused tool invocation IDs only within their originating Run and Turn", () => {
+    const items = projectWorkbenchEvents([
+      makeEvent("tool_call", { tool_call_id: "call_0", name: "root_tool" }),
+      makeEvent("tool_call", { tool_call_id: "call_0", name: "child_tool" }, { runId: "child", parentRunId: "run_1" }),
+      makeEvent("tool_result", { tool_call_id: "call_0", result: "child result" }, { runId: "child", parentRunId: "run_1" }),
+      makeEvent("tool_result", { tool_call_id: "call_0", result: "root result" }),
+    ]);
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({ kind: "tool", name: "root_tool", result: "root result" });
+    expect(items[1]).toMatchObject({ kind: "tool", name: "child_tool", result: "child result" });
   });
 
   it("discovers the active run from turn.started/user.message run_ids and excludes terminal runs", () => {
@@ -161,6 +216,9 @@ describe("projectWorkbenchEvents", () => {
     const done = [...events, makeEvent("run.completed", {}, { runId: "run_new" })];
     expect(discoverActiveRunId(done)).toBeNull();
     expect(latestRunId(done)).toBe("run_new");
+    const withChild = [...done, makeEvent("run.started", {}, { runId: "run_child", parentRunId: "run_new" })];
+    expect(discoverActiveRunId(withChild)).toBeNull();
+    expect(latestRunId(withChild)).toBe("run_new");
   });
 });
 
@@ -168,7 +226,7 @@ describe("composerState", () => {
   it("disables Send when disconnected, submitting, or a run is non-terminal", () => {
     expect(composerState({ connected: false, submitting: false, activeRunStatus: null })).toEqual({
       disabled: true,
-      reason: "Runtime is disconnected.",
+      reason: "Runtime service is unreachable.",
     });
     expect(
       composerState({ connected: true, submitting: true, activeRunStatus: null }).disabled,
@@ -186,5 +244,21 @@ describe("composerState", () => {
     expect(
       composerState({ connected: true, submitting: false, activeRunStatus: null }).disabled,
     ).toBe(false);
+  });
+
+  it("unlocks an event-inferred Run after repeated 404s with a diagnostic, without claiming completion", () => {
+    expect(composerState({
+      connected: true, submitting: false, activeRunStatus: "RUNNING", runLookupMissing: true,
+    })).toEqual({
+      disabled: false,
+      reason: "Run lookup repeatedly returned 404. Retry lookup or submit to check the Thread's real availability.",
+    });
+    expect(composerState({
+      connected: true, submitting: false, activeRunStatus: "RUNNING", runLookupMissing: true, unconfirmed: true,
+    }).disabled).toBe(true);
+  });
+
+  it.each(["WAITING_APPROVAL", "WAITING_CHILD", "INTERRUPTED"])("keeps occupied state %s busy", (status) => {
+    expect(composerState({ connected: true, submitting: false, activeRunStatus: status }).disabled).toBe(true);
   });
 });

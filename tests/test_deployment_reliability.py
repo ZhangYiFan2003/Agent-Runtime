@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -8,6 +9,8 @@ import pytest
 
 from benchmarks.deployment.client import event_timings, parse_sse_events
 from benchmarks.deployment.common import (
+    BASE_COMPOSE,
+    STAGE15_COMPOSE,
     ComposeController,
     latency_summary,
     load_profile,
@@ -101,6 +104,54 @@ def test_process_environment_scrubs_external_provider_credentials(monkeypatch):
     assert env["OPENAI_API_KEY"] == ""
     assert env["DEEPSEEK_API_KEY"] == ""
     assert env["AXIOM_API_KEY"] == "stage15-fake-provider"
+    assert env["COMPOSE_DISABLE_ENV_FILE"] == "1"
+
+
+@pytest.mark.parametrize("stage15", [False, True], ids=["default", "stage15"])
+def test_compose_provider_egress_preserves_network_boundaries(stage15):
+    if shutil.which("docker") is None:
+        pytest.skip("Docker Compose CLI is required for configuration validation")
+    compose_version = subprocess.run(
+        ["docker", "compose", "version", "--short"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if compose_version.returncode != 0:
+        pytest.skip("Docker Compose CLI is unavailable")
+
+    controller = ComposeController("axiom-stage15-config-test")
+    command = ["docker", "compose", "--file", str(BASE_COMPOSE)]
+    if stage15:
+        command.extend(["--file", str(STAGE15_COMPOSE)])
+    result = subprocess.run(
+        [*command, "config", "--format", "json"],
+        env=controller.environment(),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    config = json.loads(result.stdout)
+    services = config["services"]
+    networks = config["networks"]
+    assert networks["provider-control"]["internal"] is True
+    assert networks["provider-egress"]["driver"] == "bridge"
+    assert networks["provider-egress"].get("internal", False) is False
+    assert {
+        name for name, service in services.items() if "provider-egress" in service["networks"]
+    } == {"providerd"}
+    assert set(services["providerd"]["networks"]) == {"provider-control", "provider-egress"}
+    assert "provider-control" in services["worker"]["networks"]
+    assert services["worker"]["environment"]["AXIOM_GATEWAY_URL"] == "http://providerd:8070"
+    assert not services["providerd"].get("ports")
+    assert not services["providerd"].get("privileged", False)
+    assert "network_mode" not in services["providerd"]
+    assert "/var/run/docker.sock" not in {
+        mount["target"] for mount in services["providerd"].get("volumes", [])
+    }
+    if stage15:
+        assert set(services["fake-provider"]["networks"]) == {"provider-control"}
 
 
 def test_report_writer_rejects_secret_fields_and_private_paths(tmp_path: Path):

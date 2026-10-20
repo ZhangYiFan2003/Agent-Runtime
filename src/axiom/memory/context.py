@@ -42,16 +42,7 @@ class MemoryContextBuilder:
         max_context_chars = min(max(max_context_chars, 1), HARD_MAX_CONTEXT_CHARS)
         max_estimated_tokens = min(max(max_estimated_tokens, 1), HARD_MAX_ESTIMATED_TOKENS)
         max_records = min(max(max_records, 1), HARD_MAX_RECORDS)
-        candidates = self._candidate_records(
-            thread_id=thread_id,
-            project_scope=project_scope,
-            user_scope=user_scope,
-            query=query,
-            recent_limit=recent_limit,
-        )
-        sections: list[MemoryContextSection] = []
-        summary_record = self.store.active_summary(thread_id=thread_id) if thread_id else None
-        all_conversation_records = (
+        raw_conversation_records = (
             self.store.list_records(
                 kind=MemoryKind.CONVERSATION,
                 scope_type=MemoryScopeType.THREAD,
@@ -61,6 +52,20 @@ class MemoryContextBuilder:
             if thread_id
             else []
         )
+        summary_record = self.store.active_summary(thread_id=thread_id) if thread_id else None
+        if not is_identified_conversation_summary(summary_record, raw_conversation_records):
+            summary_record = None
+        all_conversation_records = completed_conversation_records(raw_conversation_records)
+        candidates = self._candidate_records(
+            thread_id=thread_id,
+            project_scope=project_scope,
+            user_scope=user_scope,
+            query=query,
+            recent_limit=recent_limit,
+            summary=summary_record,
+            conversation=all_conversation_records,
+        )
+        sections: list[MemoryContextSection] = []
         raw_skipped = _count_summarized_records(all_conversation_records, summary_record)
         before_tokens = sum(estimate_tokens(record.content) for record in all_conversation_records)
         chars = 0
@@ -128,26 +133,20 @@ class MemoryContextBuilder:
         user_scope: str | None,
         query: str,
         recent_limit: int,
+        summary: MemoryRecord | None,
+        conversation: list[MemoryRecord],
     ) -> list[tuple[str, list[MemoryRecord]]]:
         sections: list[tuple[str, list[MemoryRecord]]] = []
         if thread_id:
-            summary = self.store.active_summary(thread_id=thread_id)
             summaries = [summary] if summary is not None else []
             sections.append(("latest summary", summaries))
             summary_end = summary.source_event_end_id if summary is not None else None
-            recent = list(
-                reversed(
-                    _exclude_summarized(
-                        self.store.list_records(
-                            kind=MemoryKind.CONVERSATION,
-                            scope_type=MemoryScopeType.THREAD,
-                            scope_id=thread_id,
-                            limit=recent_limit + 100,
-                        ),
-                        summary_end=summary_end,
-                    )
-                )
-            )[-recent_limit:]
+            recent = _exclude_summarized(
+                conversation,
+                summary_end=summary_end,
+            )
+            recent_count = max(recent_limit, 0) // 2 * 2
+            recent = recent[-recent_count:] if recent_count else []
             sections.append(("recent conversation", recent))
             tools = self.store.list_records(
                 kind=MemoryKind.TOOL_RESULT,
@@ -254,6 +253,92 @@ def _metadata_suffix(record: MemoryRecord) -> str:
         source = f" events={record.source_event_start_id}-{record.source_event_end_id}"
     parts = [str(item) for item in (category, key) if item]
     return f" [{' '.join(parts)}{source}]" if parts or source else ""
+
+
+def completed_conversation_records(records: list[MemoryRecord]) -> list[MemoryRecord]:
+    """Return identified root pairs; Runtime writes these only after completion."""
+    grouped: dict[tuple[str, str, str], list[MemoryRecord]] = {}
+    for record in records:
+        run_id = record.metadata.get("run_id")
+        turn_id = record.metadata.get("turn_id")
+        if not isinstance(run_id, str) or not run_id:
+            continue
+        if not isinstance(turn_id, str) or not turn_id:
+            continue
+        if record.metadata.get("parent_run_id") is not None:
+            continue
+        if record.metadata.get("thread_id", record.scope_id) != record.scope_id:
+            continue
+        grouped.setdefault((record.scope_id, run_id, turn_id), []).append(record)
+
+    pairs: list[tuple[MemoryRecord, MemoryRecord]] = []
+    for group in grouped.values():
+        users = [record for record in group if record.metadata.get("role") == "user"]
+        assistants = [record for record in group if record.metadata.get("role") == "assistant"]
+        if len({record.content for record in users}) != 1:
+            continue
+        if len({record.content for record in assistants}) != 1:
+            continue
+        users = [record for record in users if record.source_event_start_id is not None]
+        assistants = [record for record in assistants if record.source_event_start_id is not None]
+        if not users or not assistants:
+            continue
+        user = min(users, key=lambda record: (record.source_event_start_id, record.id))
+        assistant = min(assistants, key=lambda record: (record.source_event_start_id, record.id))
+        if assistant.source_event_start_id <= user.source_event_start_id:
+            continue
+        pairs.append((user, assistant))
+    pairs.sort(key=lambda pair: (pair[0].source_event_start_id, pair[0].scope_id, pair[0].id))
+    return [record for pair in pairs for record in pair]
+
+
+def is_identified_conversation_summary(
+    summary: MemoryRecord | None, records: list[MemoryRecord]
+) -> bool:
+    """Only reuse summaries whose retained source range proves identified root pairs."""
+    if summary is None:
+        return False
+    start, end = summary.source_event_start_id, summary.source_event_end_id
+    if start is None or end is None or start > end:
+        return False
+    covered = [
+        record
+        for record in records
+        if record.scope_id == summary.scope_id
+        and record.source_event_start_id is not None
+        and start <= record.source_event_start_id <= end
+    ]
+    identified = completed_conversation_records(covered)
+    if not identified:
+        return False
+    if min(record.source_event_start_id for record in identified) != start:
+        return False
+    if max(record.source_event_start_id for record in covered) != end:
+        return False
+    identities = {
+        (
+            record.metadata["run_id"],
+            record.metadata["turn_id"],
+            record.metadata["role"],
+            record.content,
+        )
+        for record in identified
+    }
+    return all(
+        isinstance(record.metadata.get("run_id"), str)
+        and isinstance(record.metadata.get("turn_id"), str)
+        and isinstance(record.metadata.get("role"), str)
+        and record.metadata.get("parent_run_id") is None
+        and record.metadata.get("thread_id", record.scope_id) == summary.scope_id
+        and (
+            record.metadata.get("run_id"),
+            record.metadata.get("turn_id"),
+            record.metadata.get("role"),
+            record.content,
+        )
+        in identities
+        for record in covered
+    )
 
 
 def _drop_oldest_conversation_turn(records: list[MemoryRecord]) -> list[MemoryRecord]:

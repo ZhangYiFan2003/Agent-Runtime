@@ -575,7 +575,11 @@ def test_runtime_api_persists_llm_and_agent_trace_events(tmp_path):
     run_id = str(turn_started.payload["run_id"])
     metrics = asyncio.run(server.observability.metrics(run_id))
 
-    assert result == {"thread_id": thread_id, "text": "complete"}
+    assert result["thread_id"] == thread_id
+    assert result["text"] == "complete"
+    assert result["status"] == "COMPLETED"
+    assert result["run_id"]
+    assert result["turn_id"]
     assert {
         "run.started",
         "agent.step.started",

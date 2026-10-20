@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   THREAD_REGISTRY_LIMIT,
   createThreadRegistry,
+  loadLastThreadId,
+  saveLastThreadId,
   type StorageLike,
 } from "./thread-registry";
 
@@ -61,5 +63,32 @@ describe("thread registry", () => {
     // oldest five evicted; newest kept
     expect(list.some((entry) => entry.threadId === "thread_4")).toBe(false);
     expect(list[0].threadId).toBe(`thread_${THREAD_REGISTRY_LIMIT + 4}`);
+  });
+  it("isolates recent threads and the selected thread through A → B → A", () => {
+    const store = fakeStorage();
+    const a = createThreadRegistry(store, () => 1, "http://a");
+    const b = createThreadRegistry(store, () => 1, "http://b");
+    a.add("thread-a");
+    saveLastThreadId("http://a", "thread-a", store);
+    expect(b.list()).toEqual([]);
+    expect(loadLastThreadId("http://b", store)).toBeNull();
+    b.add("thread-b");
+    saveLastThreadId("http://b", "thread-b", store);
+    expect(a.list().map((entry) => entry.threadId)).toEqual(["thread-a"]);
+    expect(loadLastThreadId("http://a", store)).toBe("thread-a");
+    saveLastThreadId("http://b", null, store);
+    expect(loadLastThreadId("http://a", store)).toBe("thread-a");
+  });
+  it("discards legacy records with no Runtime owner, without touching pending submissions", () => {
+    const store = fakeStorage();
+    store.setItem("axiom.workbench.threads", JSON.stringify([{ threadId: "legacy", createdAt: 1, lastOpenedAt: 1 }]));
+    store.setItem("axiom.workbench.last-thread", "legacy");
+    store.setItem("axiom.workbench.pending:runtime:thread", "unconfirmed");
+    const a = createThreadRegistry(store, Date.now, "http://a");
+    expect(a.list()).toEqual([]);
+    expect(loadLastThreadId("http://a", store)).toBeNull();
+    expect(store.getItem("axiom.workbench.threads")).toBeNull();
+    expect(store.getItem("axiom.workbench.last-thread")).toBeNull();
+    expect(store.getItem("axiom.workbench.pending:runtime:thread")).toBe("unconfirmed");
   });
 });

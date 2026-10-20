@@ -3,10 +3,15 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
-from axiom.memory.context import MemoryContextBuilder
+from axiom.memory.context import (
+    MemoryContextBuilder,
+    completed_conversation_records,
+    is_identified_conversation_summary,
+)
 from axiom.memory.facts import (
     DeterministicFactExtractor,
     FactCandidate,
@@ -26,6 +31,9 @@ from axiom.memory.summarizer import (
 )
 from axiom.types import Message
 
+if TYPE_CHECKING:
+    from axiom.runtime.events import RuntimeEvent
+
 SECRET_PATTERN = re.compile(
     r"(authorization|bearer\s+[a-z0-9._-]+|sk-[a-z0-9]+|api[_-]?key|\.env)",
     re.IGNORECASE,
@@ -33,6 +41,13 @@ SECRET_PATTERN = re.compile(
 WINDOWS_PATH_PATTERN = re.compile(r"\b[A-Za-z]:\\[^\s]+")
 BASE64_BLOB_PATTERN = re.compile(r"\b[A-Za-z0-9+/]{80,}={0,2}\b")
 DEFAULT_TOOL_DIGEST_CHARS = 500
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedRuntimeTurn:
+    user: RuntimeEvent
+    assistant: RuntimeEvent
+    completed_event_id: int
 
 
 class MemoryService:
@@ -297,7 +312,7 @@ class MemoryService:
     async def extract_facts_from_thread(
         self,
         thread_id: str,
-        events: Iterable[Any],
+        events: Iterable[RuntimeEvent],
     ) -> FactExtractionRunResult:
         try:
             return await self._extract_facts_from_thread_unchecked(thread_id, events)
@@ -307,33 +322,41 @@ class MemoryService:
     async def _extract_facts_from_thread_unchecked(
         self,
         thread_id: str,
-        events: Iterable[Any],
+        events: Iterable[RuntimeEvent],
     ) -> FactExtractionRunResult:
         last_event_id = _int_or_none(self.store.get_meta(_fact_checkpoint_key(thread_id)))
         user_messages: list[Message] = []
         max_event_id = last_event_id
-        for event in events:
-            event_id = getattr(event, "id", None)
-            if not isinstance(event_id, int):
+        for turn in _completed_runtime_turns(events):
+            if turn.user.thread_id != thread_id:
                 continue
-            if last_event_id is not None and event_id <= last_event_id:
+            if last_event_id is not None and turn.completed_event_id <= last_event_id:
                 continue
-            event_type = str(getattr(event, "type", ""))
-            payload = getattr(event, "payload", {})
-            if not isinstance(payload, dict):
-                continue
-            max_event_id = event_id if max_event_id is None else max(max_event_id, event_id)
-            if event_type != "user.message":
-                continue
-            text = payload.get("text")
-            if not isinstance(text, str) or not text:
-                continue
-            user_messages.append(Message(role="user", content=text, name=f"event:{event_id}"))
+            max_event_id = (
+                turn.completed_event_id
+                if max_event_id is None
+                else max(max_event_id, turn.completed_event_id)
+            )
+            user_messages.append(
+                Message(
+                    role="user", content=turn.user.payload["text"], name=f"event:{turn.user.id}"
+                )
+            )
         if not user_messages:
             if max_event_id is not None:
                 self.store.set_meta(_fact_checkpoint_key(thread_id), str(max_event_id))
             return FactExtractionRunResult(processed_event_end_id=max_event_id)
         summary = self.store.active_summary(thread_id=thread_id)
+        if summary is not None and not is_identified_conversation_summary(
+            summary,
+            self.store.list_records(
+                kind=MemoryKind.CONVERSATION,
+                scope_type=MemoryScopeType.THREAD,
+                scope_id=thread_id,
+                limit=1000,
+            ),
+        ):
+            summary = None
         candidates = list(
             await self.fact_extractor.extract(
                 user_messages,
@@ -393,24 +416,26 @@ class MemoryService:
         policy = self.summary_policy
         if not policy.enabled:
             return SummaryRunResult(created=False)
-        active_summary = self.store.active_summary(thread_id=thread_id)
-        covered_end = active_summary.source_event_end_id if active_summary else None
-        conversation = self._conversation_records_for_summary(
-            thread_id,
-            after_event_id=covered_end,
-            reserve=policy.recent_message_reserve,
-        )
-        total_conversation = self.store.list_records(
+        raw_conversation = self.store.list_records(
             kind=MemoryKind.CONVERSATION,
             scope_type=MemoryScopeType.THREAD,
             scope_id=thread_id,
             limit=1000,
         )
+        active_summary = self.store.active_summary(thread_id=thread_id)
+        if not is_identified_conversation_summary(active_summary, raw_conversation):
+            active_summary = None
+        covered_end = active_summary.source_event_end_id if active_summary else None
+        conversation = self._conversation_records_for_summary(
+            raw_conversation,
+            after_event_id=covered_end,
+            reserve=policy.recent_message_reserve,
+        )
+        total_conversation = completed_conversation_records(raw_conversation)
         if len(total_conversation) < policy.threshold_messages:
             return SummaryRunResult(created=False)
         if len(conversation) < policy.minimum_unsummarized_messages:
             return SummaryRunResult(created=False)
-        conversation = list(reversed(conversation))
         segments = segment_messages(
             conversation,
             max_estimated_tokens=policy.map_chunk_estimated_tokens,
@@ -502,31 +527,11 @@ class MemoryService:
             compression_ratio=_compression_ratio(estimated_before, estimated_after),
         )
 
-    def history_from_runtime_events(self, events: Iterable[Any]) -> list[Message]:
+    def history_from_runtime_events(self, events: Iterable[RuntimeEvent]) -> list[Message]:
         messages: list[Message] = []
-        seen_event_ids: set[int] = set()
-        pending_user: str | None = None
-        for event in events:
-            event_id = getattr(event, "id", None)
-            if isinstance(event_id, int):
-                if event_id in seen_event_ids:
-                    continue
-                seen_event_ids.add(event_id)
-            event_type = str(getattr(event, "type", ""))
-            payload = getattr(event, "payload", {})
-            if not isinstance(payload, dict):
-                continue
-            text = payload.get("text")
-            if not isinstance(text, str) or not text:
-                continue
-            if event_type == "user.message":
-                pending_user = text
-            elif event_type == "assistant.message":
-                if pending_user is None:
-                    continue
-                messages.append(Message(role="user", content=pending_user))
-                messages.append(Message(role="assistant", content=text))
-                pending_user = None
+        for turn in _completed_runtime_turns(events):
+            messages.append(Message(role="user", content=turn.user.payload["text"]))
+            messages.append(Message(role="assistant", content=turn.assistant.payload["text"]))
         return messages
 
     def _default_scope(self, scope_type: MemoryScopeType) -> str:
@@ -538,31 +543,88 @@ class MemoryService:
 
     def _conversation_records_for_summary(
         self,
-        thread_id: str,
+        records: list[MemoryRecord],
         *,
         after_event_id: int | None,
         reserve: int,
     ) -> list[MemoryRecord]:
-        records = self.store.list_records(
-            kind=MemoryKind.CONVERSATION,
-            scope_type=MemoryScopeType.THREAD,
-            scope_id=thread_id,
-            limit=1000,
-        )
-        records = [
-            record
-            for record in records
-            if after_event_id is None
-            or (
-                record.source_event_start_id is not None
-                and record.source_event_start_id > after_event_id
-            )
-        ]
-        if reserve <= 0:
-            return records
-        ordered_oldest_first = list(reversed(records))
-        eligible = ordered_oldest_first[:-reserve] if len(ordered_oldest_first) > reserve else []
-        return list(reversed(eligible))
+        records = completed_conversation_records(records)
+        turns = [records[index : index + 2] for index in range(0, len(records), 2)]
+        if after_event_id is not None:
+            turns = [turn for turn in turns if turn[0].source_event_start_id > after_event_id]
+        eligible_count = max(0, len(turns) - (max(reserve, 0) + 1) // 2)
+        safe_prefix = 0
+        prefix_end = -1
+        for index, turn in enumerate(turns[:eligible_count]):
+            prefix_end = max(prefix_end, turn[1].source_event_start_id)
+            # A summary's event range must not cover a reserved, interleaved turn.
+            # Otherwise the later range filter would silently drop that whole turn.
+            if index + 1 == len(turns) or prefix_end < turns[index + 1][0].source_event_start_id:
+                safe_prefix = index + 1
+        return [record for turn in turns[:safe_prefix] for record in turn]
+
+
+def _completed_runtime_turns(events: Iterable[RuntimeEvent]) -> list[_CompletedRuntimeTurn]:
+    grouped: dict[tuple[str, str, str], list[RuntimeEvent]] = {}
+    seen_event_ids: set[tuple[str, int]] = set()
+    for event in sorted(events, key=lambda item: (item.id, item.thread_id)):
+        event_key = (event.thread_id, event.id)
+        if event_key in seen_event_ids:
+            continue
+        seen_event_ids.add(event_key)
+        if event.type not in {
+            "user.message",
+            "assistant.message",
+            "turn.completed",
+            "run.completed",
+        }:
+            continue
+        if event.parent_run_id is not None or event.payload.get("parent_run_id") is not None:
+            continue
+        identity = _runtime_event_identity(event)
+        if identity is not None:
+            grouped.setdefault(identity, []).append(event)
+
+    turns: list[_CompletedRuntimeTurn] = []
+    for group in grouped.values():
+        users = [event for event in group if event.type == "user.message"]
+        assistants = [event for event in group if event.type == "assistant.message"]
+        completed = [event for event in group if event.type == "turn.completed"]
+        if not completed:
+            completed = [event for event in group if event.type == "run.completed"]
+        if not users or not assistants or not completed:
+            continue
+        user_texts = [event.payload.get("text") for event in users]
+        assistant_texts = [event.payload.get("text") for event in assistants]
+        if any(not isinstance(text, str) or not text for text in [*user_texts, *assistant_texts]):
+            continue
+        if len(set(user_texts)) != 1 or len(set(assistant_texts)) != 1:
+            continue
+        user, assistant = users[0], assistants[0]
+        if assistant.id <= user.id:
+            continue
+        turns.append(_CompletedRuntimeTurn(user, assistant, completed[0].id))
+    turns.sort(key=lambda turn: (turn.user.id, turn.user.thread_id))
+    return turns
+
+
+def _runtime_event_identity(event: RuntimeEvent) -> tuple[str, str, str] | None:
+    fields = (
+        (event.thread_id, event.payload.get("thread_id")),
+        (event.run_id, event.payload.get("run_id")),
+        (event.turn_id, event.payload.get("turn_id")),
+    )
+    identity: list[str] = []
+    for envelope, payload in fields:
+        if payload is not None and (not isinstance(payload, str) or not payload):
+            return None
+        if envelope is not None and payload is not None and envelope != payload:
+            return None
+        value = envelope if envelope is not None else payload
+        if not isinstance(value, str) or not value:
+            return None
+        identity.append(value)
+    return (identity[0], identity[1], identity[2])
 
 
 def _bounded_preview(text: str, max_chars: int) -> str:

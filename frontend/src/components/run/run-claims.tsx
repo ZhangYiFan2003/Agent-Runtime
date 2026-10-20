@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Claim, Evidence } from "../../api/adapters/claim";
 import type { ClaimProvenance } from "../../api/run";
 import { fetchArtifactContent } from "../../api/run";
-import { getConnection } from "../../lib/connection";
+import { getConnectionSnapshot, useConnection } from "../../lib/connection";
 import { formatRelativeTime, truncateId } from "../../lib/format";
 import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
@@ -46,6 +46,9 @@ function EvidenceRow({
   evidence: Evidence;
   onOpenSpan: (spanId: string) => void;
 }) {
+  const connection = useConnection();
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => request.current?.abort(), [connection]);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const artifactId = locatorString(evidence, "artifact_id");
@@ -54,10 +57,15 @@ function EvidenceRow({
 
   const download = async () => {
     if (artifactId === null) return;
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    const isCurrent = () => !controller.signal.aborted && getConnectionSnapshot().generation === connection.generation;
     setDownloading(true);
     setError(null);
     try {
-      const blob = await fetchArtifactContent(getConnection(), artifactId);
+      const blob = await fetchArtifactContent(connection.config, artifactId, undefined, controller.signal);
+      if (!isCurrent()) return;
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -65,9 +73,9 @@ function EvidenceRow({
       anchor.click();
       URL.revokeObjectURL(url);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Download failed");
+      if (isCurrent()) setError(cause instanceof Error ? cause.message : "Download failed");
     } finally {
-      setDownloading(false);
+      if (isCurrent()) setDownloading(false);
     }
   };
 

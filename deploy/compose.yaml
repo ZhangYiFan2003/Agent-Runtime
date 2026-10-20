@@ -215,6 +215,7 @@ services:
       start_period: 10s
     networks:
       - provider-control
+      - provider-egress
 
   sandboxd:
     image: axiom-runtime:local
@@ -291,6 +292,8 @@ networks:
   provider-control:
     driver: bridge
     internal: true
+  provider-egress:
+    driver: bridge
   artifact-storage:
     driver: bridge
     internal: true

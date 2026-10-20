@@ -40,11 +40,13 @@ export async function fetchRunClaims(
   config: ConnectionConfig,
   runId: string,
   fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<RunClaims> {
   const raw: unknown = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/claims`, {
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     fetchImpl,
+    signal,
   });
   const dto = runClaimsSchema.parse(raw);
   return { runId: dto.run_id, claims: dto.claims.map(adaptClaim) };
@@ -54,10 +56,11 @@ export async function fetchClaimProvenance(
   config: ConnectionConfig,
   claimId: string,
   fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<ClaimProvenance> {
   const raw: unknown = await apiGet(
     `/v1/claims/${encodeURIComponent(claimId)}/provenance`,
-    { baseUrl: config.baseUrl, apiKey: config.apiKey, fetchImpl },
+    { baseUrl: config.baseUrl, apiKey: config.apiKey, fetchImpl, signal },
   );
   const dto = claimProvenanceSchema.parse(raw);
   return { claim: adaptClaim(dto.claim), evidence: dto.evidence.map(adaptEvidence) };
@@ -67,11 +70,13 @@ export async function fetchRunArtifacts(
   config: ConnectionConfig,
   runId: string,
   fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<RunArtifacts> {
   const raw: unknown = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/artifacts`, {
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     fetchImpl,
+    signal,
   });
   const dto = runArtifactsSchema.parse(raw);
   return { runId: dto.run_id, artifacts: dto.artifacts.map(adaptArtifact) };
@@ -81,11 +86,13 @@ export function fetchArtifactContent(
   config: ConnectionConfig,
   artifactId: string,
   fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<Blob> {
   return apiGetBlob(`/v1/artifacts/${encodeURIComponent(artifactId)}/content`, {
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     fetchImpl,
+    signal,
   });
 }
 
@@ -94,11 +101,13 @@ export async function fetchRun(
   config: ConnectionConfig,
   runId: string,
   fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<RunView> {
   const raw: unknown = await apiGet(`/v1/runs/${encodeURIComponent(runId)}`, {
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     fetchImpl,
+    signal,
   });
   return adaptRunView(runViewSchema.parse(raw));
 }
@@ -108,11 +117,13 @@ export async function fetchRunChildren(
   config: ConnectionConfig,
   runId: string,
   fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<RunChildren> {
   const raw: unknown = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/children`, {
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     fetchImpl,
+    signal,
   });
   const dto = childrenResponseSchema.parse(raw);
   return { parentRunId: dto.parent_run_id, children: dto.children.map(adaptChildRun) };
@@ -131,6 +142,7 @@ export async function fetchRunTrace(
   config: ConnectionConfig,
   runId: string,
   fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<RunTrace | null> {
   let raw: unknown;
   try {
@@ -138,6 +150,7 @@ export async function fetchRunTrace(
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
       fetchImpl,
+      signal,
     });
   } catch (error) {
     if (isNotFound(error)) return null;
@@ -155,6 +168,7 @@ export async function fetchRunMetrics(
   config: ConnectionConfig,
   runId: string,
   fetchImpl?: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<RunMetrics | null> {
   let raw: unknown;
   try {
@@ -162,6 +176,7 @@ export async function fetchRunMetrics(
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
       fetchImpl,
+      signal,
     });
   } catch (error) {
     if (isNotFound(error)) return null;

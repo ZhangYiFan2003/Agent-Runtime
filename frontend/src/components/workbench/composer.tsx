@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { SendHorizontal } from "lucide-react";
 import type { SendOutcome } from "../../queries/use-workbench";
 import { cn } from "../../lib/utils";
@@ -18,6 +18,7 @@ export function Composer({
   autoFocus = false,
   hero = false,
   onSend,
+  restoredDraft,
 }: {
   disabled: boolean;
   disabledReason: string | null;
@@ -26,8 +27,12 @@ export function Composer({
   /** Larger empty-state variant. */
   hero?: boolean;
   onSend: (text: string) => Promise<SendOutcome>;
+  restoredDraft?: string | null;
 }) {
   const [draft, setDraft] = useState("");
+  useEffect(() => {
+    if (restoredDraft) setDraft(restoredDraft);
+  }, [restoredDraft]);
   const trimmed = draft.trim();
   const canSend = !disabled && trimmed !== "";
 

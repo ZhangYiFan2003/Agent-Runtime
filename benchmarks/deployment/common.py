@@ -138,6 +138,7 @@ class ComposeController:
         env = dict(os.environ)
         env.update(
             {
+                "COMPOSE_DISABLE_ENV_FILE": "1",
                 "POSTGRES_USER": "axiom",
                 "POSTGRES_DB": "axiom",
                 "POSTGRES_PASSWORD": "stage15-postgres-password",

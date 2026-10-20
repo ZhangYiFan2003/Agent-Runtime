@@ -4,14 +4,31 @@ import asyncio
 import importlib
 import json
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
 from axiom.artifacts.metadata import postgres_artifact_schema
+from axiom.config import TrafficGovernanceConfig
 from axiom.provenance import postgres_provenance_schema
 from axiom.runtime.capacity import AdmissionRejectedError, CapacitySnapshot
-from axiom.runtime.checkpoints import BudgetLedgerConflictError, CheckpointConflictError
+from axiom.runtime.checkpoints import (
+    _RUN_SUMMARY_FIELDS,
+    OCCUPYING_RUN_STATUSES,
+    BudgetLedgerConflictError,
+    CheckpointConflictError,
+    _attach_child_counts,
+    _check_submission_fingerprint,
+    _check_thread_available,
+    _child_counts_sql,
+    _completed_payload,
+    _raise_submission_rate_limit,
+    _run_list_filters,
+    _run_list_order,
+    _submission_events,
+    _submission_messages,
+)
 from axiom.runtime.control_plane import (
     ApiError,
     ControlOperationName,
@@ -29,7 +46,7 @@ from axiom.runtime.models import (
 )
 from axiom.runtime.ownership import OwnershipLostError, RunOwnership
 
-POSTGRES_SCHEMA_VERSION = 8
+POSTGRES_SCHEMA_VERSION = 9
 RUN_DELIVERY_EXHAUSTED = "RUN_DELIVERY_EXHAUSTED"
 
 
@@ -108,7 +125,7 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
             "select version from axiom_schema_versions where component = 'runtime'"
         ).fetchone()
         version = int(row[0]) if row else POSTGRES_SCHEMA_VERSION
-        if version not in {1, 2, 3, 4, 5, 6, 7, POSTGRES_SCHEMA_VERSION}:
+        if version not in {1, 2, 3, 4, 5, 6, 7, 8, POSTGRES_SCHEMA_VERSION}:
             raise PostgresSchemaError(f"unsupported PostgreSQL runtime schema version: {version}")
         for statement in _SCHEMA_STATEMENTS:
             conn.execute(statement)
@@ -132,6 +149,71 @@ def initialize_postgres_schema(pool: PostgresConnectionPool) -> None:
 
 class PostgresRuntimeStore:
     backend = "postgres"
+
+    async def thread_run_head(self, thread_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._thread_run_head, thread_id)
+
+    def _thread_run_head(self, thread_id: str) -> dict[str, Any] | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "select run_id, status from runs where thread_id = %s "
+                "and parent_run_id is null order by case when status in "
+                "('RUNNING','INTERRUPTED','WAITING_APPROVAL','WAITING_CHILD') "
+                "then 0 else 1 end, created_at desc, run_id desc limit 1", (thread_id,),
+            ).fetchone()
+        return {"run_id": _text(row[0]), "status": _text(row[1])} if row else None
+
+    async def list_run_summaries(
+        self, *, limit: int = 50,
+        position: tuple[str | int | float, str, str] | None = None,
+        search: str = "", status: str = "", strategy: str = "", sort: str = "newest",
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._list_run_summaries, limit, position, search, status, strategy, sort,
+        )
+
+    def _list_run_summaries(
+        self, limit: int, position: tuple[str | int | float, str, str] | None,
+        search: str, status: str, strategy: str, sort: str,
+    ) -> list[dict[str, Any]]:
+        clauses, params = _run_list_filters(search, status, strategy, "%s")
+        sort_expression, direction = _run_list_order(sort, "postgres")
+        if position is not None:
+            value, created_at, run_id = position
+            comparison = ">" if direction == "asc" else "<"
+            if sort in {"newest", "oldest"}:
+                clauses.append(f"(created_at, run_id) {comparison} (%s, %s)")
+                params.extend((created_at, run_id))
+            else:
+                clauses.append(
+                    f"({sort_expression} {comparison} %s or ({sort_expression} = %s "
+                    "and (created_at, run_id) < (%s, %s)))"
+                )
+                params.extend((value, value, created_at, run_id))
+        order = (f"{sort_expression} {direction}, "
+                 + ("created_at desc, " if sort in {"status", "duration"} else "")
+                 + f"run_id {'asc' if sort == 'oldest' else 'desc'}")
+        query = (_POSTGRES_RUN_ROWS + "select " + ", ".join(_RUN_SUMMARY_FIELDS)
+                 + f", {sort_expression} as _cursor_value from current_runs where "
+                 + " and ".join(clauses) + f" order by {order} limit %s")
+        with self.pool.connection() as conn:
+            rows = conn.execute(query, (*params, limit + 1)).fetchall()
+            summaries = [dict(zip((*_RUN_SUMMARY_FIELDS, "_cursor_value"), row, strict=True))
+                         for row in rows]
+            if summaries:
+                ids = [item["run_id"] for item in summaries]
+                counts = conn.execute(
+                    _POSTGRES_RUN_ROWS + _child_counts_sql(",".join("%s" for _ in ids)), ids,
+                ).fetchall()
+                _attach_child_counts(summaries, counts)
+        for summary in summaries:
+            for field in ("created_at", "updated_at", "started_at", "completed_at"):
+                summary[field] = _timestamp(summary[field])
+            summary["_cursor_value"] = (
+                summary["created_at"] if sort in {"newest", "oldest"}
+                else float(summary["_cursor_value"])
+            )
+        return summaries
 
     def __init__(self, pool: PostgresConnectionPool):
         self.pool = pool
@@ -157,10 +239,12 @@ class PostgresRuntimeStore:
         self,
         checkpoint: Checkpoint,
         *,
-        idempotency_key: str,
+        idempotency_key: str | None,
         request_fingerprint: str,
         max_queued_runs: int | None = None,
         max_queued_runs_per_principal: int | None = None,
+        traffic: TrafficGovernanceConfig | None = None,
+        runnable: bool = True,
     ) -> tuple[Checkpoint, bool]:
         _require_optional_limit(max_queued_runs, "max_queued_runs")
         return await asyncio.to_thread(
@@ -170,7 +254,61 @@ class PostgresRuntimeStore:
             request_fingerprint,
             max_queued_runs,
             max_queued_runs_per_principal,
+            traffic,
+            runnable,
         )
+
+    async def lookup_submission(
+        self, thread_id: str, idempotency_key: str, request_fingerprint: str
+    ) -> Checkpoint | None:
+        return await asyncio.to_thread(
+            self._lookup_submission, thread_id, idempotency_key, request_fingerprint
+        )
+
+    def _lookup_submission(
+        self, thread_id: str, idempotency_key: str, request_fingerprint: str
+    ) -> Checkpoint | None:
+        with self.pool.connection() as conn:
+            return self._lookup_submission_in_transaction(
+                conn, thread_id, idempotency_key, request_fingerprint
+            )
+
+    def _lookup_submission_in_transaction(
+        self, conn, thread_id: str, idempotency_key: str, request_fingerprint: str
+    ) -> Checkpoint | None:
+        existing = conn.execute(
+            "select request_fingerprint, run_id from submission_idempotency "
+            "where thread_id = %s and idempotency_key = %s", (thread_id, idempotency_key),
+        ).fetchone()
+        if existing is None:
+            return None
+        if _text(existing[0]) != request_fingerprint:
+            self._idempotency_conflicts += 1
+        _check_submission_fingerprint(_text(existing[0]), request_fingerprint)
+        row = conn.execute(
+            f"select {_RUN_STATE_SELECT} from runs where run_id = %s", (_text(existing[1]),)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("submission idempotency mapping references a missing Run")
+        self._idempotent_submission_replays += 1
+        return _checkpoint_with_delivery(row)
+
+    async def project_completed_turn(self, checkpoint: Checkpoint) -> tuple[int | None, bool]:
+        return await asyncio.to_thread(self._project_completed_turn, checkpoint.run_id)
+
+    def _project_completed_turn(self, run_id: str) -> tuple[int | None, bool]:
+        with self.pool.connection() as conn:
+            _lock_capacity_coordination(conn)
+            identity = conn.execute(
+                "select thread_id from runs where run_id = %s", (run_id,)
+            ).fetchone()
+            if identity is None:
+                return None, False
+            _lock_thread(conn, _text(identity[0]))
+            row = conn.execute(
+                f"select {_RUN_STATE_SELECT} from runs where run_id = %s", (run_id,)
+            ).fetchone()
+            return _project_completed_in_transaction(conn, _checkpoint_with_delivery(row))
 
     async def requeue_delivery_exhausted(self, run_id: str) -> Checkpoint:
         return await asyncio.to_thread(self._requeue_delivery_exhausted, run_id)
@@ -310,6 +448,9 @@ class PostgresRuntimeStore:
         updated_at = _now()
         with self.pool.connection() as conn:
             _lock_capacity_coordination(conn)
+            if checkpoint.parent_run_id is None:
+                _lock_thread(conn, checkpoint.thread_id)
+                _check_postgres_thread_available(conn, checkpoint.thread_id, checkpoint.run_id)
             if conn.execute(
                 "select 1 from runs where run_id = %s", (checkpoint.run_id,)
             ).fetchone():
@@ -328,40 +469,26 @@ class PostgresRuntimeStore:
     def _admit_submission(
         self,
         checkpoint: Checkpoint,
-        idempotency_key: str,
+        idempotency_key: str | None,
         request_fingerprint: str,
         max_queued_runs: int | None,
         max_queued_runs_per_principal: int | None,
+        traffic: TrafficGovernanceConfig | None,
+        runnable: bool,
     ) -> tuple[Checkpoint, bool]:
         if checkpoint.sequence != 0 or checkpoint.parent_run_id is not None:
             raise ValueError("only a new root Run may pass submission admission")
         updated_at = _now()
         with self.pool.connection() as conn:
             _lock_capacity_coordination(conn)
-            existing = conn.execute(
-                """
-                select request_fingerprint, run_id
-                from submission_idempotency
-                where thread_id = %s and idempotency_key = %s
-                """,
-                (checkpoint.thread_id, idempotency_key),
-            ).fetchone()
-            if existing is not None:
-                if _text(existing[0]) != request_fingerprint:
-                    self._idempotency_conflicts += 1
-                    raise ApiError(
-                        "IDEMPOTENCY_KEY_CONFLICT",
-                        "idempotency key was already used with a different submission",
-                        409,
-                    )
-                row = conn.execute(
-                    f"select {_RUN_STATE_SELECT} from runs where run_id = %s",
-                    (_text(existing[1]),),
-                ).fetchone()
-                if row is None:
-                    raise RuntimeError("submission idempotency mapping references a missing Run")
-                self._idempotent_submission_replays += 1
-                return _checkpoint_with_delivery(row), False
+            _lock_thread(conn, checkpoint.thread_id)
+            if idempotency_key is not None:
+                existing = self._lookup_submission_in_transaction(
+                    conn, checkpoint.thread_id, idempotency_key, request_fingerprint
+                )
+                if existing is not None:
+                    return existing, False
+            _check_postgres_thread_available(conn, checkpoint.thread_id, checkpoint.run_id)
             if conn.execute(
                 "select 1 from runs where run_id = %s", (checkpoint.run_id,)
             ).fetchone():
@@ -373,27 +500,44 @@ class PostgresRuntimeStore:
             _check_principal_queue_quota(
                 conn, checkpoint.principal_key, max_queued_runs_per_principal
             )
-            _insert_initial_run(conn, checkpoint, updated_at=updated_at, runnable=True)
-            conn.execute(
-                """
-                insert into submission_idempotency(
-                    thread_id, idempotency_key, request_fingerprint, run_id, created_at
-                ) values (%s, %s, %s, %s, %s)
-                """,
-                (
-                    checkpoint.thread_id,
-                    idempotency_key,
-                    request_fingerprint,
-                    checkpoint.run_id,
-                    updated_at,
-                ),
+            if traffic is not None:
+                wait = _consume_submission_tokens_in_transaction(
+                    conn, checkpoint.principal_key, traffic.global_submission_rate,
+                    traffic.global_submission_burst, traffic.principal_submission_rate,
+                    traffic.principal_submission_burst,
+                )
+                if wait is not None:
+                    _raise_submission_rate_limit(wait)
+            previous = [_checkpoint(row[0]) for row in conn.execute(
+                "select state_json from runs where thread_id = %s order by created_at, run_id",
+                (checkpoint.thread_id,),
+            ).fetchall()]
+            for state in previous:
+                _project_completed_in_transaction(conn, state)
+            admitted = replace(
+                checkpoint, messages=_submission_messages(previous, checkpoint.input)
             )
+            _insert_initial_run(conn, admitted, updated_at=updated_at, runnable=runnable)
+            if idempotency_key is not None:
+                conn.execute(
+                    """
+                    insert into submission_idempotency(
+                        thread_id, idempotency_key, request_fingerprint, run_id, created_at
+                    ) values (%s, %s, %s, %s, %s)
+                    """,
+                    (checkpoint.thread_id, idempotency_key, request_fingerprint,
+                     checkpoint.run_id, updated_at),
+                )
+            for event_type, payload in _submission_events(checkpoint):
+                _append_submission_event(conn, checkpoint, event_type, payload)
         checkpoint.sequence = 1
         checkpoint.updated_at = updated_at
+        checkpoint.messages = admitted.messages
         return checkpoint, True
 
     def _requeue_delivery_exhausted(self, run_id: str) -> Checkpoint:
         with self.pool.connection() as conn:
+            _lock_run_thread(conn, run_id)
             row = conn.execute(
                 f"""
                 select {_RUN_STATE_SELECT}, current_sequence, fencing_token
@@ -470,8 +614,13 @@ class PostgresRuntimeStore:
         state["updated_at"] = updated_at
         payload = _json(state)
         with self.pool.connection() as conn:
+            if checkpoint.parent_run_id is None:
+                _lock_capacity_coordination(conn)
+                _lock_thread(conn, checkpoint.thread_id)
             if ownership is not None:
                 _lock_and_validate_ownership(conn, ownership)
+            if checkpoint.parent_run_id is None and checkpoint.status in OCCUPYING_RUN_STATUSES:
+                _check_postgres_thread_available(conn, checkpoint.thread_id, checkpoint.run_id)
             if expected == 0:
                 row = conn.execute(
                     """
@@ -546,6 +695,7 @@ class PostgresRuntimeStore:
                 ),
             )
             if checkpoint.finished:
+                _project_completed_in_transaction(conn, checkpoint)
                 conn.execute(
                     """
                     update runs
@@ -724,6 +874,7 @@ class PostgresRuntimeStore:
 
     def _mark_runnable(self, run_id: str) -> None:
         with self.pool.connection() as conn:
+            _lock_run_thread(conn, run_id)
             row = conn.execute(
                 f"""
                 update runs as candidate
@@ -754,8 +905,7 @@ class PostgresRuntimeStore:
         aging_boost_cap: int,
     ) -> RunOwnership | None:
         with self.pool.connection() as conn:
-            if max_active_runs is not None:
-                _lock_capacity_coordination(conn)
+            _lock_run_thread(conn, run_id)
             candidate = conn.execute(
                 f"""
                 select candidate.run_id, candidate.owner_worker_id,
@@ -803,8 +953,7 @@ class PostgresRuntimeStore:
         aging_boost_cap: int,
     ) -> RunOwnership | None:
         with self.pool.connection() as conn:
-            if max_active_runs is not None:
-                _lock_capacity_coordination(conn)
+            _lock_capacity_coordination(conn)
             candidate = conn.execute(
                 f"""
                 select candidate.run_id, candidate.owner_worker_id,
@@ -833,7 +982,6 @@ class PostgresRuntimeStore:
                     coalesce((candidate.state_json ->> 'runnable_since')::timestamptz,
                              candidate.created_at),
                     candidate.run_id
-                for update skip locked
                 limit 1
                 """,
                 (
@@ -843,6 +991,24 @@ class PostgresRuntimeStore:
                     aging_interval_seconds,
                 ),
             ).fetchone()
+            if candidate is not None:
+                # Select identity first so the Thread is locked before the Run, as in
+                # admission and reactivation. Recheck eligibility while locking the Run:
+                # lease release/renewal does not take the capacity coordination lock.
+                _lock_run_thread(conn, _text(candidate[0]))
+                candidate = conn.execute(
+                    f"""
+                    select candidate.run_id, candidate.owner_worker_id,
+                           candidate.delivery_attempt, candidate.state_json,
+                           candidate.current_sequence, candidate.schema_version,
+                           candidate.thread_id, candidate.turn_id,
+                           candidate.parent_run_id, candidate.fencing_token
+                    from runs as candidate
+                    where candidate.run_id = %s and {_RUN_IS_CLAIMABLE}
+                    for update skip locked
+                    """,
+                    (_text(candidate[0]),),
+                ).fetchone()
             if _delivery_is_exhausted(candidate, max_run_delivery_attempts):
                 _mark_delivery_exhausted(
                     conn,
@@ -1051,6 +1217,12 @@ class PostgresEventRepository:
 
     def append_event(self, thread_id: str, event_type: str, payload: dict[str, Any]) -> int:
         with self.pool.connection() as conn:
+            # Allocate sequence IDs only after this Thread's preceding event writer
+            # commits. PostgreSQL sequences alone do not imply commit order.
+            if conn.execute(
+                "select id from threads where id = %s for update", (thread_id,),
+            ).fetchone() is None:
+                raise ValueError("thread not found")
             row = conn.execute(
                 """
                 insert into events(
@@ -1119,6 +1291,60 @@ class PostgresEventRepository:
             )
             for row in rows
         ]
+
+    def page_events(
+        self, thread_id: str, *, after_id: int | None = None,
+        before_id: int | None = None, run_id: str | None = None,
+        limit: int = 200, latest: bool = False,
+    ) -> tuple[list[RuntimeEvent], int]:
+        clauses = ["e.thread_id = %s"]
+        params: list[object] = [thread_id]
+        if after_id is not None:
+            clauses.append("e.id > %s")
+            params.append(after_id)
+        if before_id is not None:
+            clauses.append("e.id < %s")
+            params.append(before_id)
+        if run_id is not None:
+            clauses.append("e.run_id = %s")
+            params.append(run_id)
+        return self._event_page(clauses, params, limit, latest or before_id is not None)
+
+    def page_messages(
+        self, thread_id: str, *, before_id: int | None = None,
+        after_id: int | None = None, limit: int = 50,
+    ) -> tuple[list[RuntimeEvent], int]:
+        clauses = ["e.thread_id = %s", _POSTGRES_MESSAGE_FILTER]
+        params: list[object] = [thread_id]
+        if before_id is not None:
+            clauses.append("e.id < %s")
+            params.append(before_id)
+        if after_id is not None:
+            clauses.append("e.id > %s")
+            params.append(after_id)
+        return self._event_page(clauses, params, limit, after_id is None)
+
+    def _event_page(
+        self, clauses: list[str], params: list[object], limit: int, descending: bool,
+    ) -> tuple[list[RuntimeEvent], int]:
+        order = "desc" if descending else "asc"
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "select e.id, e.thread_id, e.type, e.payload, e.created_at, "
+                "e.turn_id, e.run_id, e.parent_run_id, e.parent_step_id, e.assignment_id "
+                "from events e where " + " and ".join(clauses)
+                + f" order by e.id {order} limit %s", (*params, limit + 1),
+            ).fetchall()
+        if descending:
+            rows.reverse()
+        events = [RuntimeEvent(
+            id=int(row[0]), thread_id=_text(row[1]), type=_text(row[2]),
+            payload=dict(row[3]), created_at=_timestamp(row[4]) or "",
+            turn_id=_optional_text(row[5]), run_id=_optional_text(row[6]),
+            parent_run_id=_optional_text(row[7]), parent_step_id=_optional_text(row[8]),
+            assignment_id=_optional_text(row[9]),
+        ) for row in rows]
+        return events, events[-1].id if events else 0
 
     def database_ok(self) -> bool:
         try:
@@ -1278,6 +1504,53 @@ from control_operations
 _RUN_STATE_SELECT = """
 state_json, delivery_attempt, failure_queued_at, last_delivery_failure,
 last_delivery_failed_at, last_delivery_worker_id, last_delivery_fencing_token
+"""
+
+_POSTGRES_RUN_ROWS = """
+with current_runs as (
+    select run_id, thread_id, turn_id, status, parent_run_id, created_at, updated_at,
+        coalesce(state_json ->> 'run_kind', 'agent') run_kind,
+        coalesce(state_json ->> 'execution_strategy', 'react') execution_strategy,
+        state_json ->> 'parent_step_id' parent_step_id,
+        created_at started_at,
+        case when status in ('COMPLETED','FAILED','CANCELLED') then updated_at end completed_at
+    from runs
+)
+"""
+
+_POSTGRES_MESSAGE_FILTER = """
+e.type in ('user.message', 'assistant.message')
+and e.run_id is not null and e.run_id <> ''
+and e.turn_id is not null and e.turn_id <> ''
+and e.parent_run_id is null and e.payload ->> 'parent_run_id' is null
+and (e.payload ->> 'thread_id' is null or e.payload ->> 'thread_id' = e.thread_id)
+and (e.payload ->> 'run_id' is null or e.payload ->> 'run_id' = e.run_id)
+and (e.payload ->> 'turn_id' is null or e.payload ->> 'turn_id' = e.turn_id)
+and jsonb_typeof(e.payload -> 'text') = 'string' and e.payload ->> 'text' <> ''
+and exists (
+    select 1 from runs r where r.run_id = e.run_id and r.thread_id = e.thread_id
+    and r.turn_id = e.turn_id and r.parent_run_id is null
+    and (e.type = 'user.message' or r.status = 'COMPLETED')
+)
+and not exists (
+    select 1 from events duplicate where duplicate.thread_id = e.thread_id
+    and duplicate.run_id = e.run_id and duplicate.turn_id = e.turn_id
+    and duplicate.type = e.type
+    and ((duplicate.payload ->> 'text') is distinct from (e.payload ->> 'text')
+         or duplicate.id < e.id)
+)
+and (e.type = 'user.message' or exists (
+    select 1 from events u where u.thread_id = e.thread_id and u.run_id = e.run_id
+    and u.turn_id = e.turn_id and u.type = 'user.message' and u.id < e.id
+    and u.parent_run_id is null and u.payload ->> 'parent_run_id' is null
+    and jsonb_typeof(u.payload -> 'text') = 'string' and u.payload ->> 'text' <> ''
+    and not exists (
+        select 1 from events ambiguous where ambiguous.thread_id = u.thread_id
+        and ambiguous.run_id = u.run_id and ambiguous.turn_id = u.turn_id
+        and ambiguous.type = 'user.message'
+        and (ambiguous.payload ->> 'text') is distinct from (u.payload ->> 'text')
+    )
+))
 """
 
 
@@ -1516,6 +1789,68 @@ def _lock_capacity_coordination(conn) -> None:
     ).fetchone()
 
 
+def _lock_thread(conn, thread_id: str) -> None:
+    # Direct Runtime callers may create a Run before the API creates its Thread record.
+    conn.execute("insert into threads(id, created_at) values (%s, %s) on conflict(id) do nothing",
+                 (thread_id, _now()))
+    conn.execute("select id from threads where id = %s for update", (thread_id,)).fetchone()
+
+
+def _check_postgres_thread_available(conn, thread_id: str, run_id: str) -> None:
+    states = [_checkpoint(row[0]) for row in conn.execute(
+        "select state_json from runs where thread_id = %s and parent_run_id is null "
+        "and status in ('RUNNING', 'INTERRUPTED', 'WAITING_APPROVAL', 'WAITING_CHILD') "
+        "order by created_at, run_id", (thread_id,),
+    ).fetchall()]
+    _check_thread_available(states, run_id)
+
+
+def _lock_run_thread(conn, run_id: str) -> None:
+    _lock_capacity_coordination(conn)
+    identity = conn.execute(
+        "select thread_id, parent_run_id from runs where run_id = %s", (run_id,)
+    ).fetchone()
+    if identity is not None and identity[1] is None:
+        _lock_thread(conn, _text(identity[0]))
+        _check_postgres_thread_available(conn, _text(identity[0]), run_id)
+
+
+def _append_submission_event(conn, state: Checkpoint, event_type: str, payload: dict) -> int:
+    payload = {**payload, "thread_id": state.thread_id,
+               "run_id": state.run_id, "turn_id": state.turn_id}
+    row = conn.execute(
+        "insert into events(thread_id, run_id, turn_id, type, payload, created_at) "
+        "values (%s, %s, %s, %s, %s::jsonb, %s) returning id",
+        (state.thread_id, state.run_id, state.turn_id, event_type, _json(payload), _now()),
+    ).fetchone()
+    return int(row[0])
+
+
+def _project_completed_in_transaction(conn, state: Checkpoint) -> tuple[int | None, bool]:
+    if state.status != RunStatus.COMPLETED or state.parent_run_id is not None:
+        return None, False
+    identity = (state.thread_id, state.run_id, state.turn_id)
+    if conn.execute(
+        "select 1 from events where thread_id = %s and run_id = %s and turn_id = %s "
+        "and type = 'user.message'", identity,
+    ).fetchone() is None:
+        return None, False
+    row = conn.execute(
+        "select id from events where thread_id = %s and run_id = %s and turn_id = %s "
+        "and type = 'assistant.message' order by id limit 1", identity,
+    ).fetchone()
+    created = row is None
+    event_id = int(row[0]) if row else _append_submission_event(
+        conn, state, "assistant.message", {"text": state.output_text}
+    )
+    if conn.execute(
+        "select 1 from events where thread_id = %s and run_id = %s and turn_id = %s "
+        "and type = 'turn.completed'", identity,
+    ).fetchone() is None:
+        _append_submission_event(conn, state, "turn.completed", _completed_payload(state))
+    return event_id, created
+
+
 def _queued_count(conn) -> int:
     row = conn.execute(f"select count(*) from runs as candidate where {_RUN_IS_QUEUED}").fetchone()
     return int(row[0])
@@ -1579,6 +1914,20 @@ def _consume_submission_tokens(
     principal_rate: float | None,
     principal_burst: int | None,
 ) -> float | None:
+    with self.pool.connection() as conn:
+        return _consume_submission_tokens_in_transaction(
+            conn, principal_key, global_rate, global_burst, principal_rate, principal_burst
+        )
+
+
+def _consume_submission_tokens_in_transaction(
+    conn,
+    principal_key: str,
+    global_rate: float | None,
+    global_burst: int | None,
+    principal_rate: float | None,
+    principal_burst: int | None,
+) -> float | None:
     buckets: list[tuple[str, str, float, int]] = []
     if global_rate is not None and global_burst is not None:
         buckets.append(("global", "root_submission", global_rate, global_burst))
@@ -1586,25 +1935,24 @@ def _consume_submission_tokens(
         buckets.append(("principal", principal_key, principal_rate, principal_burst))
     if not buckets:
         return None
-    with self.pool.connection() as conn:
-        states = [_consume_bucket(conn, *bucket) for bucket in buckets]
-        if any(tokens < 1.0 for tokens, _ in states):
-            waits = [
-                max(0.0, (1.0 - tokens) / bucket[2])
-                for (tokens, _), bucket in zip(states, buckets, strict=True)
-            ]
-            return max(waits) if waits else None
-        for (scope, scope_key, _rate, _burst), (tokens, _rate_value) in zip(
-            buckets, states, strict=True
-        ):
-            conn.execute(
+    states = [_consume_bucket(conn, *bucket) for bucket in buckets]
+    if any(tokens < 1.0 for tokens, _ in states):
+        waits = [
+            max(0.0, (1.0 - tokens) / bucket[2])
+            for (tokens, _), bucket in zip(states, buckets, strict=True)
+        ]
+        return max(waits)
+    for (scope, scope_key, _rate, _burst), (tokens, _rate_value) in zip(
+        buckets, states, strict=True
+    ):
+        conn.execute(
                 """
                 update traffic_rate_buckets
                 set tokens = %s - 1, last_refill_at = current_timestamp
                 where scope = %s and scope_key = %s
                 """,
                 (tokens, scope, scope_key),
-            )
+        )
     return None
 
 
@@ -1744,6 +2092,7 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     "create index if not exists idx_runs_thread on runs(thread_id, created_at, run_id)",
+    "create index if not exists idx_runs_created on runs(created_at, run_id)",
     "create index if not exists idx_runs_parent on runs(parent_run_id)",
     """
     create table if not exists checkpoints (
@@ -1824,6 +2173,11 @@ _SCHEMA_STATEMENTS = (
     """,
     "create index if not exists idx_events_thread_id on events(thread_id, id)",
     "create index if not exists idx_events_run_id on events(thread_id, run_id, id)",
+    "create index if not exists idx_events_messages on events(thread_id, id) "
+    "where type in ('user.message', 'assistant.message')",
+    "create index if not exists idx_events_message_identity "
+    "on events(thread_id, run_id, turn_id, type, id) "
+    "where type in ('user.message', 'assistant.message')",
     """
     create table if not exists control_operations (
         operation_id text primary key,

@@ -1,20 +1,28 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Artifact } from "../../api/adapters/artifact";
 import { fetchArtifactContent } from "../../api/run";
 import { formatRelativeTime, truncateId } from "../../lib/format";
-import { getConnection } from "../../lib/connection";
+import { getConnectionSnapshot, useConnection } from "../../lib/connection";
 import { Button } from "../ui/button";
 import { CopyId } from "./copy-id";
 
 export function RunArtifactsTable({ artifacts }: { artifacts: Artifact[] }) {
+  const connection = useConnection();
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => request.current?.abort(), [connection]);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const download = async (artifact: Artifact) => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    const isCurrent = () => !controller.signal.aborted && getConnectionSnapshot().generation === connection.generation;
     setDownloading(artifact.artifactId);
     setError(null);
     try {
-      const blob = await fetchArtifactContent(getConnection(), artifact.artifactId);
+      const blob = await fetchArtifactContent(connection.config, artifact.artifactId, undefined, controller.signal);
+      if (!isCurrent()) return;
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -22,9 +30,9 @@ export function RunArtifactsTable({ artifacts }: { artifacts: Artifact[] }) {
       anchor.click();
       URL.revokeObjectURL(url);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Download failed");
+      if (isCurrent()) setError(cause instanceof Error ? cause.message : "Download failed");
     } finally {
-      setDownloading(null);
+      if (isCurrent()) setDownloading(null);
     }
   };
 

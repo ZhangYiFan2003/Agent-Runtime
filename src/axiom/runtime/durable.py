@@ -322,33 +322,17 @@ class DurableAgentRuntime:
         principal_key: str = "default",
         base_priority: int = 1,
     ) -> Checkpoint:
-        """Atomically admit a new root Run to the PostgreSQL runnable backlog."""
-        admit = getattr(self.store, "admit_run", None)
-        if admit is None or getattr(self.store, "backend", None) != "postgres":
-            raise ValueError("distributed Run admission requires PostgreSQL storage")
-        state = await self._new_run_state(
+        """Admit a root submission with its conversation facts in one transaction."""
+        state, _created = await self.submit_idempotent(
             thread_id=thread_id,
             input=input,
+            idempotency_key=None,
             history=history,
             run_id=run_id,
             turn_id=turn_id,
+            max_queued_runs=max_queued_runs,
             principal_key=principal_key,
             base_priority=base_priority,
-        )
-        await admit(
-            state,
-            max_queued_runs,
-            max_queued_runs_per_principal=getattr(
-                self.config.capacity, "max_queued_runs_per_principal", None
-            ),
-        )
-        await self._emit(
-            "run.admitted",
-            {
-                "run_id": state.run_id,
-                "turn_id": state.turn_id,
-                "status": state.status.value,
-            },
         )
         return state
 
@@ -357,18 +341,16 @@ class DurableAgentRuntime:
         *,
         thread_id: str,
         input: str,
-        idempotency_key: str,
+        idempotency_key: str | None,
         history: list[Message] | None = None,
         run_id: str | None = None,
         turn_id: str | None = None,
         max_queued_runs: int | None = None,
         principal_key: str = "default",
         base_priority: int = 1,
+        runnable: bool = True,
     ) -> tuple[Checkpoint, bool]:
-        """Atomically admit or replay one PostgreSQL root submission."""
-        admit = getattr(self.store, "admit_submission", None)
-        if admit is None or getattr(self.store, "backend", None) != "postgres":
-            raise ValueError("idempotent distributed submission requires PostgreSQL storage")
+        """Atomically accept or replay a root submission on the configured database."""
         state = await self._new_run_state(
             thread_id=thread_id,
             input=input,
@@ -378,27 +360,36 @@ class DurableAgentRuntime:
             principal_key=principal_key,
             base_priority=base_priority,
         )
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                {
-                    "thread_id": thread_id,
-                    "input": input,
-                    "execution_strategy": state.execution_strategy,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        return await admit(
+        return await self.store.admit_submission(
             state,
             idempotency_key=idempotency_key,
-            request_fingerprint=fingerprint,
+            request_fingerprint=submission_fingerprint(thread_id, input, state.execution_strategy),
             max_queued_runs=max_queued_runs,
-            max_queued_runs_per_principal=getattr(
-                self.config.capacity, "max_queued_runs_per_principal", None
-            ),
+            max_queued_runs_per_principal=self.config.capacity.max_queued_runs_per_principal,
+            traffic=self.config.traffic,
+            runnable=runnable,
         )
+
+    async def execute_submitted(self, state: Checkpoint) -> Checkpoint:
+        """Advance an already accepted local Run without admitting another identity."""
+        async def execute() -> Checkpoint:
+            async with self._run_lock(state.run_id):
+                current = await self._require(state.run_id)
+                if current.sequence != state.sequence:
+                    raise CheckpointConflictError("submitted Run has already advanced")
+                if current.status != RunStatus.RUNNING:
+                    return current
+                if self.tracer is not None:
+                    await self.tracer.start_run(current)
+                await self.budget_manager.initialize(current)
+                await self._save_checkpoint(current, operation="run.start")
+                await self._emit(
+                    "run.started",
+                    {"run_id": current.run_id, "turn_id": current.turn_id},
+                )
+            return await self._advance(current)
+
+        return await self._supervise(state, execute)
 
     async def _new_run_state(
         self,
@@ -2949,6 +2940,17 @@ def _configured_pricing_targets(config: AxiomConfig) -> list[tuple[str, str]]:
         if separator:
             targets.append((provider, model))
     return targets
+
+
+def submission_fingerprint(thread_id: str, input: str, execution_strategy: str) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {"thread_id": thread_id, "input": input, "execution_strategy": execution_strategy},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _now() -> str:

@@ -17,6 +17,7 @@ describe("fetchRuns", () => {
     const fetchImpl: typeof fetch = async (input) => {
       expect(String(input)).toContain("/v1/runs");
       return jsonResponse(200, {
+        next_cursor: "next", has_more: true,
         runs: [
           makeRunViewDto({ run_id: "run_a", status: "RUNNING" }),
           makeRunViewDto({
@@ -31,18 +32,22 @@ describe("fetchRuns", () => {
         ],
       });
     };
-    const runs = await fetchRuns(BASE, fetchImpl);
+    const page = await fetchRuns(BASE, { fetchImpl });
+    const runs = page.runs;
     expect(runs).toHaveLength(2);
     expect(runs[0].runId).toBe("run_a");
     expect(runs[0].statusGroup).toBe("active");
     expect(runs[1].parentRunId).toBe("run_a");
     expect(runs[1].childrenCount).toBe(2);
-    expect(runs[1].activeChildRunIds).toEqual(["run_b1"]);
+    expect(runs[1].activeChildrenCount).toBe(1);
+    expect(runs[1]).not.toHaveProperty("activeChildRunIds");
+    expect(page.nextCursor).toBe("next");
   });
 
   it("tolerates unknown fields and unknown enums in the list", async () => {
     const fetchImpl: typeof fetch = async () =>
       jsonResponse(200, {
+        next_cursor: null, has_more: false,
         runs: [
           makeRunViewDto({
             run_id: "run_future",
@@ -52,7 +57,7 @@ describe("fetchRuns", () => {
           }),
         ],
       });
-    const runs = await fetchRuns(BASE, fetchImpl);
+    const { runs } = await fetchRuns(BASE, { fetchImpl });
     expect(runs).toHaveLength(1);
     expect(runs[0].status).toBe("SUSPENDED_BY_OPERATOR");
     expect(runs[0].statusGroup).toBe("unknown");
@@ -61,11 +66,34 @@ describe("fetchRuns", () => {
   it("throws ApiError on HTTP failure (plain error shape)", async () => {
     const fetchImpl: typeof fetch = async () =>
       jsonResponse(401, { error: "unauthorized" });
-    const error: unknown = await fetchRuns(BASE, fetchImpl).catch((e: unknown) => e);
+    const error: unknown = await fetchRuns(BASE, { fetchImpl }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ApiError);
     if (error instanceof ApiError) {
       expect(error.status).toBe(401);
       expect(error.message).toBe("unauthorized");
+    }
+  });
+  it("sends the global search, filters, sort, page boundary and cancellation", async () => {
+    const controller = new AbortController();
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = new URL(String(input), "http://runtime");
+      expect(Object.fromEntries(url.searchParams)).toEqual({
+        limit: "25", cursor: "opaque+/=", search: "thread", status: "FAILED",
+        strategy: "multi_agent", sort: "duration",
+      });
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      return jsonResponse(200, { runs: [], next_cursor: null, has_more: false });
+    };
+    expect(await fetchRuns(BASE, {
+      limit: 25, cursor: "opaque+/=", search: " thread ", status: "FAILED",
+      strategy: "multi_agent", sort: "duration", signal: controller.signal, fetchImpl,
+    })).toEqual({ runs: [], nextCursor: null, hasMore: false });
+  });
+
+  it("rejects missing or inconsistent pagination instead of returning an empty success", async () => {
+    for (const body of [{ runs: [] }, { runs: [], next_cursor: "fake", has_more: true },
+      { runs: [], next_cursor: "fake", has_more: false }]) {
+      await expect(fetchRuns(BASE, { fetchImpl: async () => jsonResponse(200, body) })).rejects.toThrow();
     }
   });
 });

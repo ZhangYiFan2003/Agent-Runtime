@@ -1,21 +1,18 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ApiError } from "../api/client";
 import { createThread } from "../api/threads";
-import { getConnection } from "../lib/connection";
+import { getConnectionSnapshot, useConnection } from "../lib/connection";
 import {
-  composeWorkbenchItems,
+  composeDurableWorkbenchItems,
   composerState,
-  discoverActiveRunId,
-  latestRunId,
-  promptAcknowledged,
-  responseAcknowledged,
+  messageAcknowledged,
   type ComposerState,
   type WorkbenchItem,
 } from "../lib/workbench-projection";
 import {
   loadLastThreadId,
   saveLastThreadId,
-  threadRegistry,
+  getThreadRegistry,
   type ThreadRegistryEntry,
 } from "../lib/thread-registry";
 import type { RuntimeEvent } from "../api/adapters/event";
@@ -24,6 +21,8 @@ import { useHealth } from "./use-health";
 import { useRun } from "./use-run-detail";
 import { useRuntimeEvents, type RuntimeEventsState } from "./use-runtime-events";
 import { createWorkbenchSession, type SubmissionSnapshot } from "./workbench-session";
+import { useThreadMessages } from "./use-thread-messages";
+import { isTerminalRunStatus } from "../lib/run-detail-view";
 
 export type SendOutcome = "ok" | "failed" | "lost";
 
@@ -48,26 +47,40 @@ export interface Workbench {
   createAndSelectThread: () => Promise<void>;
   removeThread: (threadId: string) => void;
   dismissSubmissionNotice: () => void;
+  retrySubmission: () => Promise<void>;
+  abandonSubmission: () => void;
+  missingRunId: string | null;
+  retryRunLookup: () => void;
+  history: ReturnType<typeof useThreadMessages>;
 }
 
 /**
  * Workbench orchestration: selected thread (local registry + last-opened
- * persistence), thread-wide event replay, active-run discovery, and the
- * blocking-turn submission session. No runtime state is stored locally —
- * run data comes from `useRun`, conversation from the event replay.
+ * persistence), durable message pages, bounded debug replay, and the
+ * blocking-turn submission session. Only unconfirmed submission identities
+ * are session-persisted; Run data and conversation come from the Runtime.
  */
 export function useWorkbench(): Workbench {
-  const [threads, setThreads] = useState<ThreadRegistryEntry[]>(() => threadRegistry.list());
-  const [threadId, setThreadIdState] = useState<string | null>(() => loadLastThreadId());
-  const [promptBoundary, setPromptBoundary] = useState<number | null>(null);
+  const connection = useConnection();
+  const registry = useMemo(() => getThreadRegistry(connection.scope), [connection.scope]);
+  const identity = `${connection.scope}:${connection.generation}`;
+  const [selection, setSelection] = useState(() => ({ identity, threads: registry.list(), threadId: loadLastThreadId(connection.scope) }));
+  const { threads, threadId } = selection.identity === identity ? selection :
+    { threads: registry.list(), threadId: loadLastThreadId(connection.scope) };
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const createController = useRef<AbortController | null>(null);
+  useEffect(() => () => createController.current?.abort(), [identity]);
 
-  const session = useMemo(() => createWorkbenchSession({ getConfig: getConnection }), []);
+  const session = useMemo(() => createWorkbenchSession({ getConfig: () => connection.config }), [connection.scope, connection.generation]);
   const submission = useSyncExternalStore(
     useCallback((listener) => session.subscribe(listener), [session]),
     () => session.snapshot(),
   );
+  useEffect(() => {
+    session.restore(loadLastThreadId(connection.scope));
+    return () => session.abortAndReset();
+  }, [session]);
 
   const health = useHealth();
   const connected = !health.isError;
@@ -76,82 +89,92 @@ export function useWorkbench(): Workbench {
   // running at the default cadence across the thread's whole lifetime — a
   // workbench thread outlives any single run, so the terminal drain used by
   // Run Detail must not stop it.
-  const eventsState = useRuntimeEvents({ threadId, runId: "", runStatus: "" });
+  const history = useThreadMessages(threadId);
+  const eventsState = useRuntimeEvents({ threadId, runId: "", runStatus: "", latest: true });
   const events = eventsState.events;
 
-  // Active run discovery: turn.started / user.message events carry run_id as
-  // soon as a turn starts; a 202 POST response may confirm it before events
-  // arrive (e.g. distributed queued mode). Without an active run the context
-  // panel falls back to the most recent run seen in the thread.
-  const discoveredActiveId = discoverActiveRunId(events);
-  const activeRunId = discoveredActiveId ?? submission.confirmedRunId ?? latestRunId(events);
+  // The message endpoint returns the current root Run independently of debug
+  // retention. A confirmed POST can bridge the next message poll's latency.
+  const confirmedInHistory = submission.confirmedRunId !== null && history.messages.some((message) => message.run_id === submission.confirmedRunId);
+  const activeRunId = history.currentRun !== null && (!isTerminalRunStatus(history.currentRun.status) || confirmedInHistory)
+    ? history.currentRun.run_id : submission.confirmedRunId ?? history.currentRun?.run_id ?? null;
 
   const runQuery = useRun(activeRunId ?? "");
   const run = runQuery.data ?? null;
+  // The existing query retries once. Two missing responses establish a
+  // diagnosable inconsistency; they do not establish a completed Run.
+  const missingRunId = runQuery.isError && runQuery.error instanceof ApiError &&
+    runQuery.error.status === 404 && runQuery.failureCount >= 2 ? activeRunId : null;
 
   // The run query lags behind a newly discovered id; while a discovered
   // active run's view has not loaded, conservatively treat it as busy
   // (the runtime rejects concurrent turns with 409 anyway).
   const runForActive = run !== null && run.runId === activeRunId ? run : null;
-  const activeStatus =
-    runForActive !== null ? runForActive.status : discoveredActiveId !== null ? "RUNNING" : null;
+  const activeStatus = runForActive !== null ? runForActive.status :
+    submission.confirmedRunId === activeRunId && submission.confirmedStatus !== null
+      ? submission.confirmedStatus : history.currentRun?.run_id === activeRunId
+        ? history.currentRun.status : activeRunId !== null ? "RUNNING" : null;
 
   const composer = composerState({
     connected,
     submitting: submission.phase === "submitting",
     activeRunStatus: activeStatus,
+    unconfirmed: submission.phase === "lost",
+    runLookupMissing: missingRunId !== null,
   });
 
-  // POST/event reconciliation: once the real events render the local echoes,
+  // Once durable messages cover the local echoes,
   // drop them from the session so they cannot linger.
   useEffect(() => {
     if (
       submission.prompt !== null &&
       submission.threadId === threadId &&
-      promptAcknowledged(events, submission.prompt, promptBoundary)
+      messageAcknowledged(history.messages, "user", { threadId, runId: submission.confirmedRunId, turnId: submission.confirmedTurnId, prompt: null, responseText: null })
     ) {
       session.acknowledgePrompt();
     }
-  }, [events, submission.prompt, submission.threadId, threadId, promptBoundary, session]);
+  }, [history.messages, submission.prompt, submission.threadId, submission.confirmedRunId, submission.confirmedTurnId, threadId, session]);
 
   useEffect(() => {
     if (
       submission.responseText !== null &&
-      responseAcknowledged(events, submission.responseText, promptBoundary)
+      messageAcknowledged(history.messages, "assistant", { threadId, runId: submission.confirmedRunId, turnId: submission.confirmedTurnId, prompt: null, responseText: null })
     ) {
       session.acknowledgeResponse();
     }
-  }, [events, submission.responseText, promptBoundary, session]);
+  }, [history.messages, submission.responseText, submission.confirmedRunId, submission.confirmedTurnId, threadId, session]);
 
   const selectThread = useCallback(
     (next: string | null) => {
-      session.abortAndReset();
-      setPromptBoundary(null);
-      setThreadIdState(next);
-      saveLastThreadId(next);
-      if (next !== null) setThreads(threadRegistry.add(next));
+      createController.current?.abort();
+      session.restore(next);
+      saveLastThreadId(connection.scope, next);
+      setSelection({ identity, threadId: next, threads: next !== null ? registry.add(next) : registry.list() });
     },
-    [session],
+    [session, connection.scope, identity, registry],
   );
 
   const createAndSelectThread = useCallback(async () => {
     if (creating) return;
     setCreating(true);
     setCreateError(null);
+    const controller = new AbortController();
+    createController.current = controller;
     try {
-      const ref = await createThread(getConnection());
-      setThreads(threadRegistry.add(ref.threadId));
+      const ref = await createThread(connection.config, { signal: controller.signal });
+      if (controller.signal.aborted) return;
+      if (getConnectionSnapshot() !== connection) return;
       selectThread(ref.threadId);
     } catch (error) {
-      setCreateError(error instanceof ApiError ? error.message : "Failed to create thread");
+      if (!controller.signal.aborted && getConnectionSnapshot() === connection) setCreateError(error instanceof ApiError ? error.message : "Failed to create thread");
     } finally {
-      setCreating(false);
+      if (getConnectionSnapshot() === connection) setCreating(false);
     }
-  }, [creating, selectThread]);
+  }, [creating, selectThread, connection]);
 
   const removeThread = useCallback((id: string) => {
-    setThreads(threadRegistry.remove(id));
-  }, []);
+    setSelection({ identity, threadId, threads: registry.remove(id) });
+  }, [registry, identity, threadId]);
 
   const send = useCallback(
     async (text: string): Promise<SendOutcome> => {
@@ -160,38 +183,40 @@ export function useWorkbench(): Workbench {
         // Auto-create a thread for the first message from the empty state.
         setCreating(true);
         setCreateError(null);
+        const controller = new AbortController();
+        createController.current = controller;
         try {
-          const ref = await createThread(getConnection());
+          const ref = await createThread(connection.config, { signal: controller.signal });
+          if (controller.signal.aborted) return "failed";
+          if (getConnectionSnapshot() !== connection) return "failed";
           id = ref.threadId;
-          setThreads(threadRegistry.add(ref.threadId));
           selectThread(ref.threadId);
         } catch (error) {
-          setCreateError(error instanceof ApiError ? error.message : "Failed to create thread");
+          if (!controller.signal.aborted && getConnectionSnapshot() === connection) setCreateError(error instanceof ApiError ? error.message : "Failed to create thread");
           return "failed";
         } finally {
-          setCreating(false);
+          if (getConnectionSnapshot() === connection) setCreating(false);
         }
       }
-      const lastEvent = events.length > 0 ? events[events.length - 1] : null;
-      setPromptBoundary(lastEvent !== null ? lastEvent.eventId : null);
       await session.submit(id, text);
       const phase = session.snapshot().phase;
       if (phase === "failed") return "failed";
       if (phase === "lost") return "lost";
       return "ok";
     },
-    [threadId, events, session, selectThread],
+    [threadId, session, selectThread, connection],
   );
 
   const items = useMemo(
     () =>
-      composeWorkbenchItems(events, {
+      composeDurableWorkbenchItems(history.messages, events, {
+        threadId,
         prompt: submission.threadId === threadId ? submission.prompt : null,
-        boundaryEventId: promptBoundary,
-        responseText: submission.responseText,
-        responseRunId: submission.confirmedRunId,
-      }),
-    [events, submission.prompt, submission.threadId, submission.responseText, submission.confirmedRunId, threadId, promptBoundary],
+        responseText: submission.threadId === threadId ? submission.responseText : null,
+        runId: submission.confirmedRunId,
+        turnId: submission.confirmedTurnId,
+      }, eventsState.preview),
+    [history.messages, events, eventsState.preview, submission.prompt, submission.threadId, submission.responseText, submission.confirmedRunId, submission.confirmedTurnId, threadId],
   );
 
   return {
@@ -214,5 +239,10 @@ export function useWorkbench(): Workbench {
     createAndSelectThread,
     removeThread,
     dismissSubmissionNotice: session.dismissNotice,
+    retrySubmission: session.retryUnconfirmed,
+    abandonSubmission: session.abandonUnconfirmed,
+    missingRunId,
+    retryRunLookup: () => void runQuery.refetch(),
+    history,
   };
 }

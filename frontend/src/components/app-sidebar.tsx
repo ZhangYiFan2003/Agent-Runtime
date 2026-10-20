@@ -17,7 +17,7 @@ function ConnectionStatus() {
     return (
       <div className="flex items-center gap-2 px-3 py-2 text-xs text-fg-2">
         <StatusDot tone="muted" />
-        <span className="truncate">Runtime · connecting…</span>
+        <span className="truncate">Runtime · checking reachability…</span>
       </div>
     );
   }
@@ -25,7 +25,7 @@ function ConnectionStatus() {
     return (
       <div className="flex items-center gap-2 px-3 py-2 text-xs text-fg-2">
         <StatusDot tone="danger" />
-        <span className="truncate">Runtime · disconnected</span>
+        <span className="truncate">Runtime · unreachable</span>
       </div>
     );
   }
@@ -33,14 +33,14 @@ function ConnectionStatus() {
     <Tooltip>
       <TooltipTrigger asChild>
         <div className="flex items-center gap-2 px-3 py-2 text-xs text-fg-2">
-          <StatusDot tone="accent" />
+          <StatusDot tone={health.data.database === "error" ? "warn" : "accent"} />
           <span className="truncate">
-            Runtime · {health.data.storageBackend}
+            Runtime · service reachable
           </span>
         </div>
       </TooltipTrigger>
       <TooltipContent side="right">
-        {health.data.storageBackend} · {health.data.workers} workers
+        {health.data.storageBackend} · {health.data.workers} API-local task threads · database {health.data.database}
       </TooltipContent>
     </Tooltip>
   );

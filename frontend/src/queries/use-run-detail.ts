@@ -8,7 +8,7 @@ import {
   fetchRunMetrics,
   fetchRunTrace,
 } from "../api/run";
-import { getConnection } from "../lib/connection";
+import { useConnection } from "../lib/connection";
 import {
   DETAIL_REFETCH_INTERVAL_MS,
   RUN_REFETCH_INTERVAL_MS,
@@ -23,9 +23,10 @@ import { queryKeys } from "./keys";
  * render a neutral "not available yet" state instead of an error.
  */
 export function useRun(runId: string) {
+  const connection = useConnection();
   return useQuery({
-    queryKey: queryKeys.run(runId),
-    queryFn: () => fetchRun(getConnection(), runId),
+    queryKey: queryKeys.forConnection(connection).run(runId),
+    queryFn: ({ signal }) => fetchRun(connection.config, runId, undefined, signal),
     enabled: runId !== "",
     retry: 1,
     refetchInterval: (query) =>
@@ -34,9 +35,10 @@ export function useRun(runId: string) {
 }
 
 export function useRunChildren(runId: string, runStatus: string | undefined) {
+  const connection = useConnection();
   return useQuery({
-    queryKey: queryKeys.children(runId),
-    queryFn: () => fetchRunChildren(getConnection(), runId),
+    queryKey: queryKeys.forConnection(connection).children(runId),
+    queryFn: ({ signal }) => fetchRunChildren(connection.config, runId, undefined, signal),
     enabled: runId !== "" && runStatus !== undefined,
     retry: 1,
     refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),
@@ -44,9 +46,10 @@ export function useRunChildren(runId: string, runStatus: string | undefined) {
 }
 
 export function useRunArtifacts(runId: string, runStatus: string | undefined) {
+  const connection = useConnection();
   return useQuery({
-    queryKey: queryKeys.artifacts(runId),
-    queryFn: () => fetchRunArtifacts(getConnection(), runId),
+    queryKey: queryKeys.forConnection(connection).artifacts(runId),
+    queryFn: ({ signal }) => fetchRunArtifacts(connection.config, runId, undefined, signal),
     enabled: runId !== "" && runStatus !== undefined,
     retry: 1,
     refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),
@@ -54,9 +57,10 @@ export function useRunArtifacts(runId: string, runStatus: string | undefined) {
 }
 
 export function useRunClaims(runId: string, runStatus: string | undefined) {
+  const connection = useConnection();
   return useQuery({
-    queryKey: queryKeys.claims(runId),
-    queryFn: () => fetchRunClaims(getConnection(), runId),
+    queryKey: queryKeys.forConnection(connection).claims(runId),
+    queryFn: ({ signal }) => fetchRunClaims(connection.config, runId, undefined, signal),
     enabled: runId !== "" && runStatus !== undefined,
     retry: 1,
     refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),
@@ -64,18 +68,20 @@ export function useRunClaims(runId: string, runStatus: string | undefined) {
 }
 
 export function useClaimProvenance(claimId: string | null) {
+  const connection = useConnection();
   return useQuery({
-    queryKey: queryKeys.claimProvenance(claimId ?? ""),
-    queryFn: () => fetchClaimProvenance(getConnection(), claimId as string),
+    queryKey: queryKeys.forConnection(connection).claimProvenance(claimId ?? ""),
+    queryFn: ({ signal }) => fetchClaimProvenance(connection.config, claimId as string, undefined, signal),
     enabled: claimId !== null && claimId !== "",
     retry: 1,
   });
 }
 
 export function useRunTrace(runId: string, runStatus: string | undefined) {
+  const connection = useConnection();
   return useQuery({
-    queryKey: queryKeys.trace(runId),
-    queryFn: () => fetchRunTrace(getConnection(), runId),
+    queryKey: queryKeys.forConnection(connection).trace(runId),
+    queryFn: ({ signal }) => fetchRunTrace(connection.config, runId, undefined, signal),
     enabled: runId !== "" && runStatus !== undefined,
     retry: 1,
     refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),
@@ -83,9 +89,10 @@ export function useRunTrace(runId: string, runStatus: string | undefined) {
 }
 
 export function useRunMetrics(runId: string, runStatus: string | undefined) {
+  const connection = useConnection();
   return useQuery({
-    queryKey: queryKeys.metrics(runId),
-    queryFn: () => fetchRunMetrics(getConnection(), runId),
+    queryKey: queryKeys.forConnection(connection).metrics(runId),
+    queryFn: ({ signal }) => fetchRunMetrics(connection.config, runId, undefined, signal),
     enabled: runId !== "" && runStatus !== undefined,
     retry: 1,
     refetchInterval: () => runDetailRefetchInterval(runStatus, DETAIL_REFETCH_INTERVAL_MS),

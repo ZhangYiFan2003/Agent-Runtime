@@ -1,4 +1,6 @@
 import type { RuntimeEvent } from "../api/adapters/event";
+import type { ThreadMessage } from "../api/messages";
+import type { StreamPreview } from "../queries/use-runtime-events";
 import { isTerminalRunStatus } from "./run-detail-view";
 import { summarizeEvent } from "./events-view";
 import { truncateId } from "./format";
@@ -24,6 +26,8 @@ export type WorkbenchItem =
       eventId: number | null;
       timestamp: string | null;
       text: string;
+      runId: string | null;
+      turnId: string | null;
       /** Local pending echo — replaced by the real user.message event. */
       pending: boolean;
     }
@@ -34,8 +38,10 @@ export type WorkbenchItem =
       timestamp: string | null;
       text: string;
       runId: string | null;
+      turnId: string | null;
       /** True when the text came from the turn-POST response, not an event. */
       fromResponse: boolean;
+      preview?: boolean;
     }
   | {
       kind: "tool";
@@ -134,7 +140,8 @@ function payloadStr(event: RuntimeEvent, key: string): string | null {
 }
 
 function toolKey(event: RuntimeEvent): string | null {
-  return payloadStr(event, "tool_call_id") ?? payloadStr(event, "invocation_id");
+  const key = payloadStr(event, "tool_call_id") ?? payloadStr(event, "invocation_id");
+  return key === null ? null : JSON.stringify([event.threadId, event.runId, event.turnId, key]);
 }
 
 function durationBetween(a: RuntimeEvent, b: RuntimeEvent): number | null {
@@ -195,9 +202,27 @@ export function projectWorkbenchEvents(events: RuntimeEvent[]): WorkbenchItem[] 
   const items: WorkbenchItem[] = [];
   /** tool pairing: key → index into items (the tool row to update). */
   const openTools = new Map<string, number>();
+  const seenMessages = new Set<string>();
 
   for (const event of events) {
     const type = event.eventType;
+
+    if (type === "user.message" || type === "assistant.message") {
+      if (payloadStr(event, "text") === null) continue;
+      if (event.parentRunId !== null) {
+        items.push({
+          kind: "other", id: `e${event.eventId}`, eventId: event.eventId,
+          timestamp: event.timestamp, eventType: `child.${type}`,
+          summary: payloadStr(event, "text") ?? "",
+        });
+        continue;
+      }
+      if (event.runId !== null && event.turnId !== null) {
+        const key = JSON.stringify([type, event.threadId, event.runId, event.turnId]);
+        if (seenMessages.has(key)) continue;
+        seenMessages.add(key);
+      }
+    }
 
     if (type === "user.message") {
       const text = payloadStr(event, "text");
@@ -208,6 +233,8 @@ export function projectWorkbenchEvents(events: RuntimeEvent[]): WorkbenchItem[] 
         eventId: event.eventId,
         timestamp: event.timestamp,
         text,
+        runId: event.runId,
+        turnId: event.turnId,
         pending: false,
       });
       continue;
@@ -223,6 +250,7 @@ export function projectWorkbenchEvents(events: RuntimeEvent[]): WorkbenchItem[] 
         timestamp: event.timestamp,
         text,
         runId: event.runId,
+        turnId: event.turnId,
         fromResponse: false,
       });
       continue;
@@ -347,44 +375,46 @@ export function projectWorkbenchEvents(events: RuntimeEvent[]): WorkbenchItem[] 
 /* ------------------------------------------------------------------ */
 
 export interface PendingSubmissionView {
+  threadId: string | null;
   /** Local echo of the in-flight user message (null when acknowledged). */
   prompt: string | null;
-  /** Events at or below this id predate the submission. */
-  boundaryEventId: number | null;
   /** Assistant text from a completed turn-POST 200 (fallback when the
    *  assistant.message event has not arrived). */
   responseText: string | null;
   /** Run confirmed by the turn response, used to link fallback citations. */
-  responseRunId?: string | null;
+  runId: string | null;
+  turnId: string | null;
 }
 
 /** True when a real user.message event covers the pending local echo. */
 export function promptAcknowledged(
   events: RuntimeEvent[],
-  prompt: string,
-  boundaryEventId: number | null,
+  threadId: string | null,
+  runId: string | null,
+  turnId: string | null,
 ): boolean {
-  const boundary = boundaryEventId ?? -1;
+  if (threadId === null || runId === null || turnId === null) return false;
   return events.some(
     (event) =>
-      event.eventId > boundary &&
+      event.threadId === threadId && event.runId === runId && event.turnId === turnId && event.parentRunId === null &&
       event.eventType === "user.message" &&
-      payloadStr(event, "text") === prompt,
+      payloadStr(event, "text") !== null,
   );
 }
 
 /** True when an assistant.message event already rendered the POST text. */
 export function responseAcknowledged(
   events: RuntimeEvent[],
-  responseText: string,
-  boundaryEventId: number | null,
+  threadId: string | null,
+  runId: string | null,
+  turnId: string | null,
 ): boolean {
-  const boundary = boundaryEventId ?? -1;
+  if (threadId === null || runId === null || turnId === null) return false;
   return events.some(
     (event) =>
-      event.eventId > boundary &&
+      event.threadId === threadId && event.runId === runId && event.turnId === turnId && event.parentRunId === null &&
       event.eventType === "assistant.message" &&
-      payloadStr(event, "text") === responseText,
+      payloadStr(event, "text") !== null,
   );
 }
 
@@ -399,20 +429,22 @@ export function composeWorkbenchItems(
 ): WorkbenchItem[] {
   const items = projectWorkbenchEvents(events);
 
-  if (pending.prompt !== null && !promptAcknowledged(events, pending.prompt, pending.boundaryEventId)) {
+  if (pending.prompt !== null && !promptAcknowledged(events, pending.threadId, pending.runId, pending.turnId)) {
     items.push({
       kind: "user",
       id: "pending-prompt",
       eventId: null,
       timestamp: null,
       text: pending.prompt,
+      runId: pending.runId,
+      turnId: pending.turnId,
       pending: true,
     });
   }
 
   if (
     pending.responseText !== null &&
-    !responseAcknowledged(events, pending.responseText, pending.boundaryEventId)
+    !responseAcknowledged(events, pending.threadId, pending.runId, pending.turnId)
   ) {
     items.push({
       kind: "assistant",
@@ -420,11 +452,50 @@ export function composeWorkbenchItems(
       eventId: null,
       timestamp: null,
       text: pending.responseText,
-      runId: pending.responseRunId ?? null,
+      runId: pending.runId,
+      turnId: pending.turnId,
       fromResponse: true,
     });
   }
 
+  return items;
+}
+
+export function messageAcknowledged(messages: ThreadMessage[], role: ThreadMessage["role"], pending: PendingSubmissionView): boolean {
+  return messages.some((message) => message.role === role && message.thread_id === pending.threadId &&
+    message.run_id === pending.runId && message.turn_id === pending.turnId);
+}
+
+/** Only durable message pages establish conversation history; debug rows stay bounded. */
+export function composeDurableWorkbenchItems(
+  messages: ThreadMessage[],
+  events: RuntimeEvent[],
+  pending: PendingSubmissionView,
+  preview: StreamPreview | null,
+): WorkbenchItem[] {
+  const items = projectWorkbenchEvents(events.filter((event) =>
+    event.eventType !== "user.message" && event.eventType !== "assistant.message" &&
+    event.eventType !== "text_delta" && event.eventType !== "assistant.delta"));
+  for (const message of messages) {
+    const base = { id: `m${message.id}`, eventId: message.id, timestamp: message.created_at,
+      text: message.text, runId: message.run_id, turnId: message.turn_id };
+    items.push(message.role === "user" ? { kind: "user", ...base, pending: false } : { kind: "assistant", ...base, fromResponse: false });
+  }
+  if (preview !== null && !messages.some((message) => message.role === "assistant" && message.run_id === preview.runId && message.turn_id === preview.turnId) &&
+    !(pending.responseText !== null && pending.runId === preview.runId && pending.turnId === preview.turnId)) {
+    items.push({ kind: "assistant", id: `preview-${preview.runId}-${preview.turnId}`, eventId: preview.eventId,
+      timestamp: preview.timestamp, text: preview.incomplete ? "Live preview unavailable. Waiting for the saved result…" : preview.text,
+      runId: preview.runId, turnId: preview.turnId, fromResponse: false, preview: true });
+  }
+  items.sort((a, b) => (a.eventId ?? Number.MAX_SAFE_INTEGER) - (b.eventId ?? Number.MAX_SAFE_INTEGER));
+  if (pending.prompt !== null && !messageAcknowledged(messages, "user", pending)) {
+    items.push({ kind: "user", id: "pending-prompt", eventId: null, timestamp: null, text: pending.prompt,
+      runId: pending.runId, turnId: pending.turnId, pending: true });
+  }
+  if (pending.responseText !== null && !messageAcknowledged(messages, "assistant", pending)) {
+    items.push({ kind: "assistant", id: "response-text", eventId: null, timestamp: null, text: pending.responseText,
+      runId: pending.runId, turnId: pending.turnId, fromResponse: true });
+  }
   return items;
 }
 
@@ -479,15 +550,12 @@ export function discoverActiveRunId(events: RuntimeEvent[]): string | null {
     const marker = markers[i];
     if (!marker.terminal && marker.parentRunId === null) return marker.runId;
   }
-  for (let i = markers.length - 1; i >= 0; i -= 1) {
-    if (!markers[i].terminal) return markers[i].runId;
-  }
   return null;
 }
 
 /** Most recently observed run, terminal or not (context-panel fallback). */
 export function latestRunId(events: RuntimeEvent[]): string | null {
-  const markers = deriveThreadRuns(events);
+  const markers = deriveThreadRuns(events).filter((marker) => marker.parentRunId === null);
   return markers.length > 0 ? markers[markers.length - 1].runId : null;
 }
 
@@ -510,12 +578,20 @@ export function composerState(options: {
   connected: boolean;
   submitting: boolean;
   activeRunStatus: string | null;
+  unconfirmed?: boolean;
+  runLookupMissing?: boolean;
 }): ComposerState {
   if (!options.connected) {
-    return { disabled: true, reason: "Runtime is disconnected." };
+    return { disabled: true, reason: "Runtime service is unreachable." };
   }
   if (options.submitting) {
     return { disabled: true, reason: null };
+  }
+  if (options.unconfirmed) {
+    return { disabled: true, reason: "Confirm or forget the unconfirmed submission before sending another message." };
+  }
+  if (options.runLookupMissing) {
+    return { disabled: false, reason: "Run lookup repeatedly returned 404. Retry lookup or submit to check the Thread's real availability." };
   }
   if (options.activeRunStatus !== null && !isTerminalRunStatus(options.activeRunStatus)) {
     return { disabled: true, reason: "A turn is already running in this thread." };

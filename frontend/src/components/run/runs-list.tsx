@@ -1,12 +1,12 @@
 import { useMemo } from "react";
-import type { RunView } from "../../api/adapters/run";
+import type { RunSummary } from "../../api/adapters/run-summary";
 import { formatDurationMs, formatFullTime, formatRelativeTime, truncateId } from "../../lib/format";
 import { childrenLabel, isChildRun, runDurationMs } from "../../lib/runs-view";
 import { CopyId } from "./copy-id";
 import { StatusPill } from "./status-pill";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 
-function LineageCell({ run }: { run: RunView }) {
+function LineageCell({ run }: { run: RunSummary }) {
   if (isChildRun(run)) {
     return (
       <span className="font-mono text-xs whitespace-nowrap text-info">
@@ -24,16 +24,14 @@ function LineageCell({ run }: { run: RunView }) {
         </span>
       </TooltipTrigger>
       <TooltipContent side="top" className="font-mono text-[11px]">
-        {run.activeChildRunIds.length > 0
-          ? `active: ${run.activeChildRunIds.join(", ")}`
-          : `${run.childrenCount} direct children`}
+        {`${run.childrenCount} direct children · ${run.activeChildrenCount} active`}
       </TooltipContent>
     </Tooltip>
   );
 }
 
 interface RunsTableProps {
-  runs: RunView[];
+  runs: RunSummary[];
   onOpenRun: (runId: string) => void;
 }
 

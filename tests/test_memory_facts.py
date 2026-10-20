@@ -16,14 +16,31 @@ from axiom.memory import (
     MemoryService,
 )
 from axiom.runtime.api import RuntimeApiServer, RuntimeTurnContext
+from axiom.runtime.events import RuntimeEvent
 from axiom.types import Message
 
 
-class Event:
-    def __init__(self, event_id: int, event_type: str, payload: dict[str, object]):
-        self.id = event_id
-        self.type = event_type
-        self.payload = payload
+class Event(RuntimeEvent):
+    def __init__(
+        self,
+        event_id: int,
+        event_type: str,
+        payload: dict[str, object],
+        *,
+        run_id: str | None = "run-a",
+        turn_id: str | None = "turn-a",
+        parent_run_id: str | None = None,
+    ):
+        super().__init__(
+            id=event_id,
+            thread_id="thread-a",
+            type=event_type,
+            payload=payload,
+            created_at="",
+            run_id=run_id,
+            turn_id=turn_id,
+            parent_run_id=parent_run_id,
+        )
 
 
 class BrokenExtractor:
@@ -55,7 +72,10 @@ def test_fact_extraction_scope_policy_and_cross_thread_reuse(tmp_path):
         ),
         Event(2, "assistant.message", {"text": "remember user preference:theme=dark"}),
         Event(3, "tool_result", {"content": "remember user preference:shell=bash"}),
-        Event(4, "user.message", {"text": "maybe use Java someday"}),
+        Event(
+            4, "user.message", {"text": "maybe use Java someday"}, run_id="run-b", turn_id="turn-b"
+        ),
+        Event(5, "turn.completed", {}),
     ]
 
     result = asyncio.run(service.extract_facts_from_thread("thread-a", events))
@@ -106,7 +126,9 @@ def test_duplicate_merge_and_conflict_supersession_keep_one_active_value(tmp_pat
     assert [record.content for record in active] == ["squash merge"]
     assert len([record for record in history if record.metadata.get("active", True)]) == 1
     assert any(record.metadata.get("superseded_by") == new.id for record in history)
-    assert history[-1].metadata["observation_count"] == 2
+    assert (
+        next(record for record in history if record.id == old.id).metadata["observation_count"] == 2
+    )
 
 
 def test_same_scope_normalized_key_has_one_active_value_across_categories(tmp_path):
@@ -138,9 +160,7 @@ def test_database_rejects_two_active_values_for_same_scoped_key(tmp_path):
         category="workflow",
     )
 
-    with sqlite3.connect(tmp_path / "memory.db") as conn, pytest.raises(
-        sqlite3.IntegrityError
-    ):
+    with sqlite3.connect(tmp_path / "memory.db") as conn, pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             """
             insert into memory_records(
@@ -250,7 +270,17 @@ def test_sensitive_candidates_are_rejected_and_checkpointed(tmp_path):
     label = "api" + "_key"
     events = [
         Event(1, "user.message", {"text": f"remember project workflow:secret={label}=abc"}),
-        Event(2, "user.message", {"text": "remember project workflow:merge_strategy=squash"}),
+        Event(2, "assistant.message", {"text": "ok"}),
+        Event(3, "turn.completed", {}),
+        Event(
+            4,
+            "user.message",
+            {"text": "remember project workflow:merge_strategy=squash"},
+            run_id="run-b",
+            turn_id="turn-b",
+        ),
+        Event(5, "assistant.message", {"text": "ok"}, run_id="run-b", turn_id="turn-b"),
+        Event(6, "turn.completed", {}, run_id="run-b", turn_id="turn-b"),
     ]
 
     first = asyncio.run(service.extract_facts_from_thread("thread-a", events))
@@ -294,6 +324,8 @@ def test_extractor_failure_does_not_advance_incremental_checkpoint(tmp_path):
     )
     events = [
         Event(1, "user.message", {"text": "remember project workflow:merge_strategy=squash"}),
+        Event(2, "assistant.message", {"text": "ok"}),
+        Event(3, "turn.completed", {}),
     ]
 
     failed = asyncio.run(broken.extract_facts_from_thread("thread-a", events))
@@ -303,6 +335,68 @@ def test_extractor_failure_does_not_advance_incremental_checkpoint(tmp_path):
     assert failed.error == "RuntimeError"
     assert retried.accepted_count == 1
     assert recovered.list_records(kind=MemoryKind.FACT, scope_id="project-a")[0].content == "squash"
+
+
+def test_fact_extraction_waits_for_identified_root_completion_and_deduplicates_callbacks(tmp_path):
+    service = MemoryService(tmp_path / "memory.db", project_scope="project-a")
+    events = [
+        Event(1, "user.message", {"text": "remember project workflow:pending=confirmed"}),
+        Event(
+            2,
+            "user.message",
+            {"text": "remember project workflow:ready=done"},
+            run_id="run-b",
+            turn_id="turn-b",
+        ),
+        Event(3, "assistant.message", {"text": "done"}, run_id="run-b", turn_id="turn-b"),
+        Event(4, "turn.completed", {}, run_id="run-b", turn_id="turn-b"),
+    ]
+
+    first = asyncio.run(service.extract_facts_from_thread("thread-a", events))
+    assert first.accepted_count == 1
+    assert first.processed_event_end_id == 4
+
+    events.extend(
+        [
+            Event(5, "assistant.message", {"text": "confirmed"}),
+            Event(6, "turn.completed", {}),
+            Event(7, "assistant.message", {"text": "confirmed"}),
+            Event(8, "turn.completed", {}),
+            Event(
+                9,
+                "user.message",
+                {"text": "remember project workflow:child=exclude"},
+                run_id="child",
+                parent_run_id="run-a",
+            ),
+            Event(
+                10,
+                "assistant.message",
+                {"text": "child output"},
+                run_id="child",
+                parent_run_id="run-a",
+            ),
+            Event(11, "turn.completed", {}, run_id="child", parent_run_id="run-a"),
+            Event(
+                12,
+                "user.message",
+                {"text": "remember project workflow:unknown=exclude"},
+                run_id=None,
+                turn_id=None,
+            ),
+            Event(13, "assistant.message", {"text": "unknown output"}, run_id=None, turn_id=None),
+            Event(14, "turn.completed", {}, run_id=None, turn_id=None),
+        ]
+    )
+    second = asyncio.run(service.extract_facts_from_thread("thread-a", events))
+    repeated = asyncio.run(service.extract_facts_from_thread("thread-a", events))
+
+    assert second.accepted_count == 1
+    assert second.processed_event_end_id == 6
+    assert repeated.candidate_count == 0
+    records = service.list_records(kind=MemoryKind.FACT, scope_id="project-a")
+    assert {record.metadata["key"] for record in records} == {"workflow:pending", "workflow:ready"}
+    assert {record.source_event_start_id for record in records} == {1, 2}
 
 
 def test_thread_fact_does_not_overwrite_project_fact(tmp_path):
@@ -366,6 +460,17 @@ def test_runtime_fact_extraction_failure_does_not_fail_completed_turn(tmp_path):
 
     response = asyncio.run(server._run_turn(thread_id, "remember project workflow:x=y"))
 
-    assert response == {"thread_id": thread_id, "text": "ok"}
+    assert response["thread_id"] == thread_id
+    assert response["text"] == "ok"
+    assert response["run_id"]
+    assert response["turn_id"]
+    assert response["status"] == "COMPLETED"
     assert contexts
-    assert server.repository.list_events(thread_id)[-1].type == "turn.completed"
+    completed = [
+        event
+        for event in server.repository.list_events(thread_id)
+        if event.type == "turn.completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0].run_id == response["run_id"]
+    assert completed[0].turn_id == response["turn_id"]

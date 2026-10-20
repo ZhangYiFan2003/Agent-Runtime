@@ -12,6 +12,7 @@ import { CopyId } from "../components/run/copy-id";
 import { StatusPill } from "../components/run/status-pill";
 import { Button } from "../components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "../components/ui/sheet";
+import { useConnection } from "../lib/connection";
 
 /**
  * Workbench — the thread + turn + live execution loop (Phase 6).
@@ -23,6 +24,11 @@ import { Sheet, SheetContent, SheetTitle } from "../components/ui/sheet";
  * panel reads the RunView queries, controls go through the Phase-5 engine.
  */
 export function WorkbenchPage() {
+  const connection = useConnection();
+  return <ConnectedWorkbench key={`${connection.scope}:${connection.generation}`} />;
+}
+
+function ConnectedWorkbench() {
   useDocumentTitle("Workbench · Axiom");
   const wb = useWorkbench();
   const isDesktop = useMediaQuery("(min-width: 768px)");
@@ -50,11 +56,13 @@ export function WorkbenchPage() {
 
   const composer = (
     <Composer
+      key={wb.threadId}
       disabled={wb.composer.disabled}
       disabledReason={wb.composer.reason}
       submitting={wb.submission.phase === "submitting"}
       autoFocus={isDesktop}
       onSend={wb.send}
+      restoredDraft={wb.submission.rejectedDraft}
     />
   );
 
@@ -65,15 +73,13 @@ export function WorkbenchPage() {
           role="status"
           className="flex items-center justify-between gap-2 border-t border-border bg-info/5 px-4 py-1.5 md:px-6"
         >
-          <span className="text-xs text-info">{SUBMISSION_LOST_MESSAGE}</span>
-          <button
-            type="button"
-            onClick={wb.dismissSubmissionNotice}
-            aria-label="Dismiss"
-            className="shrink-0 rounded p-0.5 text-fg-2 hover:bg-bg-2 hover:text-fg-0"
-          >
-            <X className="size-3" />
-          </button>
+          <div className="min-w-0 text-xs text-info">
+            <p>{SUBMISSION_LOST_MESSAGE}</p>
+            {wb.submission.errorMessage && <p className="mt-1">{wb.submission.errorMessage}</p>}
+            <p className="mt-1 text-fg-2">Forgetting does not cancel a Run already accepted by the Runtime.</p>
+          </div>
+          <Button size="sm" onClick={() => void wb.retrySubmission()}>Confirm submission</Button>
+          <Button size="sm" variant="ghost" onClick={wb.abandonSubmission}>Forget submission</Button>
         </div>
       )}
       {wb.submission.phase === "failed" && (
@@ -83,6 +89,9 @@ export function WorkbenchPage() {
         >
           <span className="text-xs text-danger">
             {wb.submission.errorMessage ?? "Turn submission failed"}
+            {wb.submission.confirmedRunId && (
+              <span className="ml-2"><CopyId id={wb.submission.confirmedRunId} /></span>
+            )}
             {wb.submission.errorStatus !== null && wb.submission.errorStatus > 0 && (
               <span className="ml-2 font-mono text-[10px] text-fg-2">
                 HTTP {wb.submission.errorStatus}
@@ -97,6 +106,12 @@ export function WorkbenchPage() {
           >
             <X className="size-3" />
           </button>
+        </div>
+      )}
+      {wb.missingRunId && (
+        <div role="alert" className="flex items-center justify-between gap-2 border-t border-border px-4 py-2 text-xs text-warn md:px-6">
+          <span>Run <CopyId id={wb.missingRunId} /> repeatedly returned 404. Its outcome is unknown; a new submission will check Thread availability.</span>
+          <Button size="sm" variant="ghost" onClick={wb.retryRunLookup}>Retry Run lookup</Button>
         </div>
       )}
     </>
@@ -158,12 +173,14 @@ export function WorkbenchPage() {
         </h1>
         <div className="mt-6">
           <Composer
+            key={wb.threadId}
             disabled={wb.composer.disabled}
             disabledReason={wb.composer.reason}
             submitting={wb.submission.phase === "submitting" || wb.creatingThread}
             autoFocus={isDesktop}
             hero
             onSend={wb.send}
+            restoredDraft={wb.submission.rejectedDraft}
           />
         </div>
         {notices}
@@ -178,7 +195,7 @@ export function WorkbenchPage() {
     <section className="flex min-w-0 flex-1 flex-col">
       {header}
       <div className="min-h-0 flex-1">
-        <WorkbenchFeed items={wb.items} status={wb.replayStatus} replayError={wb.replayError} />
+        <WorkbenchFeed key={wb.threadId} items={wb.items} status={wb.replayStatus} replayError={wb.replayError} history={wb.history} />
       </div>
       {notices}
       <div className="mb-[calc(52px+env(safe-area-inset-bottom))] shrink-0 border-t border-border px-4 py-3 md:mb-0 md:px-6">

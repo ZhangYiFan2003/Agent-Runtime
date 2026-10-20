@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import inspect
 import json
+import math
 import os
 import threading
 import time
@@ -46,7 +49,7 @@ from axiom.runtime.control_plane import (
     child_view,
     run_view,
 )
-from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy
+from axiom.runtime.durable import DurableAgentRuntime, RetryPolicy, submission_fingerprint
 from axiom.runtime.events import EventRepository, RuntimeEvent, ThreadEventRepository
 from axiom.runtime.models import Checkpoint, Interrupt, RunError, RunStatus
 from axiom.runtime.observability import SpanStatus, SpanType
@@ -216,8 +219,6 @@ class RuntimeApiServer:
         self._httpd: ThreadingHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
         self._worker_threads: list[threading.Thread] = []
-        self._thread_locks: dict[str, threading.Lock] = {}
-        self._thread_locks_guard = threading.Lock()
         self._run_locks: dict[str, threading.Lock] = {}
         self._run_locks_guard = threading.Lock()
         self._cancel_locks: dict[str, threading.Lock] = {}
@@ -428,7 +429,7 @@ class RuntimeApiServer:
         parsed = urlsplit(request.path)
         method = request.command
         path = parsed.path
-        query = parse_qs(parsed.query)
+        query = parse_qs(parsed.query, keep_blank_values=True)
         if method == "GET" and path == "/health":
             capacity = self._capacity_health()
             distributed = self._distributed_health()
@@ -454,6 +455,9 @@ class RuntimeApiServer:
         if not self._authorized(request):
             _send_json(request, 401, {"error": "unauthorized"})
             return
+        if method == "GET" and path == "/v1/auth/check":
+            _send_json(request, 200, {"authenticated": True})
+            return
         try:
             body = _read_json(request)
             if method == "POST" and path == "/v1/threads":
@@ -464,79 +468,51 @@ class RuntimeApiServer:
                 if not self.repository.thread_exists(thread_id):
                     _send_json(request, 404, {"error": "thread not found"})
                     return
-                message = str(body.get("message") or body.get("prompt") or "")
-                if not message:
+                message = body.get("message", body.get("prompt"))
+                if not isinstance(message, str) or not message.strip():
                     _send_json(request, 400, {"error": "message is required"})
                     return
-                principal_key = "default"
                 submission_key = _idempotency_key(request, body)
-                idempotent_submission = submission_key is not None
-                if idempotent_submission and not (
-                    self.storage_backend == "postgres" and self.config.worker.distributed_enabled
-                ):
-                    raise ApiError(
-                        "submission_idempotency_requires_postgres",
-                        "root submission idempotency requires distributed PostgreSQL mode",
-                        422,
-                    )
-                lock = None if idempotent_submission else self._thread_lock(thread_id)
-                if lock is not None and not lock.acquire(blocking=False):
-                    _send_json(request, 409, {"error": "thread turn already running"})
+                result = asyncio.run(
+                    self._run_turn(thread_id, message, idempotency_key=submission_key)
+                )
+                response_status = (
+                    202
+                    if result["status"] in {
+                        RunStatus.RUNNING.value,
+                        RunStatus.INTERRUPTED.value,
+                        RunStatus.WAITING_APPROVAL.value,
+                        RunStatus.WAITING_CHILD.value,
+                    }
+                    else 200
+                )
+                _send_json(request, response_status, result)
+            elif method == "GET" and path.startswith("/v1/threads/") and path.endswith("/messages"):
+                thread_id = path.split("/")[3]
+                if not self.repository.thread_exists(thread_id):
+                    _send_json(request, 404, {"error": "thread not found"})
                     return
-                try:
-                    if self.config.worker.distributed_enabled:
-                        limiter = getattr(self.checkpoint_store, "consume_submission_tokens", None)
-                        if limiter is not None:
-                            retry_after = asyncio.run(
-                                limiter(
-                                    principal_key,
-                                    global_rate=self.config.traffic.global_submission_rate,
-                                    global_burst=self.config.traffic.global_submission_burst,
-                                    principal_rate=self.config.traffic.principal_submission_rate,
-                                    principal_burst=self.config.traffic.principal_submission_burst,
-                                )
-                            )
-                            if retry_after is not None:
-                                raise ApiError(
-                                    "RATE_LIMITED",
-                                    "new Root Run submission rate limit exceeded",
-                                    429,
-                                    details={
-                                        "retry_after_seconds": max(1, int(retry_after + 0.999))
-                                    },
-                                )
-                    if submission_key is None:
-                        result = asyncio.run(self._run_turn(thread_id, message))
-                    else:
-                        result = asyncio.run(
-                            self._run_turn(
-                                thread_id,
-                                message,
-                                idempotency_key=submission_key,
-                            )
-                        )
-                    response_status = (
-                        202
-                        if result.get("queued")
-                        or result.get("status")
-                        in {
-                            RunStatus.INTERRUPTED.value,
-                            RunStatus.WAITING_APPROVAL.value,
-                            RunStatus.WAITING_CHILD.value,
-                        }
-                        else 200
-                    )
-                    _send_json(request, response_status, result)
-                finally:
-                    if lock is not None:
-                        lock.release()
+                _send_json(request, 200, self._message_page(thread_id, query))
             elif method == "GET" and path.startswith("/v1/threads/") and path.endswith("/events"):
                 thread_id = path.split("/")[3]
-                after_id = _first_int(query.get("after_id"))
-                if after_id is None:
-                    after_id = _header_int(request, "Last-Event-ID")
                 run_filter = _first_text(query.get("run_id"))
+                scope = [thread_id, run_filter or ""]
+                raw_cursor = _query_value(query, "cursor")
+                if raw_cursor is not None and "after_id" in query:
+                    raise ApiError("invalid_request", "use cursor or after_id, not both", 400)
+                after_id = (
+                    _sequence_cursor(raw_cursor, "events", scope)
+                    if raw_cursor is not None
+                    else _query_sequence(query, "after_id")
+                )
+                if after_id is None and request.headers.get("Last-Event-ID") is not None:
+                    after_id = _parse_sequence(request.headers["Last-Event-ID"])
                 follow = _first_bool(query.get("follow"))
+                latest = _first_bool(query.get("latest"))
+                if latest and after_id is not None:
+                    raise ApiError(
+                        "invalid_request", "latest cannot be combined with a cursor", 400
+                    )
                 if not self.repository.thread_exists(thread_id):
                     _send_json(request, 404, {"error": "thread not found"})
                     return
@@ -546,10 +522,11 @@ class RuntimeApiServer:
                     after_id=after_id,
                     run_id=run_filter,
                     follow=follow,
+                    latest=latest,
+                    limit=_page_limit(query, default=200, maximum=500),
                 )
             elif method == "GET" and path == "/v1/runs":
-                runs = asyncio.run(self._list_run_views())
-                _send_json(request, 200, {"runs": runs})
+                _send_json(request, 200, asyncio.run(self._run_summary_page(query)))
             elif method == "GET" and path == "/v1/runtime/active-runs":
                 _send_json(
                     request,
@@ -698,6 +675,13 @@ class RuntimeApiServer:
                 )
                 _send_json(request, 200, state.public_dict())
             elif method == "POST" and path == "/v1/tasks":
+                if self.workers == 0:
+                    raise ApiError(
+                        "TASK_WORKERS_DISABLED",
+                        "Legacy task consumers are disabled in this deployment; "
+                        "use the Thread/Run submission endpoints instead.",
+                        503,
+                    )
                 prompt = str(body.get("message") or body.get("prompt") or "")
                 if not prompt:
                     _send_json(request, 400, {"error": "message is required"})
@@ -833,132 +817,112 @@ class RuntimeApiServer:
         *,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        history_events = await self._list_events_async(thread_id)
-        principal_key = "default"
-        history = self.memory_service.history_from_runtime_events(history_events)
+        strategy = _execution_strategy_name(self.config.prompt.agent_mode)
+        fingerprint = submission_fingerprint(thread_id, message, strategy)
+        if idempotency_key is not None:
+            existing = await self.checkpoint_store.lookup_submission(
+                thread_id, idempotency_key, fingerprint
+            )
+            if existing is not None:
+                return await self._submission_result(existing)
         turn_id = f"turn_{uuid4().hex}"
         run_id = f"run_{uuid4().hex}"
         context = RuntimeRequestContext(
             thread_id=thread_id,
             message=message,
-            history=history,
+            history=[],
             cwd=self.cwd,
             config=self.config,
             turn_id=turn_id,
             run_id=run_id,
         )
-        if idempotency_key is None:
-            await self._record_user_turn(thread_id, turn_id, run_id, message)
-        engine = await self._engine(context)
-        run_lock = self._run_lock(run_id)
-        if not run_lock.acquire(blocking=False):
-            raise RuntimeError("new run unexpectedly already advancing")
         try:
-            if isinstance(engine, QueryEngine):
-                runtime = self._durable_runtime(
-                    engine,
-                    thread_id,
-                    execution_strategy=_execution_strategy_name(engine.config.prompt.agent_mode),
-                )
-                if self.config.worker.distributed_enabled:
-                    if idempotency_key is None:
-                        state = await runtime.submit(
-                            thread_id=thread_id,
-                            input=message,
-                            history=history,
-                            run_id=run_id,
-                            turn_id=turn_id,
-                            max_queued_runs=self.config.capacity.max_queued_runs,
-                            principal_key=principal_key,
-                            base_priority=1,
-                        )
-                    else:
-                        state, created = await runtime.submit_idempotent(
-                            thread_id=thread_id,
-                            input=message,
-                            history=history,
-                            run_id=run_id,
-                            turn_id=turn_id,
-                            idempotency_key=idempotency_key,
-                            max_queued_runs=self.config.capacity.max_queued_runs,
-                            principal_key=principal_key,
-                            base_priority=1,
-                        )
-                        if created:
-                            await self._record_user_turn(
-                                thread_id,
-                                state.turn_id,
-                                state.run_id,
-                                message,
-                            )
-                            await self._append_event_async(
-                                thread_id,
-                                "run.admitted",
-                                {
-                                    "run_id": state.run_id,
-                                    "turn_id": state.turn_id,
-                                    "status": state.status.value,
-                                },
-                            )
-                    return {
-                        "thread_id": state.thread_id,
-                        "run_id": state.run_id,
-                        "status": state.status.value,
-                        "queued": not state.finished,
-                    }
-                state = await runtime.start(
-                    thread_id=thread_id,
-                    input=message,
-                    history=history,
-                    run_id=run_id,
-                    turn_id=turn_id,
-                )
-                return await self._finish_durable_turn(state)
-
-            return await self._run_legacy_turn(
-                engine=engine,
-                context=context,
-                thread_id=thread_id,
-                message=message,
-                history=history,
+            if self.config.worker.distributed_enabled and self.storage_backend != "postgres":
+                raise ValueError("distributed execution requires PostgreSQL storage")
+            engine = await self._engine(context)
+            if self.config.worker.distributed_enabled and not isinstance(engine, QueryEngine):
+                raise ValueError("custom engine does not support distributed execution")
+            runtime = (
+                self._durable_runtime(engine, thread_id, execution_strategy=strategy)
+                if isinstance(engine, QueryEngine)
+                else None
             )
-        finally:
-            run_lock.release()
+        except Exception as exc:
+            raise ApiError(
+                "SUBMISSION_INITIALIZATION_FAILED",
+                "submission was not accepted because Runtime initialization failed",
+                503,
+            ) from exc
+        if runtime is not None:
+            state, created = await runtime.submit_idempotent(
+                thread_id=thread_id,
+                input=message,
+                run_id=run_id,
+                turn_id=turn_id,
+                idempotency_key=idempotency_key,
+                max_queued_runs=self.config.capacity.max_queued_runs,
+                runnable=self.config.worker.distributed_enabled,
+            )
+        else:
+            candidate = Checkpoint.create(
+                thread_id=thread_id,
+                input=message,
+                run_id=run_id,
+                turn_id=turn_id,
+                execution_strategy=strategy,
+            )
+            state, created = await self.checkpoint_store.admit_submission(
+                candidate,
+                idempotency_key=idempotency_key,
+                request_fingerprint=fingerprint,
+                max_queued_runs=self.config.capacity.max_queued_runs,
+                max_queued_runs_per_principal=self.config.capacity.max_queued_runs_per_principal,
+                traffic=self.config.traffic,
+                runnable=False,
+            )
+        if not created or self.config.worker.distributed_enabled:
+            return await self._submission_result(state)
+        context.history[:] = state.messages[:-1]
+        with self._run_lock(state.run_id):
+            try:
+                if runtime is not None:
+                    state = await runtime.execute_submitted(state)
+                    return await self._finish_durable_turn(state)
+                return await self._run_legacy_turn(engine=engine, state=state)
+            except (ApiError, CheckpointConflictError):
+                raise
+            except Exception as exc:
+                current = await self.checkpoint_store.load(state.run_id)
+                if current is None:
+                    raise
+                if not current.finished:
+                    current.status = RunStatus.FAILED
+                    current.error = RunError(
+                        type=type(exc).__name__, message=_safe_error(exc), step="execution"
+                    )
+                    await self.checkpoint_store.save(current)
+                return await self._finish_durable_turn(current)
 
-    async def _record_user_turn(
-        self, thread_id: str, turn_id: str, run_id: str, message: str
-    ) -> None:
-        await self._append_event_async(
-            thread_id,
-            "turn.started",
-            {"turn_id": turn_id, "run_id": run_id, "message_chars": len(message)},
-        )
-        user_event_id = await self._append_event_async(
-            thread_id, "user.message", {"text": message, "run_id": run_id, "turn_id": turn_id}
-        )
-        self._derive_conversation_memory(
-            thread_id,
-            role="user",
-            content=message,
-            event_id=user_event_id,
-        )
+    async def _submission_result(self, state: Checkpoint) -> dict[str, Any]:
+        if state.status == RunStatus.COMPLETED:
+            await self.checkpoint_store.project_completed_turn(state)
+        return {
+            "thread_id": state.thread_id,
+            "run_id": state.run_id,
+            "turn_id": state.turn_id,
+            "status": state.status.value,
+            "queued": self.config.worker.distributed_enabled and not state.finished,
+            "text": state.output_text,
+            "error": state.error.to_dict() if state.error else None,
+        }
 
     async def _run_legacy_turn(
         self,
         *,
         engine: Any,
-        context: RuntimeRequestContext,
-        thread_id: str,
-        message: str,
-        history: list[Message],
+        state: Checkpoint,
     ) -> dict[str, Any]:
-        state = Checkpoint.create(
-            thread_id=thread_id,
-            input=message,
-            history=history,
-            run_id=context.run_id,
-            turn_id=context.turn_id,
-        )
+        thread_id = state.thread_id
         tracer = RunTracer(self.observability_store)
         await tracer.start_run(state)
         engine_span = await tracer.start_span(
@@ -966,7 +930,6 @@ class RuntimeApiServer:
             "legacy.engine",
             attributes={"durable_internal_steps": False},
         )
-        await self.checkpoint_store.save(state)
         await self._append_event_async(
             thread_id,
             "run.started",
@@ -975,7 +938,7 @@ class RuntimeApiServer:
         text = ""
         done_payload: dict[str, Any] = {}
         try:
-            async for event in _ask_events(engine, message, history):
+            async for event in _ask_events(engine, state.input, state.messages[:-1]):
                 event_type = str(event.get("type"))
                 if event_type == "text_delta":
                     delta = str(event.get("text") or "")
@@ -1019,7 +982,7 @@ class RuntimeApiServer:
                 "run.failed",
                 {"run_id": state.run_id, "error": state.error.to_dict()},
             )
-            raise
+            return await self._finish_durable_turn(state)
         state.messages.append(Message(role="assistant", content=text))
         state.output_text = text
         state.status = RunStatus.COMPLETED
@@ -1033,25 +996,7 @@ class RuntimeApiServer:
             "run.completed",
             {"run_id": state.run_id, "legacy_engine": True},
         )
-        assistant_event_id = await self._append_event_async(
-            thread_id,
-            "assistant.message",
-            {"text": text},
-        )
-        self._derive_conversation_memory(
-            thread_id,
-            role="assistant",
-            content=text,
-            event_id=assistant_event_id,
-        )
-        await self._append_event_async(
-            thread_id,
-            "turn.completed",
-            {**done_payload, "turn_id": state.turn_id, "run_id": state.run_id},
-        )
-        await self._summarize_thread_best_effort(thread_id)
-        await self._extract_facts_best_effort(thread_id)
-        return {"thread_id": thread_id, "text": text}
+        return await self._finish_durable_turn(state)
 
     async def _resume_run(self, run_id: str, *, decision: str | None) -> dict[str, Any]:
         state = await self.checkpoint_store.load(run_id)
@@ -1396,9 +1341,104 @@ class RuntimeApiServer:
             assignment_metadata=metadata,
         )
 
-    async def _list_run_views(self) -> list[dict[str, Any]]:
-        states = await self._all_runs()
-        return [await self._run_view(state) for state in states]
+    def _message_page(self, thread_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = _page_limit(query, default=50, maximum=200)
+        before = _query_value(query, "before")
+        after = _query_value(query, "after")
+        if before is not None and after is not None:
+            raise ApiError("invalid_request", "use before or after, not both", 400)
+        scope = [thread_id]
+        before_id = _sequence_cursor(before, "messages", scope) if before is not None else None
+        after_id = _sequence_cursor(after, "messages", scope) if after is not None else None
+        rows, _boundary = self.repository.page_messages(
+            thread_id, before_id=before_id, after_id=after_id, limit=limit
+        )
+        has_more = len(rows) > limit
+        rows = rows[:limit] if after is not None else rows[-limit:]
+        messages = [
+            {
+                "id": event.id,
+                "thread_id": event.thread_id,
+                "run_id": event.run_id,
+                "turn_id": event.turn_id,
+                "role": "user" if event.type == "user.message" else "assistant",
+                "text": event.payload["text"],
+                "created_at": event.created_at,
+            }
+            for event in rows
+        ]
+        live_id = rows[-1].id if rows else after_id or 0
+        return {
+            "messages": messages,
+            "older_cursor": (
+                _encode_read_cursor("messages", scope, [rows[0].id])
+                if rows and has_more and after is None
+                else None
+            ),
+            "after_cursor": _encode_read_cursor("messages", scope, [live_id]),
+            "has_more": has_more,
+            "current_run": asyncio.run(self.checkpoint_store.thread_run_head(thread_id)),
+        }
+
+    async def _run_summary_page(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = _page_limit(query, default=50, maximum=200)
+        search = _query_value(query, "search") or ""
+        status = _query_value(query, "status") or ""
+        strategy = _query_value(query, "strategy") or ""
+        sort = _query_value(query, "sort") or "newest"
+        if sort not in {"newest", "oldest", "status", "duration"}:
+            raise ApiError("invalid_request", "invalid Run sort order", 400)
+        scope = [search, status, strategy, sort]
+        raw_cursor = _query_value(query, "cursor")
+        position = None
+        if raw_cursor is not None:
+            values = _decode_read_cursor(raw_cursor, "runs", scope)
+            if (
+                len(values) != 3
+                or not isinstance(values[0], (str, int, float))
+                or isinstance(values[0], bool)
+                or not isinstance(values[1], str)
+                or not values[1]
+                or not isinstance(values[2], str)
+                or not values[2]
+            ):
+                raise ApiError("invalid_request", "invalid Run cursor position", 400)
+            try:
+                datetime.fromisoformat(values[1])
+            except ValueError as exc:
+                raise ApiError("invalid_request", "invalid Run cursor timestamp", 400) from exc
+            if (sort in {"newest", "oldest"}) != isinstance(values[0], str):
+                raise ApiError("invalid_request", "invalid Run cursor sort value", 400)
+            if sort in {"newest", "oldest"} and values[0] != values[1]:
+                raise ApiError("invalid_request", "invalid Run cursor sort value", 400)
+            if sort in {"status", "duration"}:
+                try:
+                    finite = math.isfinite(values[0])
+                except OverflowError:
+                    finite = False
+                if not finite:
+                    raise ApiError("invalid_request", "invalid Run cursor sort value", 400)
+            if sort == "status" and values[0] not in range(6):
+                raise ApiError("invalid_request", "invalid Run cursor status rank", 400)
+            position = (values[0], values[1], values[2])
+        rows = await self.checkpoint_store.list_run_summaries(
+            limit=limit, position=position, search=search,
+            status=status, strategy=strategy, sort=sort,
+        )
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        next_cursor = None
+        if rows and has_more:
+            last = rows[-1]
+            next_cursor = _encode_read_cursor(
+                "runs", scope, [last["_cursor_value"], last["created_at"], last["run_id"]]
+            )
+        return {
+            "runs": [{key: value for key, value in row.items() if key != "_cursor_value"}
+                     for row in rows],
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
 
     async def _all_runs(self) -> list[Checkpoint]:
         by_id: dict[str, Checkpoint] = {}
@@ -1485,43 +1525,36 @@ class RuntimeApiServer:
                     }
                 )
             return result
-        if state.status == RunStatus.CANCELLED:
-            return {
-                "thread_id": state.thread_id,
-                "turn_id": state.turn_id,
-                "run_id": state.run_id,
-                "status": state.status.value,
-                "text": state.output_text,
-            }
         if state.status == RunStatus.FAILED:
-            message = state.error.message if state.error else "run failed"
-            await self._append_event_async(state.thread_id, "error", {"error": message})
-            raise RuntimeError(message)
+            raise RuntimeError(state.error.message if state.error else "run failed")
+        if state.status != RunStatus.COMPLETED:
+            return await self._submission_result(state)
 
-        assistant_event_id = await self._append_event_async(
-            state.thread_id,
-            "assistant.message",
-            {"text": state.output_text},
-        )
-        self._derive_conversation_memory(
-            state.thread_id,
-            role="assistant",
-            content=state.output_text,
-            event_id=assistant_event_id,
-        )
-        await self._append_event_async(
-            state.thread_id,
-            "turn.completed",
-            {
-                "turn_id": state.turn_id,
-                "run_id": state.run_id,
-                "total_turns": state.agent_turn,
-                "total_tokens": state.total_tokens,
-            },
-        )
+        await self.checkpoint_store.project_completed_turn(state)
+        events = await self._list_events_async(state.thread_id)
+        for event in events:
+            if (
+                event.run_id == state.run_id
+                and event.turn_id == state.turn_id
+                and event.type in {"user.message", "assistant.message"}
+            ):
+                self._derive_conversation_memory(
+                    state.thread_id,
+                    role="user" if event.type == "user.message" else "assistant",
+                    content=event.payload["text"],
+                    event_id=event.id,
+                    turn_id=state.turn_id,
+                    run_id=state.run_id,
+                )
         await self._summarize_thread_best_effort(state.thread_id)
         await self._extract_facts_best_effort(state.thread_id)
-        return {"thread_id": state.thread_id, "text": state.output_text}
+        return {
+            "thread_id": state.thread_id,
+            "run_id": state.run_id,
+            "turn_id": state.turn_id,
+            "status": state.status.value,
+            "text": state.output_text,
+        }
 
     def _durable_runtime(
         self,
@@ -1860,14 +1893,6 @@ class RuntimeApiServer:
             return await asyncio.to_thread(self.repository.list_events, thread_id)
         return self.repository.list_events(thread_id)
 
-    def _thread_lock(self, thread_id: str) -> threading.Lock:
-        with self._thread_locks_guard:
-            lock = self._thread_locks.get(thread_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._thread_locks[thread_id] = lock
-            return lock
-
     def _run_lock(self, run_id: str) -> threading.Lock:
         with self._run_locks_guard:
             lock = self._run_locks.get(run_id)
@@ -1891,6 +1916,8 @@ class RuntimeApiServer:
         role: str,
         content: str,
         event_id: int,
+        turn_id: str,
+        run_id: str,
     ) -> None:
         try:
             self.memory_service.save_conversation(
@@ -1898,6 +1925,8 @@ class RuntimeApiServer:
                 role=role,
                 content=content,
                 event_id=event_id,
+                turn_id=turn_id,
+                metadata={"run_id": run_id, "thread_id": thread_id},
             )
         except Exception:
             return
@@ -1952,13 +1981,30 @@ class RuntimeApiServer:
         after_id: int | None = None,
         run_id: str | None = None,
         follow: bool = False,
+        latest: bool = False,
+        limit: int = 200,
     ) -> None:
         if not follow:
-            rows = self.repository.list_events(thread_id, after_id=after_id, run_id=run_id)
+            rows, boundary = self.repository.page_events(
+                thread_id, after_id=after_id, run_id=run_id, limit=limit, latest=latest
+            )
+            has_more = len(rows) > limit and not latest
+            has_older = len(rows) > limit and latest
+            rows = rows[-limit:] if latest else rows[:limit]
+            cursor = rows[-1].id if rows else after_id or 0
             body = "".join(_sse_event(event) for event in rows).encode("utf-8")
             request.send_response(200)
             request.send_header("content-type", "text/event-stream")
             request.send_header("content-length", str(len(body)))
+            request.send_header("X-Axiom-Events-After-Id", str(cursor))
+            request.send_header("X-Axiom-Events-Has-More", str(has_more).lower())
+            request.send_header("X-Axiom-Events-Has-Older", str(has_older).lower())
+            request.send_header("X-Axiom-Events-Watermark", str(max(cursor, boundary)))
+            request.send_header(
+                "X-Axiom-Events-Next-Cursor",
+                _encode_read_cursor("events", [thread_id, run_id or ""], [cursor])
+                if has_more else "",
+            )
             request.end_headers()
             request.wfile.write(body)
             return
@@ -1976,6 +2022,7 @@ class RuntimeApiServer:
         request.send_header("cache-control", "no-cache")
         request.end_headers()
         cursor = after_id
+        initial_tail = latest
         last_write = time.monotonic()
         terminal_observed = False
         with self._sse_metrics_lock:
@@ -1984,11 +2031,15 @@ class RuntimeApiServer:
                 self._sse_reconnects += 1
         try:
             while not self._stop.is_set():
-                rows = self.repository.list_events(
+                rows, _boundary = self.repository.page_events(
                     thread_id,
                     after_id=cursor,
                     run_id=run_id,
+                    limit=limit,
+                    latest=initial_tail,
                 )
+                rows = rows[-limit:] if initial_tail else rows[:limit]
+                initial_tail = False
                 if rows:
                     for event in rows:
                         request.wfile.write(_sse_event(event).encode("utf-8"))
@@ -2006,6 +2057,8 @@ class RuntimeApiServer:
                     request.wfile.write(b": keepalive\n\n")
                     _flush(request)
                     last_write = time.monotonic()
+                if len(rows) == limit:
+                    continue
                 if self._stop.wait(self.sse_poll_interval):
                     return
         except (BrokenPipeError, ConnectionError, OSError, ValueError):
@@ -2112,6 +2165,84 @@ def _header_int(request: BaseHTTPRequestHandler, name: str) -> int | None:
     except ValueError:
         return None
     return parsed if parsed >= 0 else None
+
+
+def _query_value(query: dict[str, list[str]], name: str) -> str | None:
+    values = query.get(name)
+    if values is None:
+        return None
+    if len(values) != 1:
+        raise ApiError("invalid_request", f"{name} must occur once", 400)
+    return values[0]
+
+
+def _page_limit(query: dict[str, list[str]], *, default: int, maximum: int) -> int:
+    raw = _query_value(query, "limit")
+    if raw is None:
+        return default
+    try:
+        limit = int(raw)
+    except ValueError as exc:
+        raise ApiError("invalid_request", "limit must be a positive integer", 400) from exc
+    if not 1 <= limit <= maximum:
+        raise ApiError("invalid_request", f"limit must be between 1 and {maximum}", 400)
+    return limit
+
+
+def _parse_sequence(value: str) -> int:
+    try:
+        position = int(value)
+    except ValueError as exc:
+        raise ApiError(
+            "invalid_request", "event position must be a nonnegative integer", 400
+        ) from exc
+    if not 0 <= position <= 2**63 - 1:
+        raise ApiError("invalid_request", "event position must be a nonnegative integer", 400)
+    return position
+
+
+def _query_sequence(query: dict[str, list[str]], name: str) -> int | None:
+    value = _query_value(query, name)
+    return _parse_sequence(value) if value is not None else None
+
+
+def _encode_read_cursor(kind: str, scope: list[str], position: list[object]) -> str:
+    payload = json.dumps(
+        {"v": 1, "kind": kind, "scope": scope, "position": position},
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_read_cursor(value: str, kind: str, scope: list[str]) -> list[object]:
+    try:
+        if not value or len(value) > 4096:
+            raise ValueError("invalid cursor size")
+        raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+        payload = json.loads(raw)
+        if (
+            not isinstance(payload, dict)
+            or type(payload.get("v")) is not int
+            or payload["v"] != 1
+            or payload.get("kind") != kind
+            or payload.get("scope") != scope
+            or not isinstance(payload.get("position"), list)
+        ):
+            raise ValueError("cursor scope or version mismatch")
+        return payload["position"]
+    except (ValueError, UnicodeError, binascii.Error) as exc:
+        raise ApiError("invalid_request", "invalid or mismatched pagination cursor", 400) from exc
+
+
+def _sequence_cursor(value: str, kind: str, scope: list[str]) -> int:
+    values = _decode_read_cursor(value, kind, scope)
+    if (
+        len(values) != 1
+        or type(values[0]) is not int
+        or not 0 <= values[0] <= 2**63 - 1
+    ):
+        raise ApiError("invalid_request", "invalid pagination sequence", 400)
+    return values[0]
 
 
 def _first_bool(values: list[str] | None) -> bool:

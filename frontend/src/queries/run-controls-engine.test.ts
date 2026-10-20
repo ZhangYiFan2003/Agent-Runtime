@@ -3,6 +3,8 @@ import { QueryClient } from "@tanstack/react-query";
 import { ApiError } from "../api/client";
 import type { InterruptSummary } from "../api/adapters/run";
 import { createRunControlsEngine } from "./run-controls-engine";
+import { getConnectionSnapshot, saveConnection } from "../lib/connection";
+import { queryKeys } from "./keys";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -119,10 +121,11 @@ describe("createRunControlsEngine — invalidation and errors", () => {
     });
     await engine.cancel();
     const keys = invalidate.mock.calls.map((call) => call[0]?.queryKey);
-    expect(keys).toContainEqual(["runs", "run_a"]);
-    expect(keys).toContainEqual(["runs", "run_a", "children"]);
-    expect(keys).toContainEqual(["runs", "run_a", "trace"]);
-    expect(keys).toContainEqual(["runs", "run_a", "metrics"]);
+    const scoped = queryKeys.forConnection(getConnectionSnapshot());
+    expect(keys).toContainEqual(scoped.run("run_a"));
+    expect(keys).toContainEqual(scoped.children("run_a"));
+    expect(keys).toContainEqual(scoped.trace("run_a"));
+    expect(keys).toContainEqual(scoped.metrics("run_a"));
     // never a global invalidation
     expect(keys).not.toContainEqual(["runs"]);
     expect(engine.snapshot().feedback).toEqual({ tone: "success", message: "Cancel requested" });
@@ -218,8 +221,9 @@ describe("createRunControlsEngine — approvals target the child run", () => {
     });
     // Both the child family and the parent page aggregates refresh.
     const keys = invalidate.mock.calls.map((call) => call[0]?.queryKey);
-    expect(keys).toContainEqual(["runs", "run_child"]);
-    expect(keys).toContainEqual(["runs", "run_parent"]);
+    const scoped = queryKeys.forConnection(getConnectionSnapshot());
+    expect(keys).toContainEqual(scoped.run("run_child"));
+    expect(keys).toContainEqual(scoped.run("run_parent"));
     expect(engine.snapshot().feedback).toEqual({ tone: "success", message: "Approval submitted" });
   });
 
@@ -241,6 +245,38 @@ describe("createRunControlsEngine — approvals target the child run", () => {
 });
 
 describe("createRunControlsEngine — pending scoping", () => {
+  it("ignores late control results and never invalidates a replacement connection", async () => {
+    saveConnection({ baseUrl: "http://runtime-a", apiKey: "first" });
+    let release!: (value: Response) => void;
+    const gate = new Promise<Response>((resolve) => { release = resolve; });
+    const client = makeQueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { fetchImpl, requests } = recorder(() => gate);
+    const engine = createRunControlsEngine({ runId: "shared-id", queryClient: client, deps: { fetchImpl } });
+    const pending = engine.cancel();
+    saveConnection({ baseUrl: "http://runtime-a", apiKey: "replacement" });
+    release(jsonResponse(200, {}));
+    expect(await pending).toBe(false);
+    expect(requests[0].url).toBe("http://runtime-a/v1/runs/shared-id/cancel");
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(engine.snapshot().feedback).toBeNull();
+    expect(await engine.cancel()).toBe(false);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("does not retry a transport failure after changing Runtime", async () => {
+    saveConnection({ baseUrl: "http://runtime-a", apiKey: "first" });
+    const { fetchImpl, requests } = recorder(() => {
+      throw new ApiError({ status: 0, message: "lost" });
+    });
+    const engine = createRunControlsEngine({ runId: "shared-id", queryClient: makeQueryClient(), deps: {
+      fetchImpl, sleep: async () => { saveConnection({ baseUrl: "http://runtime-b", apiKey: "second" }); },
+    } });
+    expect(await engine.resume()).toBe(false);
+    expect(requests).toHaveLength(1);
+    expect(engine.snapshot().feedback).toBeNull();
+  });
+
   it("pending state is scoped per runId", async () => {
     let release!: (value: Response) => void;
     const gate = new Promise<Response>((resolve) => {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { ArrowDown, ChevronRight, Loader2 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import type { WorkbenchItem } from "../../lib/workbench-projection";
@@ -150,6 +150,7 @@ function FeedRow({ item }: { item: WorkbenchItem }) {
               axiom
             </span>
             <Timestamp iso={item.timestamp} />
+            {item.preview && <span className="font-mono text-[10px] text-fg-2">live preview</span>}
           </div>
           <div className="mt-0.5 text-13 break-words whitespace-pre-wrap text-fg-1">
             <AssistantText text={item.text} runId={item.runId} />
@@ -206,13 +207,37 @@ export function WorkbenchFeed({
   items,
   status,
   replayError,
+  history,
 }: {
   items: WorkbenchItem[];
   status: ReplayStatus;
   replayError: string | null;
+  history: {
+    loading: boolean; error: string | null; hasOlder: boolean;
+    loadingOlder: boolean; olderError: string | null;
+    loadOlder: () => Promise<void>; retry: () => void;
+  };
 }) {
-  const lastId = items.length > 0 ? items[items.length - 1].id : null;
-  const { scrollRef, showJump, handleScroll, jumpToLatest } = useFollowPin(lastId);
+  const tail = items.at(-1);
+  const lastId = tail ? `${tail.id}:${tail.kind === "assistant" ? tail.text.length : ""}` : null;
+  const { scrollRef, showJump, handleScroll, jumpToLatest, pauseFollowing } = useFollowPin(lastId);
+  const anchor = useRef<{ id: string; top: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!anchor.current || !scrollRef.current) return;
+    const row = [...scrollRef.current.querySelectorAll<HTMLElement>("[data-feed-id]")].find((element) => element.dataset.feedId === anchor.current?.id);
+    if (row) scrollRef.current.scrollTop += row.getBoundingClientRect().top - anchor.current.top;
+    if (!history.loadingOlder) anchor.current = null;
+  }, [items, history.loadingOlder, scrollRef]);
+  const loadOlder = () => {
+    pauseFollowing();
+    const container = scrollRef.current;
+    if (container) {
+      const top = container.getBoundingClientRect().top;
+      const row = [...container.querySelectorAll<HTMLElement>("[data-feed-id]")].find((element) => element.getBoundingClientRect().bottom > top);
+      if (row?.dataset.feedId) anchor.current = { id: row.dataset.feedId, top: row.getBoundingClientRect().top };
+    }
+    void history.loadOlder();
+  };
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
@@ -224,21 +249,36 @@ export function WorkbenchFeed({
       </div>
 
       <div ref={scrollRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-y-auto">
+        {history.loading && items.length > 0 && <div role="status" className="px-4 py-2 font-mono text-[11px] text-fg-2">Loading saved conversation…</div>}
+        {!history.loading && items.length > 0 && (
+          <div className="px-4 py-2 text-center font-mono text-[11px] text-fg-2">
+            {history.hasOlder ? <Button variant="ghost" size="sm" onClick={loadOlder} disabled={history.loadingOlder}>
+              {history.loadingOlder ? "Loading earlier messages…" : "Load earlier messages"}
+            </Button> : "Beginning of conversation"}
+            {history.olderError && <div role="alert" className="mt-1 text-danger">{history.olderError}</div>}
+          </div>
+        )}
         {items.length === 0 ? (
           <div className="px-6 py-16 text-center">
-            <div className="text-sm font-medium text-fg-0">No activity yet</div>
+            <div className="text-sm font-medium text-fg-0">{history.loading ? "Loading conversation…" : history.error ? "Conversation unavailable" : "No messages yet"}</div>
             <div className="mt-1 font-mono text-xs text-fg-2">
-              {status === "connecting"
-                ? "Loading persisted events…"
+              {history.loading
+                ? "Reading saved messages…"
                 : status === "not-found"
                   ? "This thread does not exist on the connected runtime."
                   : "Send a message below to start a turn."}
             </div>
           </div>
         ) : (
-          <div className="divide-y divide-border/40 py-2">{items.map((item) => <FeedRow key={item.id} item={item} />)}</div>
+          <div className="divide-y divide-border/40 py-2">{items.map((item) => <div key={item.id} data-feed-id={item.id}><FeedRow item={item} /></div>)}</div>
         )}
       </div>
+
+      {history.error !== null && (
+        <div role="alert" className="flex items-center justify-between border-t border-border px-3 py-1 text-xs text-danger">
+          <span>{history.error}</span><Button variant="ghost" size="sm" onClick={history.retry}>Retry messages</Button>
+        </div>
+      )}
 
       {replayError !== null && status !== "following" && (
         <div className="shrink-0 border-t border-border/60 px-3 py-1 font-mono text-[11px] text-fg-2">

@@ -9,6 +9,9 @@
 > work — it requires a `run_id` filter, so the Workbench's thread-wide replay
 > would keep polling regardless, and the replay client's cursor/dedupe/
 > backoff/terminal-drain semantics are already unit-tested.
+> Runtime Step 3 adds independent durable message pages, bounded Event replay,
+> SQL-filtered Run-summary pages and connection-scoped browser state. Debug-log
+> eviction no longer determines whether a conversation or its active Run exists.
 
 This document is the long-term context for all frontend sessions. Sections
 A–K below are the original analysis/design record; the status note above
@@ -76,9 +79,11 @@ Base URL `http://127.0.0.1:<port>`, all `/v1` routes require the API key.
 
 | Endpoint | Returns | Notes |
 | --- | --- | --- |
-| `GET /health` | status, workers, database, storage_backend, capacity | Unauthenticated; use for connection check |
+| `GET /health` | status, workers, database, storage_backend, capacity | Public service/dependency health only; workers counts API-local legacy task threads |
+| `GET /v1/auth/check` | `{authenticated: true}` | Validates the Runtime API key without creating work or calling a model; required for Test Connection |
 | `POST /v1/threads` | `{id}` | Creates thread |
-| `GET /v1/runs` | `{runs: RunView[]}` | All runs across all threads, creation-ordered. No pagination/filter params |
+| `GET /v1/runs` | `{runs: RunSummary[], next_cursor, has_more}` | SQL-filtered summary pages; default 50, maximum 200; detail remains separate |
+| `GET /v1/threads/{thread_id}/messages` | `{messages[], older_cursor, after_cursor, has_more, current_run}` | Identified root conversation Events only, default 50, maximum 200; latest page initially, exclusive `before`/`after` |
 | `GET /v1/runs/{run_id}` | `RunView` | Stable projection incl. `allowed_operations`, `pending_interrupts` |
 | `GET /v1/runs/{run_id}/children` | `{parent_run_id, children: ChildView[]}` | Stable ordering; child includes assignment_id, worker_role, attempt, interrupt |
 | `GET /v1/runs/{run_id}/interrupts` | `{run_id, pending_interrupts[]}` | Aggregates run + direct children |
@@ -87,7 +92,7 @@ Base URL `http://127.0.0.1:<port>`, all `/v1` routes require the API key.
 | `POST /v1/runs/{run_id}/resume` | RunView-like result | Body `{decision?: "approve"\|"reject", invocation_id?, request_id?}`; 202 when waiting/queued |
 | `POST /v1/runs/{run_id}/cancel` | RunView | State-idempotent; cascades to non-terminal children |
 | `POST /v1/runs/{run_id}/interrupt` | `public_dict` | Body `{reason}` |
-| `GET /v1/threads/{thread_id}/events?after_id=&run_id=` | `text/event-stream` | Stored replay; envelope has stable top-level `event_id, thread_id, turn_id, run_id, parent_run_id, parent_step_id, assignment_id, event_type, timestamp, payload` |
+| `GET /v1/threads/{thread_id}/events?after_id=&run_id=` | `text/event-stream` | Bounded replay, default 200/max 500; paging headers, `latest=1`, scoped cursor and optional Run-filtered `follow=1`; envelope identity unchanged |
 | `GET /v1/runtime/active-runs` | `{active_runs[]}` | Process-local diagnostic: identity, strategy, registered_at, owner_thread_id, task_done, cancellation_requested |
 
 Structured errors on run-control endpoints: `{error: {code, message, run_id?,
@@ -109,28 +114,34 @@ Event types persisted (non-exhaustive, must be treated as open):
 
 | Endpoint | Issue |
 | --- | --- |
-| `POST /v1/threads/{id}/turns` | **Synchronous and blocking**: the HTTP request is held for the entire turn (`asyncio.run` of the durable run). Returns 200 `{thread_id, text}` for legacy engines, 200/202 run results for durable runs, 409 when a turn is already running. Response shape is engine-dependent. Usable with a long client timeout, but it is not an async "create run → poll" API |
-| `POST/GET /v1/tasks`, `GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/cancel` | Background queue path (prompt → deterministic durable Run `run_<task_id>`). Works as a non-blocking execution entry, but the task record model is minimal and separate from the Thread/Turn model |
+| `POST /v1/threads/{id}/turns` | Local execution remains blocking; distributed admission returns 202. Every success has `thread_id`, `run_id`, `turn_id`, and an existing uppercase `status`. Web sends one stable `Idempotency-Key` per logical message on both storage backends; uncertain results retain the original key/message for explicit confirmation. A different submission to an occupied Thread returns structured 409 `THREAD_BUSY` |
+| `POST/GET /v1/tasks`, `GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/cancel` | Legacy SQLite background queue, separate from the distributed Run queue. Submissions require API-local task workers; with `--task-workers 0` (default Compose), POST returns structured 503 `TASK_WORKERS_DISABLED` without writing a task. Existing tasks can still be listed, viewed, and canceled |
 | Error shape on non-run-control routes | 401/404/400/500 on threads/events/tasks return `{"error": "<string>"}`, not the structured error object. The client must handle both shapes |
 
-### B.3 Needed by the frontend, currently missing
+### B.3 Read capabilities and remaining gaps
 
 1. **CORS**: no `Access-Control-*` headers and no `OPTIONS` handling. A browser
    app cannot call the API cross-origin. Dev workaround: Vite dev-server
    proxy. Long-term: minimal additive backend change (opt-in CORS).
-2. **Thread listing / history**: no `GET /v1/threads` (the repository has
-   `list_threads` internally but it is not exposed) and no JSON thread-history
-   endpoint. The Workbench cannot enumerate past conversations; events are
-   only available as an SSE-format replay per known thread ID.
+2. **Thread listing**: no `GET /v1/threads` list. Recent IDs and last selection
+   remain local, scoped to normalized Runtime URL. Conversation history for a
+   known Thread is now available from `/messages`, independent of raw Events.
 3. **Async turn/run creation**: no `POST … → 202 {run_id}` + poll pattern for
    turns in the default (non-distributed) mode. The blocking turns endpoint or
-   the `/v1/tasks` queue are the only entries.
-4. **Live SSE**: the events endpoint sends the full stored body with
-   `Content-Length` and **closes** — it is replay, not a held-open stream. No
-   heartbeat, no `limit`/`since` paging (unbounded body on long threads). The
-   frontend must implement fetch-based reconnect-with-`after_id` polling;
-   `EventSource` is also unusable because it cannot send the auth header.
-5. **Run list pagination/filter**: `GET /v1/runs` returns everything.
+   the `/v1/tasks` queue (when local task workers are enabled) are the local entries.
+4. **Event transport**: finite SSE replay closes after one bounded page. Its
+   `X-Axiom-Events-After-Id`, `Has-More`, `Has-Older`, `Watermark` and `Next-Cursor`
+   headers carry protocol metadata (each name has the `X-Axiom-Events-` prefix).
+   The frontend drains forward pages before polling again and stops terminal
+   replay only after reaching its observed watermark. Workbench initially asks
+   for `latest=1`, avoiding an automatic replay of old logs. Backend `follow=1`
+   remains available with a Run filter and bounded batches/keepalives; Web uses
+   authenticated fetch polling because `EventSource` cannot send the auth header.
+5. **Run pagination/filter**: implemented. `search`, exact `status`/`strategy`,
+   and `sort=newest|oldest|status|duration` apply globally in SQL. Creation-time
+   ordering has a unique Run-ID tie-breaker. Status/duration ties use newest
+   creation time and Run ID. The list uses a separate slim `RunSummary` DTO,
+   not invented default values for a full Run view.
 6. **Interrupt detail**: `pending_interrupts` deliberately omits tool
    arguments — the approval UI can show `tool_name`, `reason`,
    `invocation_id`, but not the exact command/args being approved.
@@ -144,6 +155,35 @@ Event types persisted (non-exhaustive, must be treated as open):
 **Rule**: none of these gaps may be fixed by changing Runtime internals in a
 frontend phase. Additive API changes are a separate, explicit backend decision.
 
+### B.4 Pagination and connection state (Runtime Step 3)
+
+Messages display in ascending stable ID order. Initial reads obtain the latest
+50 messages; loading earlier history updates only `older_cursor`, while polling
+with `after_cursor` updates only the live boundary. Merge both directions by ID,
+preserve the reading position, and use `current_run` plus Run Detail for controls.
+The live boundary comes from returned message identities, not a later independent
+maximum Event read. Incomplete user messages are UI history, not model context.
+Stream previews belong to one Run/Turn and are replaced by the durable final
+message; their bounded buffer is separate from the 1,500-Event debug window.
+
+Run pages load only on request. **Load more runs** appends and deduplicates by
+Run ID; **Refresh** returns to the first page and reads that page only. There is
+no polling/refetch of all loaded older pages. Counts say **loaded**, not a global
+total; known filter choices do not depend on whichever page is currently loaded.
+All three endpoints reject invalid limits/cursors with HTTP 400; cursors bind
+their list kind and Thread/filter scope. Errors never trigger an all-history
+fallback or an empty success response. See `docs/runtime-api.md` for boundaries.
+
+`useConnection()` exposes `{config, scope, generation}`. Scope reuses Step 2's
+normalized URL; Query keys add an in-memory generation changed on verified save
+or explicit clear, including same-URL credential changes. Credentials never enter
+keys or persisted identity. Old reads, replay loops, controls and downloads
+capture their original configuration and cancel/ignore stale results. A → B → A
+reloads A without showing B's cached rows. Recent Thread IDs and last selection
+are URL-scoped; unowned legacy registry records are discarded once. Unconfirmed
+submissions retain their original Runtime/Thread key and are never auto-resubmitted
+by pagination or connection switching.
+
 ---
 
 ## C. API gap → frontend strategy mapping
@@ -151,8 +191,8 @@ frontend phase. Additive API changes are a separate, explicit backend decision.
 | Gap | v1 strategy |
 | --- | --- |
 | CORS | Vite proxy `/v1` + `/health` in dev; document the limitation |
-| Blocking turns | Call with extended timeout and an explicit "running…" pending state; offer `/v1/tasks` as the background alternative later |
-| No live SSE | Custom `EventStreamClient`: `fetch` + reader, parse SSE frames, dedupe by `event_id`, reconnect/poll with `after_id` cursor and backoff |
+| Blocking turns | Call with extended timeout and an explicit "running…" pending state; legacy `/v1/tasks` submissions require enabled API-local task workers and are disabled in default Compose |
+| Event transport | Bounded fetch-based SSE pages, stable-ID dedupe, page draining then polling with `after_id` and existing backoff |
 | No thread list | Workbench keeps a local thread-ID registry (localStorage) with "open by ID" fallback |
 | Missing product APIs (Tools/MCP, Evaluation) | Defer those pages; show per-run observability only |
 | Two error shapes | Normalize both in the API client into one `ApiError` type |
@@ -292,13 +332,15 @@ Desktop, three regions:
 
 Behavior decisions:
 
-- Send → `POST /v1/threads/{id}/turns` with long timeout; UI immediately
-  enters a pending "turn running" state driven by event polling, not by
-  guessing. A 409 "thread turn already running" maps to a disabled composer
-  with explanation.
-- While a turn runs, the feed is driven by the SSE replay client
-  (`after_id` cursor). UI never accumulates its own copy of run state — run
-  status comes from TanStack Query refetch of the Run view.
+- Send → `POST /v1/threads/{id}/turns` with the existing long timeout and a
+  stable submission key. Only identified server results/events establish a Run.
+  Structured `THREAD_BUSY` restores the draft and identifies the actual active Run.
+  Network/protocol uncertainty retains the original key/message across refresh
+  for explicit confirmation; it does not create a fresh submission automatically.
+- Durable conversation rows come from `/messages`; SSE supplies a bounded debug
+  feed and temporary streaming preview. Earlier history does not move the live
+  cursor or force scrolling to the bottom. Run identity comes from `current_run`
+  or confirmed submission identity; status and controls come from Run Detail.
 - Approval cards render from `pending_interrupts`; both decision buttons send
   one mutation with a fresh `Idempotency-Key`, disabled after first click.
 - Composer offers Interrupt and Cancel only when the active Run's
@@ -437,16 +479,16 @@ menus/sheets only.
    definitive response. 409 `idempotency_key_conflict` surfaces as an error;
    replayed stored results are accepted silently. `Idempotency-Key` header is
    primary; body `request_id` only as fallback.
-2. **Retry policy**: GETs auto-retry ≤3 with backoff (idempotent). Mutations
-   retry automatically **only** on network-level failure with the same key —
-   never on 4xx/5xx responses.
-3. **SSE client**: cursor = last `event_id`, reconnect with `after_id`,
-   exponential backoff with jitter, dedupe set on `event_id`, per-thread
-   cursor registry. Events are grouped by `run_id` / `parent_run_id` /
+2. **Retry policy**: GETs use their existing bounded retries. Turn submissions
+   never retry automatically. An unresolved POST keeps its original key/message
+   for explicit confirmation; malformed 2xx responses are unresolved protocol errors.
+3. **SSE client**: cursor = last `event_id`, reconnect with `after_id`, bounded
+   page draining through the observed terminal watermark, existing backoff,
+   dedupe set on `event_id`, Runtime-generation/Thread/Run-scoped replay state.
+   Events are grouped by `run_id` / `parent_run_id` /
    `assignment_id` for lineage display; unknown `event_type` renders via a
-   generic fallback row. Since the stream is replay-only today, the client
-   already supports "poll mode"; if the backend later holds connections open,
-   only the transport changes.
+   generic fallback row. Frontend finite polling and backend Run-filtered follow
+   share the existing SSE envelopes; page metadata is never a business Event.
 4. **UI is never a second source of truth**: run status, allowed operations,
    pending interrupts always come from query refetch of the Run view. Local
    state is limited to selection, composer drafts, and the thread-ID registry.
@@ -466,10 +508,11 @@ Each phase ends in a usable, shippable state. No phase modifies Runtime
 internals.
 
 1. **Scaffold & contract layer** — Vite/React/TS/Tailwind/shadcn setup, design
-   tokens, API client + zod DTOs + adapters, Settings (base URL, API key,
-   `/health` check), Vite proxy, app shell + sidebar.
-2. **Runs list** — dense table with status pills, strategy, times, client-side
-   filter/sort; empty/error states.
+   tokens, API client + zod DTOs + adapters, Settings (base URL, Runtime API key,
+   protected `/v1/auth/check` verification plus public `/health` details), Vite proxy,
+   app shell + sidebar.
+2. **Runs list** — dense table with status pills, strategy, times; Runtime Step 3
+   replaces original client filtering/sorting with SQL-filtered summary pages.
 3. **Run Detail read-only** — header + ActionBar rendering (actions still
    disabled), trace waterfall, span table, metrics panel, children table,
    inspector, mobile tabs/bottom-sheet.

@@ -52,7 +52,9 @@ not receive Docker daemon access. Sandbox containers join no Compose network.
 
 Workers reach providerd only on the private `provider-control` network. Only providerd receives
 external provider credentials. Runtime API, Web, PostgreSQL, sandboxd, and Sandbox containers do not
-join that network; providerd and sandboxd publish no host ports.
+join that network; providerd and sandboxd publish no host ports. `provider-control` remains
+internal. Only providerd also joins the ordinary `provider-egress` bridge for external model
+DNS/TLS connections; no other service or per-Run Sandbox joins that egress network.
 
 ## Prerequisites
 
@@ -125,7 +127,8 @@ Services log to stdout/stderr.
 
 The bounded Stage 15 harness starts an isolated Compose project with fake process-local
 credentials and a deterministic local provider. It does not read this deployment's `.env` or call
-an external LLM:
+an external LLM. Its fake provider shares `provider-control`, so successful Runs validate the
+gateway and execution path, not external DNS/TLS connectivity or a real model request:
 
 ```powershell
 uv run python -m benchmarks.deployment.run_load --profiles smoke moderate-1-worker moderate-2-workers saturation --build
@@ -136,6 +139,20 @@ Results are written under `.tmp/stage15/`. See
 [`benchmarks/deployment/README.md`](../benchmarks/deployment/README.md) for safe project cleanup,
 profile bounds, and interpretation, and
 [`docs/operations-reliability.md`](../docs/operations-reliability.md) for the current fault model.
+
+Validate Compose without printing interpolated configuration or credentials:
+
+```bash
+docker compose --env-file deploy/.env -f deploy/compose.yaml config --quiet
+```
+
+Check external DNS/TLS/HTTP from inside providerd separately; the
+[isolated harness instructions](../benchmarks/deployment/README.md#external-connectivity-check)
+provide a request without credentials or model inference. An HTTP 401/403 is connectivity
+evidence, not model success. Record Compose/network configuration, container external
+connectivity, and a real model response separately. Only run a bounded, low-cost model request
+when explicit test credentials and call authorization are already available. Model calls are
+never part of health checks or connection verification.
 
 `GET /health` reports API-local task workers, not distributed Worker replica membership. For
 distributed diagnosis, use Compose service state plus PostgreSQL capacity/lease evidence and
