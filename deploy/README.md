@@ -195,17 +195,219 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml up -d
 
 Do not add `-v` unless you intentionally want to delete PostgreSQL and Runtime volumes.
 
-## Upgrade
+## Backup and restore
+
+Use a coordinated **stop-writes** backup. PostgreSQL `pg_dump` is consistent within its database;
+it does not create a simultaneous snapshot of MinIO or the workspace. Docker volumes are
+persistence, not backups.
+
+| State | Current location and recovery purpose |
+| --- | --- |
+| Distributed Runtime authority | `postgres_data`: Run heads/checkpoints, Tool executions, budgets, delivery/ownership, Thread events/messages, submission/control idempotency, Artifact metadata and Claim provenance. Restore the database together. |
+| Artifact bytes | `artifact_data`, through the dedicated MinIO bucket. Export objects through the S3 API; do not copy MinIO's live internal directory. Metadata alone cannot restore bytes. |
+| Auxiliary local state | `runtime_data` at `/var/lib/axiom`: `runtime.db` observability, `memory.db`, `tasks.db`, and any configured local Artifact store. This is shared single-host state even when Runtime authority uses PostgreSQL. |
+| Agent files | `workspace_data` or the explicit `AXIOM_WORKSPACE_MOUNT`. Preserve it with the same backup boundary as tool records and artifacts. |
+| Local-only Runtime | `<data-dir>/runtime.db` holds the coherent SQLite repositories; the default is `~/.axiom/runtime`. Preserve its sibling memory/tasks databases and local `artifacts/`, or their explicitly configured paths. |
+| Other host/container state | Explicit host memory paths and `~/.axiom/snapshots` need separate preservation if used. Compose does not mount `/home/axiom/.axiom/snapshots`; snapshots in a container's writable layer do not survive recreation. |
+
+Query caches, the Web event window, process handles, Worker identities, and providerd circuit/admission
+state are rebuildable. Ownership leases are database records, not reusable process handles. Retain
+configuration **names**, source SHA, built image identities, schema version, workspace mount mode,
+Artifact bucket/endpoint names, and the backup boundary in an access-controlled manifest. Manage
+credential values through the existing secret mechanism; do not put them in a manifest, source
+control, or command output. Backups contain private user data and need protected storage outside
+the checkout.
+
+The following commands are Bash for the supported Linux/WSL host. Select the existing project
+explicitly; use the same reviewed Compose overrides as the running deployment. Never run
+`docker compose config` without `--quiet` when credentials are interpolated. Before beginning,
+inspect active Runs in the Console and decide which may finish or require explicit interruption
+or cancellation. Stop scheduled CLI jobs and other host writers too.
 
 ```bash
-git pull
-docker compose --env-file deploy/.env -f deploy/compose.yaml --profile sandbox-build build
-docker compose --env-file deploy/.env -f deploy/compose.yaml up -d
+set -euo pipefail
+project=axiom
+backup_id="$(date -u +%Y%m%dT%H%M%SZ)"
+backup="$(pwd)/../axiom-backups/$backup_id"
+mkdir -m 700 -p "$backup"
+dc() { docker compose -p "$project" --env-file deploy/.env -f deploy/compose.yaml "$@"; }
+dc config --quiet
+dc stop web
 ```
 
-Back up the PostgreSQL database independently before upgrades. Docker volumes are persistence,
-not backups. Back up `artifact_data` together with PostgreSQL: database-only recovery can leave
-Artifact metadata pointing to missing Blobs, while MinIO-only recovery can leave orphan bytes.
+Stopping Web closes the published admission/control entrypoint. Block any other direct clients.
+Allow safe work to finish, or apply the previously chosen controls through an existing authorized
+operator route before stopping the API. Worker shutdown can leave resumable nonterminal Runs;
+it is not proof that every external side effect completed or was rolled back.
+
+```bash
+dc stop -t 40 runtime-api worker
+```
+
+Confirm all Worker replicas and API processes stopped. Also stop every managed per-Run Sandbox
+that can still write this workspace: use only container IDs selected by both
+`axiom.managed=true` and the recorded `axiom.run_id` labels, never a global Docker stop/prune.
+Stop sandboxd and providerd after execution has stopped. Keep PostgreSQL and MinIO available
+for logical export.
+
+```bash
+dc stop sandboxd providerd
+dc exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup/runtime.dump"
+dc run --rm --no-deps -T --user 0:0 -v "$backup:/backup" --entrypoint python runtime-api - <<'PY'
+import tarfile
+for source, name in [("/var/lib/axiom", "runtime-data"), ("/workspace", "workspace")]:
+    with tarfile.open(f"/backup/{name}.tar.gz", "w:gz") as archive:
+        archive.add(source, arcname=".")
+PY
+dc run --rm --no-deps -T --user 0:0 -v "$backup:/backup" --entrypoint python runtime-api - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+from urllib.parse import urlsplit
+from minio import Minio
+
+client = Minio(urlsplit(os.environ["AXIOM_ARTIFACT_S3_ENDPOINT"]).netloc,
+               access_key=os.environ["AXIOM_ARTIFACT_S3_ACCESS_KEY"],
+               secret_key=os.environ["AXIOM_ARTIFACT_S3_SECRET_KEY"], secure=False)
+bucket = os.environ["AXIOM_ARTIFACT_S3_BUCKET"]
+root = Path("/backup/artifact-objects")
+root.mkdir()
+for item in client.list_objects(bucket, recursive=True):
+    target = root / item.object_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    client.fget_object(bucket, item.object_name, str(target))
+    with target.open("rb") as content:
+        assert hashlib.file_digest(content, "sha256").hexdigest() == target.name
+PY
+```
+
+The object export assumes this deployment's dedicated content-addressed Artifact bucket; its
+object names end with the SHA-256 digest. The scripts use credentials only inside the existing
+trusted service environment. Preserve required container-local snapshots before recreation,
+using `docker compose cp` against the specific container into the protected backup location.
+Keep every writer paused until all exports and a checksum inventory succeed. Resume the existing
+deployment only after completing that boundary, or continue with the upgrade below.
+
+For standalone SQLite, stop the API, all local task workers, CLI writers, and workspace tools.
+Use the standard backup interface for each database, including committed WAL content:
+
+```bash
+uv run python - /absolute/data-dir/runtime.db /absolute/backup/runtime.db <<'PY'
+import sqlite3
+import sys
+from contextlib import closing
+with closing(sqlite3.connect(sys.argv[1])) as source:
+    with closing(sqlite3.connect(sys.argv[2])) as destination:
+        source.backup(destination)
+PY
+```
+
+Repeat for `memory.db` and `tasks.db` while writers remain stopped, then copy local Blob bytes and
+the workspace. Do not copy only an actively written SQLite main file; committed records can still
+be in `-wal`. Alternatively copy all stopped files, including their WAL companions, as a unit.
+
+### Isolated restore and nonterminal Runs
+
+Restore first into an empty project with different ports, independent volumes and a disposable
+workspace. Use the backed-up source/images and separately supplied **test** configuration. Do not
+reuse a production bind mount, database DSN, provider route, or external credentials. Supply the
+documented process-local fake provider from the [deployment harness](../benchmarks/deployment/README.md)
+before any execution. Restoring backups alone must not trigger real external effects.
+
+With the `dc` function redirected to that isolated project/configuration, start only storage, then
+restore the dump into the empty database:
+
+```bash
+dc up -d postgres minio
+dc exec -T postgres sh -c 'pg_restore --exit-on-error --no-owner --no-acl -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$backup/runtime.dump"
+dc run --rm --no-deps -T --user 0:0 -v "$backup:/backup:ro" --entrypoint python runtime-api - <<'PY'
+import tarfile
+for target, name in [("/var/lib/axiom", "runtime-data"), ("/workspace", "workspace")]:
+    with tarfile.open(f"/backup/{name}.tar.gz") as archive:
+        archive.extractall(target, filter="tar", numeric_owner=True)
+PY
+dc run --rm --no-deps -T --user 0:0 -v "$backup:/backup:ro" --entrypoint python runtime-api - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+from urllib.parse import urlsplit
+from minio import Minio
+
+client = Minio(urlsplit(os.environ["AXIOM_ARTIFACT_S3_ENDPOINT"]).netloc,
+               access_key=os.environ["AXIOM_ARTIFACT_S3_ACCESS_KEY"],
+               secret_key=os.environ["AXIOM_ARTIFACT_S3_SECRET_KEY"], secure=False)
+bucket = os.environ["AXIOM_ARTIFACT_S3_BUCKET"]
+if not client.bucket_exists(bucket):
+    client.make_bucket(bucket)
+root = Path("/backup/artifact-objects")
+for source in root.rglob("*"):
+    if source.is_file():
+        with source.open("rb") as content:
+            assert hashlib.file_digest(content, "sha256").hexdigest() == source.name
+        client.fput_object(bucket, source.relative_to(root).as_posix(), str(source))
+PY
+```
+
+Extract only your own trusted backup archives into empty recovery volumes. Numeric ownership
+preserves the default image's UID/GID 10001; bind mounts require the host's reviewed ownership
+procedure. A mismatched auxiliary memory project scope may require restoring the original
+workspace path; keep mount/configuration names with the backup.
+
+Keep distributed Workers stopped while reviewing restored Run/Tool states. Once started, they can
+claim queued work or recover after persisted leases expire; an old fencing generation does not
+authorize a restored process. Local API startup can recover `WAITING_CHILD` parents, while a
+`RUNNING` local root requires explicit resume. `WAITING_APPROVAL` requires the recorded approval
+decision. Inspect ambiguous tool outcomes before any resume: checkpoint recovery cannot undo
+external effects performed after the backup boundary. Cancel unwanted Runs through existing
+controls, and start execution only against disposable workspaces and the fake provider during
+the drill.
+
+Validate Thread/Run/Turn associations, paged messages and raw events, an Artifact download hash,
+and replay of a saved submission key with the original payload: replay must return its existing
+Run without a new model execution. Inspect nonterminal behavior separately, then explicitly resume
+one safe fake-provider Run. Restart and reread the same records. A database-only restore does not
+prove a Compose/MinIO/workspace restore.
+
+The offline regression `uv run pytest tests/test_artifacts.py -k stopped_sqlite_backup` exercises
+SQLite's backup interface with WAL frames present, a local Blob and workspace, message/Run/tool
+links, retained idempotency, and explicit recovery of a pending Run using a fake client. It does
+not exercise the Docker or MinIO commands above. Run the existing real
+[Compose harness](../benchmarks/deployment/README.md) when Docker is available; retain the source
+SHA, environment and actual result, and mark any unexecuted service restore as unverified.
+
+A separate isolated PostgreSQL 15.12 `pg_dump`/`pg_restore` drill also preserved a completed Run,
+a pending Run, their messages and submission keys, Artifact metadata with local Blob SHA-256,
+and a copied disposable workspace. The pending Run remained unexecuted. This is database plus
+local-file recovery evidence; it does not establish MinIO recovery, a Compose deployment cycle,
+provider networking, or a real external model request. Repeat it against the exact deployment
+revision before relying on the backup procedure operationally.
+
+## Upgrade and rollback
+
+1. Complete the coordinated backup above and record the current source SHA and PostgreSQL schema
+   version (current Runtime schema is v9). Keep the deployment stopped and preserve the backup.
+2. Record/retain actual image IDs or archive the images outside the checkout. The default local
+   application tags and upstream base tags are mutable; a source SHA alone cannot reproduce an
+   older built image. `dc --profile sandbox-build config --images` lists image references without
+   printing interpolated service credentials; resolve them with `docker image inspect` and retain
+   the corresponding images, including the configured Sandbox image.
+3. Check out an explicitly reviewed target SHA in a clean deployment checkout, rather than
+   pulling a moving branch. With the same project/configuration, build the target application,
+   Web and Sandbox images: `dc --profile sandbox-build build`.
+4. Start storage, providerd and sandboxd, then `dc up -d runtime-api`. Runtime startup performs
+   the additive migration and rejects unsupported future schemas. Check service health and logs
+   without printing credentials. Keep Workers stopped until the migration and read checks pass.
+5. Confirm authenticated API access, an existing Run, message/event pages and an Artifact hash.
+   Start Workers and Web, then perform one authorized bounded smoke Run. Record whether its
+   provider was fake or a real external model; `/health` and HTTP 401 do not prove model success.
+
+Code/image rollback and data rollback are different operations. This repository does not promise
+that an arbitrary older revision can read v9; verify compatibility in an isolated restore first.
+If compatibility is unproven, restore the coordinated pre-upgrade database, Blob export, auxiliary
+data and workspace into fresh volumes, use the saved images/configuration, and apply the restore
+validation above. That rollback **loses writes after the backup boundary** and may not undo external
+side effects. Retain the failed-upgrade state for diagnosis rather than overwriting it. There is
+no destructive automatic down migration, and production rollback requires separate authorization.
 
 ## Security boundary
 

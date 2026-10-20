@@ -32,6 +32,22 @@ Core runtime choices:
   short lock on one coordination row while deriving counts from Run/lease truth; no queue or active
   counter is persisted.
 
+Operational persistence spans more than the Runtime database. PostgreSQL holds the coherent
+distributed Run/event/idempotency/ownership/artifact-metadata/provenance records; MinIO holds Blob
+bytes, the shared `runtime_data` volume holds auxiliary SQLite observability/memory/tasks, and the
+workspace holds tool-visible files. Backups pause every writer before exporting these stores;
+`pg_dump` alone does not provide cross-store consistency. The default local backend instead
+stores Runtime truth in `<data-dir>/runtime.db`, with sibling local databases and Blob storage.
+See the maintained [backup, restore, and upgrade procedure](../deploy/README.md#backup-and-restore).
+
+SnapshotService writes to `~/.axiom/snapshots`; Compose currently does not persist that container
+home directory. Required snapshots must be preserved separately before container recreation.
+Web query/event caches and providerd governance are rebuildable, while durable Tool outcomes and
+submission keys must be retained. Restore validation keeps execution stopped until nonterminal
+Runs and ambiguous external effects have been reviewed; distributed Workers can otherwise claim
+restored work, and local API startup can resume waiting parents. Recovery tests use fake providers
+and disposable workspaces rather than replaying real external side effects.
+
 The default LLM provider is `deepseek`, the default model is
 `deepseek-v4-flash`, and the default provider base URL is
 `https://api.deepseek.com/v1`. Requests are sent to the OpenAI-compatible

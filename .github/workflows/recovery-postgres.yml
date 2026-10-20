@@ -56,3 +56,11 @@ jobs:
         run: >-
           uv run --locked python -m benchmarks.recovery.run_fault_injection
           --output /tmp/axiom-recovery-baseline.json
+
+      - name: Retain deterministic recovery results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: postgres-recovery-${{ github.sha }}
+          path: /tmp/axiom-recovery-baseline.json
+          retention-days: 14

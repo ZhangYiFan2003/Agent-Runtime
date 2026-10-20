@@ -37,7 +37,15 @@ jobs:
         run: uv sync --extra dev --locked
 
       - name: Run tests
-        run: uv run --locked pytest
+        run: uv run --locked pytest --junitxml=test-results/backend.xml
+
+      - name: Retain failed backend test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-tests-${{ github.sha }}
+          path: test-results/backend.xml
+          retention-days: 14
 
   postgres-integration:
     name: postgres-integration
@@ -94,6 +102,15 @@ jobs:
           --strict-config
           --strict-markers
           -ra
+          --junitxml=test-results/postgres.xml
+
+      - name: Retain failed PostgreSQL contract results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: postgres-contract-${{ github.sha }}
+          path: test-results/postgres.xml
+          retention-days: 14
 
   mcp-windows:
     runs-on: windows-latest

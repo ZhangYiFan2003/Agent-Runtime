@@ -68,6 +68,10 @@ and Trace spans, then inspect citation markers and provenance in the Console.
 Bounded real-Compose load, saturation, and service-level failure evidence is maintained under
 [`benchmarks/deployment/`](benchmarks/deployment/); see
 [`docs/operations-reliability.md`](docs/operations-reliability.md) for the verified fault model.
+Use the [current architecture](docs/architecture-current.md), [Runtime API contract](docs/runtime-api.md),
+and [backup, restore, and upgrade procedure](deploy/README.md#backup-and-restore) as the maintained
+implementation and operations references. The Compose baseline supports one trusted operator on
+one Linux/WSL Docker host; it does not establish high availability or production readiness.
 
 ## Features
 
@@ -305,15 +309,12 @@ Run the full local test suite:
 uv run pytest
 ```
 
-Current baseline:
-
-```text
-305 tests passing
-```
-
 The default tests use fake LLM clients, temporary directories, temporary SQLite databases, deterministic code-search fixtures, and localhost-safe HTTP paths. They do not require API keys and do not call external model providers.
 
-GitHub Actions runs the same test suite on push and pull request events for `main`.
+Optional real PostgreSQL, Docker, and MinIO checks need their documented isolated environments;
+an explicit skip is not integration evidence. See the workflows in [`.github/workflows/`](.github/workflows/)
+and the [deployment harness](benchmarks/deployment/README.md) for commands and retained results.
+Test counts describe a particular source revision and environment, not a stable capability guarantee.
 
 ## Project Status
 

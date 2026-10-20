@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
+import sqlite3
+from contextlib import closing
 from io import BytesIO
 
 import pytest
@@ -24,7 +27,8 @@ from axiom.policy import DefaultPermissionPolicy, PermissionAction
 from axiom.runtime.api import RuntimeApiServer
 from axiom.runtime.checkpoints import SQLiteCheckpointStore
 from axiom.runtime.durable import DurableAgentRuntime
-from axiom.runtime.models import Checkpoint, ToolExecutionRecord, ToolExecutionStatus
+from axiom.runtime.models import Checkpoint, RunStatus, ToolExecutionRecord, ToolExecutionStatus
+from axiom.runtime.storage import create_durable_storage
 from axiom.tools import ToolRegistry
 from axiom.tools.base import ToolContext
 
@@ -328,6 +332,130 @@ def test_durable_run_persists_artifact_link_without_embedding_content(tmp_path) 
     assert record is not None and len(record.artifact_ids) == 1
     assert record.result is not None and "durable artifact" not in record.result
     assert service.get(record.artifact_ids[0]) is not None
+
+
+def test_stopped_sqlite_backup_restores_messages_artifact_and_submission_identity(tmp_path):
+    class ArtifactClient:
+        provider_name = "test"
+        model_name = "test"
+        max_context_window = 10_000
+
+        def __init__(self):
+            self.calls = 0
+
+        async def chat(self, messages, _tools, *, system_prompt):
+            del system_prompt
+            self.calls += 1
+            if not any(message.role == "tool" for message in messages):
+                yield {
+                    "type": "tool_call_delta",
+                    "tool_call": {
+                        "index": 0,
+                        "id": "restore-artifact",
+                        "function": {
+                            "name": "publish_artifact",
+                            "arguments": json.dumps({"path": "result.txt"}),
+                        },
+                    },
+                }
+                yield {"type": "message_end", "stop_reason": "tool_use"}
+                return
+            yield {"type": "text_delta", "text": "published"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    config = AxiomConfig()
+    config.policy.hitl_mode = "never"
+    config.features.audit_log = False
+    source = tmp_path / "source"
+    workspace = source / "workspace"
+    workspace.mkdir(parents=True)
+    content = b"isolated recovery artifact\n"
+    (workspace / "result.txt").write_bytes(content)
+    database = source / "runtime.db"
+    storage = create_durable_storage(config.storage, default_sqlite_path=database)
+    registry = ToolRegistry()
+    registry.register_all(artifact_tools())
+
+    def runtime_for(durable, root, client):
+        service = ArtifactService(
+            durable.artifacts, LocalArtifactBlobStore(root / "blobs"),
+            max_file_bytes=1024, max_metadata_bytes=1024,
+        )
+        runtime = DurableAgentRuntime(
+            llm_client=client, tool_registry=registry, system_prompt="test",
+            cwd=str(root / "workspace"), config=config,
+            store=durable.runtime, artifact_service=service,
+        )
+        return runtime, service
+
+    original, artifacts = runtime_for(storage, source, ArtifactClient())
+    completed_thread = storage.events.create_thread()
+    pending_thread = storage.events.create_thread()
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    # Keep WAL frames present: copying only runtime.db would lose committed records.
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("pragma journal_mode=wal")
+        connection.execute("pragma wal_autocheckpoint=0")
+        completed, _ = asyncio.run(original.submit_idempotent(
+            thread_id=completed_thread, input="publish", idempotency_key="completed-key",
+        ))
+        completed = asyncio.run(original.execute_submitted(completed))
+        assert completed.status == RunStatus.COMPLETED
+        pending, _ = asyncio.run(original.submit_idempotent(
+            thread_id=pending_thread, input="publish later", idempotency_key="pending-key",
+        ))
+        artifact = artifacts.list_run(completed.run_id)[0]
+        assert database.with_name("runtime.db-wal").stat().st_size > 0
+        # No Runtime, tool, or workspace writer runs during this coordinated backup.
+        storage.close()
+        with closing(sqlite3.connect(backup / "runtime.db")) as destination:
+            connection.backup(destination)
+        shutil.copytree(source / "blobs", backup / "blobs")
+        shutil.copytree(workspace, backup / "workspace")
+
+    restored_root = tmp_path / "restored"
+    shutil.copytree(backup, restored_root)
+    restored = create_durable_storage(
+        config.storage, default_sqlite_path=restored_root / "runtime.db",
+    )
+    client = ArtifactClient()
+    runtime, artifacts = runtime_for(restored, restored_root, client)
+    try:
+        loaded = asyncio.run(restored.runtime.load(completed.run_id))
+        assert loaded.status == RunStatus.COMPLETED and loaded.output_text == "published"
+        assert loaded.turn_id == completed.turn_id
+        messages, _ = restored.events.page_messages(completed_thread)
+        assert [(message.type, message.payload["text"]) for message in messages] == [
+            ("user.message", "publish"), ("assistant.message", "published"),
+        ]
+        assert {message.run_id for message in messages} == {completed.run_id}
+        tool = asyncio.run(restored.runtime.load_tool_execution(
+            f"{completed.run_id}:restore-artifact",
+        ))
+        assert tool.artifact_ids == [artifact.artifact_id]
+        restored_content = b"".join(artifacts.iter_content(artifact.artifact_id))
+        assert restored_content == content
+        assert hashlib.sha256(restored_content).hexdigest() == artifact.blob_sha256
+        assert (restored_root / "workspace" / "result.txt").read_bytes() == content
+        replay, created = asyncio.run(runtime.submit_idempotent(
+            thread_id=completed_thread, input="publish", idempotency_key="completed-key",
+        ))
+        assert not created and replay.run_id == completed.run_id
+        replay, created = asyncio.run(runtime.submit_idempotent(
+            thread_id=pending_thread, input="publish later", idempotency_key="pending-key",
+        ))
+        assert not created and replay.run_id == pending.run_id
+        assert replay.status == RunStatus.RUNNING and client.calls == 0
+        assert asyncio.run(restored.runtime.thread_run_head(pending_thread)) == {
+            "run_id": pending.run_id, "status": "RUNNING",
+        }
+        # Explicit operator recovery uses only this disposable workspace and fake client.
+        recovered = asyncio.run(runtime.resume(pending.run_id))
+        assert recovered.status == RunStatus.COMPLETED and client.calls == 2
+        assert len(artifacts.list_run(pending.run_id)) == 1
+    finally:
+        restored.close()
 
 
 class _FakeRequest:

@@ -161,6 +161,11 @@ creation time and Run ID descending. Child counts are aggregated for the bounded
 page; the API does not construct a full detail view for every list row. There is
 no exact global total in this response. Run Detail retains its full read contract.
 
+These are live keyset pages, not a long-lived database snapshot. The default
+creation order is stable when newer Runs are inserted. Status and duration can
+change while a Run executes, so a Run may move across those page boundaries;
+clients deduplicate by Run ID and refresh the first page for a current view.
+
 Message, Event and Run cursors bind their list kind and Thread/filter scope;
 they cannot be reused across lists, Threads or Run filters. Invalid cursors,
 conflicting boundary parameters, and limits outside `1..maximum` return HTTP 400
